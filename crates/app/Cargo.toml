@@ -1,0 +1,38 @@
+[package]
+name = "yeager"
+description = "Yeager - Modern Windows Network Optimization & Transport Resilience Platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "yeager"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+erwin.workspace = true
+hange.workspace = true
+slint = { workspace = true, features = ["raw-window-handle-06", "unstable-winit-030"] }
+levi = { path = "../levi" }
+ring = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon.workspace = true
+muda.workspace = true
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build.workspace = true
+embed-resource = "3"

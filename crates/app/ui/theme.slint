@@ -1,0 +1,33 @@
+// Design tokens for Yeager, following the EasyKey-Next design language:
+// Apple-like translucent surfaces, a single accent, radii 14 / 10 / 7.
+
+export global Theme {
+    in-out property <bool> dark: true;
+    in-out property <color> accent: #0a7aff;
+
+    // Text
+    out property <color> label: dark ? #f5f5f7 : #1d1d1f;
+    out property <color> label2: dark ? #ebebf599 : #3c3c4399;
+    out property <color> on-accent: #ffffff;
+
+    // Surfaces
+    out property <color> window-bg: dark ? #1c1c1e : #ececf0;
+    out property <color> sidebar-bg: dark ? #26262899 : #f6f6f8cc;
+    out property <color> group: dark ? #2c2c2e : #ffffff;
+    out property <color> group-alt: dark ? #3a3a3c : #f2f2f5;
+    out property <color> separator: dark ? #ffffff14 : #0000000d;
+    out property <color> control-off: dark ? #48484a : #e3e3e8;
+    out property <color> sidebar-sel: dark ? #ffffff1a : #0000000d;
+
+    // Shape
+    out property <length> r-window: 14px;
+    out property <length> r-group: 10px;
+    out property <length> r-control: 7px;
+    out property <length> r-popup: 11px;
+
+    // Type
+    out property <length> fs-title: 15px;
+    out property <length> fs-body: 13px;
+    out property <length> fs-sub: 11.5px;
+    out property <string> font: "Be Vietnam Pro";
+}

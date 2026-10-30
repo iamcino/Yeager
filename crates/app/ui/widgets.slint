@@ -1,0 +1,468 @@
+// Reusable controls shared by every settings pane, in the EasyKey design
+// language.
+
+import { Theme } from "theme.slint";
+
+// Apple-style sliding switch.
+export component Switch {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    width: 44px;
+    height: 26px;
+    accessible-role: switch;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+
+    Rectangle {
+        border-radius: self.height / 2;
+        background: root.checked ? Theme.accent : Theme.control-off;
+        opacity: root.enabled ? 1.0 : 0.5;
+        animate background { duration: 180ms; easing: ease-in-out; }
+
+        Rectangle {
+            x: root.checked ? parent.width - self.width - 2.5px : 2.5px;
+            y: 2.5px;
+            width: 21px;
+            height: 21px;
+            border-radius: self.height / 2;
+            background: #ffffff;
+            drop-shadow-blur: 3px;
+            drop-shadow-color: #00000033;
+            drop-shadow-offset-y: 1px;
+            animate x { duration: 180ms; easing: ease-out; }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// Grouped list container, like a System Settings card.
+export component GroupBox {
+    in property <string> title;
+    VerticalLayout {
+        spacing: 8px;
+        if root.title != "": Text {
+            text: root.title;
+            font-size: Theme.fs-sub;
+            font-weight: 600;
+            color: Theme.label2;
+            x: 6px;
+        }
+        Rectangle {
+            background: Theme.group;
+            border-radius: Theme.r-group;
+            border-width: 1px;
+            border-color: Theme.separator;
+            VerticalLayout {
+                padding: 4px;
+                @children
+            }
+        }
+    }
+}
+
+// A thin divider between rows in a group.
+export component RowSeparator {
+    height: 1px;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Rectangle { background: Theme.separator; }
+    }
+}
+
+// A row carrying a title, optional subtitle, and trailing content.
+export component Row {
+    in property <string> title;
+    in property <string> subtitle;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 16px;
+        // Text column takes the free width so labels stay flush left and the
+        // trailing control stays flush right on every row.
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 3px;
+            Text {
+                text: root.title;
+                color: Theme.label;
+                font-size: Theme.fs-body;
+                font-weight: 500;
+            }
+            if root.subtitle != "": Text {
+                text: root.subtitle;
+                color: Theme.label2;
+                font-size: Theme.fs-sub;
+                wrap: word-wrap;
+            }
+        }
+        // Keeps one-line rows at 48px. Set on the row itself, a min-height
+        // would replace the layout's own and wrapped subtitles would spill
+        // out of the group.
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            min-height: 36px;
+            HorizontalLayout {
+                spacing: 8px;
+                @children
+            }
+        }
+    }
+}
+
+// A row whose trailing control is a Switch.
+// Inherits Row (rather than wrapping one) so it stretches to the full group
+// width like every other row.
+export component ToggleRow inherits Row {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    Switch {
+        checked <=> root.checked;
+        enabled: root.enabled;
+        toggled(v) => { root.toggled(v); }
+    }
+}
+
+// Segmented control.
+export component Segmented {
+    in property <[string]> options;
+    in-out property <int> current;
+    in property <bool> enabled: true;
+    callback selected(int);
+
+    height: 30px;
+    Rectangle {
+        background: Theme.control-off;
+        border-radius: Theme.r-control;
+        opacity: root.enabled ? 1.0 : 0.6;
+        HorizontalLayout {
+            padding: 2px;
+            spacing: 2px;
+            for opt[i] in root.options: Rectangle {
+                background: i == root.current ? Theme.group : transparent;
+                border-radius: Theme.r-control - 2px;
+                drop-shadow-blur: i == root.current ? 2px : 0px;
+                drop-shadow-color: #00000026;
+                animate background { duration: 120ms; }
+                HorizontalLayout {
+                    alignment: center;
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    Text {
+                        text: opt;
+                        vertical-alignment: center;
+                        font-size: Theme.fs-body;
+                        font-weight: i == root.current ? 600 : 400;
+                        color: Theme.label;
+                    }
+                }
+                TouchArea {
+                    enabled: root.enabled;
+                    clicked => {
+                        root.current = i;
+                        root.selected(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A pill button (used for actions like "Áp dụng", "Khôi phục mặc định").
+export component PillButton {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 32px;
+    horizontal-stretch: 0;
+    Rectangle {
+        background: root.primary
+            ? (ta.pressed ? Theme.accent.darker(15%) : Theme.accent)
+            : (ta.pressed ? Theme.group-alt.darker(10%) : Theme.group-alt);
+        border-radius: Theme.r-control;
+        opacity: root.enabled ? 1.0 : 0.5;
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            alignment: center;
+            Text {
+                text: root.text;
+                vertical-alignment: center;
+                font-size: Theme.fs-body;
+                font-weight: 600;
+                color: root.primary ? Theme.on-accent : Theme.label;
+            }
+        }
+        ta := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+// A radio-option row for vertical options (TCP Algorithm selection).
+export component RadioRow {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> selected: false;
+    // A brand logo shown in place of the title text (e.g. DNS providers).
+    in property <image> logo;
+    in property <length> logo-height: 22px;
+    // Short trailing note before the radio, e.g. "HTTP/3 · 32 ms".
+    in property <string> badge;
+    callback clicked();
+
+    Rectangle {
+        background: ta.has-hover ? Theme.sidebar-sel : transparent;
+        border-radius: Theme.r-control;
+        animate background { duration: 100ms; }
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 2px;
+                // Collapsed rather than `if`, which would not report height.
+                Image {
+                    visible: root.logo.width > 0;
+                    height: root.logo.width > 0 ? root.logo-height : 0px;
+                    source: root.logo;
+                    image-fit: contain;
+                    horizontal-alignment: left;
+                }
+                Text {
+                    visible: root.logo.width == 0;
+                    height: root.logo.width == 0 ? self.preferred-height : 0px;
+                    text: root.title;
+                    color: Theme.label;
+                    font-size: Theme.fs-body;
+                    font-weight: root.selected ? 600 : 500;
+                }
+                if root.subtitle != "": Text {
+                    text: root.subtitle;
+                    color: Theme.label2;
+                    font-size: Theme.fs-sub;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Minimum row height lives here, not on the row: see Row.
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                min-height: 34px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: end;
+                    if root.badge != "": Text {
+                        text: root.badge;
+                        color: Theme.label2;
+                        font-size: Theme.fs-sub;
+                        vertical-alignment: center;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            border-width: 2px;
+                            border-color: root.selected ? Theme.accent : Theme.label2;
+                            background: transparent;
+
+                            if root.selected: Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: Theme.accent;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ta := TouchArea {
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+// A color swatch used in the accent picker.
+export component Swatch inherits Rectangle {
+    in property <color> swatch-color;
+    in property <bool> selected;
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    border-radius: 13px;
+    background: root.swatch-color;
+    border-width: root.selected ? 3px : 0px;
+    border-color: #ffffff;
+
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+// Single-line text field with a placeholder.
+export component TextField {
+    in property <string> placeholder;
+    in-out property <string> text;
+    callback accepted(string);
+
+    height: 32px;
+    min-width: 120px;
+    horizontal-stretch: 1;
+    Rectangle {
+        background: Theme.group-alt;
+        border-radius: Theme.r-control;
+        border-width: 1px;
+        border-color: input.has-focus ? Theme.accent : Theme.separator;
+    }
+    if root.text == "": Text {
+        x: 10px;
+        text: root.placeholder;
+        color: Theme.label2;
+        font-size: Theme.fs-body;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        text <=> root.text;
+        color: Theme.label;
+        font-size: Theme.fs-body;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => { root.accepted(self.text); }
+    }
+}
+
+// A status row: title on the left, value on the right, opens a page on click.
+export component ValueRow {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> value;
+    in property <color> value-color: Theme.label2;
+    callback clicked();
+
+    Rectangle {
+        background: ta.has-hover ? Theme.sidebar-sel : transparent;
+        border-radius: Theme.r-control;
+    }
+    VerticalLayout {
+        Row {
+            title: root.title;
+            subtitle: root.subtitle;
+            // Long values are cut with "…" rather than pushed past the edge.
+            Text {
+                text: root.value;
+                color: root.value-color;
+                font-size: Theme.fs-body;
+                font-weight: 500;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                overflow: elide;
+                min-width: 0;
+            }
+            Text {
+                text: "›";
+                color: Theme.label2;
+                font-size: 16px;
+                vertical-alignment: center;
+            }
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Large round on/off button for the home page.
+export component PowerButton {
+    in property <bool> active;
+    callback clicked();
+    width: 72px;
+    height: 72px;
+
+    Rectangle {
+        border-radius: self.width / 2;
+        background: root.active ? Theme.accent : Theme.control-off;
+        drop-shadow-blur: root.active ? 18px : 0px;
+        drop-shadow-color: Theme.accent.with-alpha(0.45);
+        animate background, drop-shadow-blur { duration: 200ms; easing: ease-in-out; }
+    }
+    Path {
+        width: 28px;
+        height: 28px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3 L 12 11 M 6.3 6.6 A 8 8 0 1 0 17.7 6.6";
+        stroke: root.active ? Theme.on-accent : Theme.label;
+        stroke-width: 2.4px;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+// Thin vertical scrollbar for a Flickable: bind `viewport-y` to the
+// flickable's and pass its sizes. Hidden when everything fits.
+export component ScrollBar {
+    in-out property <length> viewport-y;
+    in property <length> viewport-height;
+    in property <length> visible-height;
+
+    property <length> range: max(0px, root.viewport-height - root.visible-height);
+    property <length> thumb-height: root.range > 0px
+        ? max(32px, root.height * root.visible-height / root.viewport-height)
+        : root.height;
+    property <length> start-y;
+
+    width: 10px;
+    visible: root.range > 0px;
+
+    thumb := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.range > 0px ? (root.height - root.thumb-height) * (-root.viewport-y / root.range) : 0px;
+        width: ta.has-hover || ta.pressed ? 8px : 5px;
+        height: root.thumb-height;
+        border-radius: self.width / 2;
+        background: ta.pressed ? Theme.label2 : Theme.label2.transparentize(40%);
+        animate width { duration: 120ms; }
+    }
+    ta := TouchArea {
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                root.start-y = root.viewport-y;
+            }
+        }
+        moved => {
+            if self.pressed && root.height > root.thumb-height {
+                root.viewport-y = clamp(
+                    root.start-y - (self.mouse-y - self.pressed-y) * root.range / (root.height - root.thumb-height),
+                    -root.range, 0px);
+            }
+        }
+    }
+}

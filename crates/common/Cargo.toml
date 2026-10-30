@@ -1,0 +1,9 @@
+[package]
+name = "common"
+description = "Shared types and system helpers for the Yeager workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true

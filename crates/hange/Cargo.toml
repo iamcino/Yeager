@@ -1,0 +1,23 @@
+[package]
+name = "hange"
+description = "Yeager discovery engine: DNS over HTTPS/3 stub resolver and system DoH setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+hickory-proto = "0.26"
+hickory-net = { version = "0.26", features = ["h3-ring", "https-ring", "rustls-platform-verifier"] }
+futures-util = { version = "0.3", default-features = false }
+lru = "0.19"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_LibraryLoader",
+] }

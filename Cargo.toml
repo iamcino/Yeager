@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/erwin", "crates/hange", "crates/common", "crates/levi"]
+
+[workspace.package]
+version = "1.0.8"
+edition = "2024"
+authors = ["Cino"]
+license = "MIT"
+description = "Yeager - Modern Windows Network Optimization & Transport Resilience Platform"
+repository = "https://github.com/iamcino/Yeager"
+
+[workspace.dependencies]
+common = { path = "crates/common" }
+erwin = { path = "crates/erwin" }
+hange = { path = "crates/hange" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slint = "1.18"
+slint-build = "1.18"
+tray-icon = "0.21"
+muda = "0.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

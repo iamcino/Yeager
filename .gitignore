@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+/dist/
+
+# IDE / editor
+.vs/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+.dotnet/
+
+# Claude
+CLAUDE.md
+.claude/
+
+# Local testing tools & private diagnostics (not for public repo)
+tools/test-*.ps1
+tools/local-*
+/local_tests/
+
+
+# Local internal documentation & private agent handoffs (local only)
+note_for_agent.md
+docs/cross-platform-architecture.md
+

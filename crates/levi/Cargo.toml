@@ -1,0 +1,21 @@
+[package]
+name = "levi"
+description = "Levi — High-performance Native Transport Resilience & Handshake Stabilization Engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "levi"
+path = "src/main.rs"
+
+[lib]
+name = "levi"
+path = "src/lib.rs"
+
+[dependencies]
+common.workspace = true
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }

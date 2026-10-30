@@ -1,0 +1,1139 @@
+import "../../../assets/fonts/BeVietnamPro-Regular.ttf";
+import "../../../assets/fonts/BeVietnamPro-SemiBold.ttf";
+
+import { Theme } from "theme.slint";
+import { Lang } from "lang.slint";
+import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, PowerButton, ScrollBar } from "widgets.slint";
+export { Theme } from "theme.slint";
+export { Lang } from "lang.slint";
+
+// A Windows-style caption button (minimize / close) on the right of the bar.
+component CaptionButton {
+    in property <bool> danger;
+    in property <string> commands;
+    callback clicked();
+    width: 46px;
+
+    Rectangle {
+        background: ta.pressed
+            ? (root.danger ? #c42b1c : Theme.sidebar-sel.darker(20%))
+            : ta.has-hover ? (root.danger ? #e81123 : Theme.sidebar-sel) : transparent;
+        animate background { duration: 80ms; }
+    }
+    Path {
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: root.commands;
+        stroke: root.danger && ta.has-hover ? #ffffff : Theme.label;
+        stroke-width: 1px;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Self-drawn title bar over the content pane, so the sidebar runs the full
+// height of the window. The title (the current page) is centred on the bar, the empty area drags the frameless window, and
+// minimize / close sit on the right as on Windows.
+component TitleBar {
+    in property <string> title;
+    callback close();
+    callback minimize();
+    callback drag();
+    height: 44px;
+
+    TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.drag();
+            }
+        }
+    }
+
+    Text {
+        text: root.title;
+        font-size: Theme.fs-body;
+        font-weight: 600;
+        color: Theme.label2;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    HorizontalLayout {
+        x: parent.width - self.width;
+        width: self.preferred-width;
+        CaptionButton {
+            commands: "M 0 5 L 10 5";
+            clicked => { root.minimize(); }
+        }
+        CaptionButton {
+            danger: true;
+            commands: "M 0 0 L 10 10 M 10 0 L 0 10";
+            clicked => { root.close(); }
+        }
+    }
+}
+
+// Sidebar icon drawn as vector paths (24-unit grid). Paths instead of
+// colorized SVG images: the GPU renderer now and then drew those with pieces
+// missing.
+component NavIcon {
+    in property <int> kind; // 0 general, 1 engine, 2 TCP, 3 DNS, 4 appearance
+    in property <color> color;
+    width: 18px;
+    height: 18px;
+    Path {
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: root.color;
+        stroke-width: 1.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: [
+            "M 4 7 h 16 M 4 12 h 16 M 4 17 h 16",
+            "M 12 3 l 7 2.8 v 5.4 c 0 4.4 -2.9 8.2 -7 9.8 c -4.1 -1.6 -7 -5.4 -7 -9.8 V 5.8 z M 9 12 l 2.2 2.2 L 15.5 10",
+            "M 13.5 2.5 L 5 13.5 h 6.5 l -1 8 l 8.5 -11 h -6.5 z",
+            "M 3 12 a 9 9 0 1 0 18 0 a 9 9 0 1 0 -18 0 M 8.2 12 a 3.8 9 0 1 0 7.6 0 a 3.8 9 0 1 0 -7.6 0 M 3.5 9 h 17 M 3.5 15 h 17",
+            "M 3 12 a 9 9 0 1 0 18 0 a 9 9 0 1 0 -18 0",
+        ][root.kind];
+    }
+    // Filled parts: the general icon's knobs, the appearance icon's half.
+    if root.kind == 0 || root.kind == 4: Path {
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: root.color;
+        stroke: root.color;
+        stroke-width: 1.4px;
+        stroke-line-join: round;
+        commands: root.kind == 0 ? "M 12.8 7 a 2.2 2.2 0 1 0 4.4 0 a 2.2 2.2 0 1 0 -4.4 0 M 6.8 12 a 2.2 2.2 0 1 0 4.4 0 a 2.2 2.2 0 1 0 -4.4 0 M 10.8 17 a 2.2 2.2 0 1 0 4.4 0 a 2.2 2.2 0 1 0 -4.4 0" : "M 12 3 a 9 9 0 0 1 0 18 z";
+    }
+}
+
+// Sidebar entry. The icon sits in a fixed 18px box so every label starts at
+// the same x, whatever the glyph.
+component SidebarItem {
+    in property <string> text;
+    in property <int> icon;
+    in property <bool> selected;
+    callback clicked();
+    height: 36px;
+    Rectangle {
+        background: root.selected ? Theme.sidebar-sel : transparent;
+        border-radius: Theme.r-control;
+        animate background { duration: 100ms; }
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                NavIcon {
+                    kind: root.icon;
+                    color: root.selected ? Theme.accent : Theme.label2;
+                }
+            }
+            Text {
+                text: root.text;
+                font-size: Theme.fs-body;
+                font-weight: root.selected ? 600 : 400;
+                vertical-alignment: center;
+                color: Theme.label;
+                horizontal-stretch: 1;
+            }
+        }
+        TouchArea { clicked => { root.clicked(); } }
+    }
+}
+
+// One settings page: scrolls on its own, with the overlay scrollbar. Each page
+// gets its own Flickable because a layout inside an `if` would not follow the
+// width, so wrapped rows would be cut off at the bottom of the scroll range.
+component Page {
+    content := Flickable {
+        width: parent.width;
+        height: parent.height;
+        content-width: self.width;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 18px;
+            alignment: start;
+            @children
+        }
+    }
+    ScrollBar {
+        x: parent.width - self.width - 4px;
+        y: 6px;
+        height: parent.height - 12px;
+        viewport-y <=> content.content-y;
+        viewport-height: content.content-height;
+        visible-height: content.height;
+    }
+}
+
+// One address on the network card; long IPv6 addresses are cut with "…".
+component AddressRow inherits Row {
+    in property <string> value;
+    Text {
+        text: root.value;
+        color: Theme.label2;
+        font-size: Theme.fs-body;
+        font-weight: 500;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        overflow: elide;
+        min-width: 0;
+    }
+}
+
+// A strip along an edge of the frameless window that starts a resize.
+component ResizeEdge inherits TouchArea {
+    in property <int> edge;
+    callback resize(int);
+    pointer-event(e) => {
+        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+            root.resize(root.edge);
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Yeager";
+    icon: @image-url("../../../assets/icons/yeager.png");
+    no-frame: true;
+    default-font-family: Theme.font;
+    background: transparent;
+    preferred-width: 860px;
+    preferred-height: 600px;
+    min-width: root.min-width-px * 1px;
+    min-height: root.min-height-px * 1px;
+    out property <float> min-width-px: 700;
+    out property <float> min-height-px: 500;
+
+    // --- Window chrome callbacks ---
+    callback close-window();
+    callback minimize-window();
+    callback drag-window();
+    // 0 top, 1 bottom, 2 left, 3 right, 4 top-left, 5 top-right, 6 bottom-left, 7 bottom-right
+    callback resize-window(int);
+
+    // --- Network card (home page) ---
+    in property <string> net-local4: "…";
+    in property <string> net-public4: "…";
+    in property <string> net-local6: "…";
+    in property <string> net-public6: "…";
+    in property <bool> net-busy;
+    callback refresh-network();
+
+    // --- State from Rust ---
+    in property <bool> engine-active: false;
+    in property <string> engine-status: Lang.t("Đang tắt", "Off");
+    in property <int> scope: 0;              // 0 All, 1 HostList
+    in property <[string]> hosts;
+    in-out property <int> transport-profile: 0; // 0 Auto, 1 Fast, 2 Hardened, 3 Observe
+    in property <int> stats-stabilized: 0;
+    in property <int> stats-rst-silenced: 0;
+    in property <string> congestion: "cubic";
+    in-out property <int> congestion-sel: 2; // index into congestion options
+    in property <bool> tcp-enabled: true;
+    in property <bool> low-latency: false;
+    in property <bool> latency-busy: false;
+    in property <string> latency-status: Lang.t("Ping router, 1.1.1.1 và 8.8.8.8 trong 10 giây để biết giật do mạng nhà hay nhà mạng", "Pings the router, 1.1.1.1 and 8.8.8.8 for 10 seconds to tell home lag from ISP lag");
+    in property <bool> diag-running: false;
+    in property <string> diag-status: Lang.t("So sánh CUBIC, CTCP và BBRv2 bằng tải thử (~25 MB mỗi loại, khoảng 40 giây)", "Compares CUBIC, CTCP and BBRv2 with a test download (~25 MB each, about 40 seconds)");
+    in property <int> diag-pick: -1;         // congestion index, -1 = none yet
+    in property <string> diag-pick-label;
+    in property <bool> doh-enabled: true;
+    in-out property <int> doh-provider: 0;
+    in property <bool> doh-http3: true;
+    in property <string> dns-ping: "…";
+    // Per DNS provider row (Cloudflare, Google, AdGuard): "HTTP/3 · 32 ms".
+    in property <[string]> dns-stats: ["—", "—", "—"];
+    in property <string> dns-auto-detail;
+    in property <string> dns-status: Lang.t("Chưa kiểm tra", "Not checked");
+    in property <string> log: Lang.t("Sẵn sàng", "Ready");
+    in property <bool> connect-on-launch: true;
+    in property <bool> launch-login: false;
+    in-out property <bool> dark <=> Theme.dark;
+    in-out property <bool> english <=> Lang.english;
+    in property <string> version;
+    // Updates: the newer version a check found ("" while up to date), a
+    // check or download in progress, and the line under "Check for updates".
+    in property <string> update-version;
+    // The ISP Cloudflare sees ("" until known), shown above the status.
+    in property <string> isp;
+    in property <bool> update-busy: false;
+    in property <string> update-status;
+    in property <bool> check-updates: true;
+    // The update dialog: 0 hidden, 1 offer, 2 downloading, 3 failed.
+    in-out property <int> update-dialog: 0;
+    in property <string> update-error;
+
+    // --- Actions to Rust ---
+    callback toggle-engine(bool);
+    callback set-scope(int);
+    callback set-transport-profile(int);
+    callback add-host(string);
+    callback remove-host(int);
+    callback set-congestion(int);
+    callback apply-congestion();
+    callback reset-tcp();
+    callback set-tcp-enabled(bool);
+    callback run-diagnose();
+    callback set-low-latency(bool);
+    callback run-latency-check();
+    callback apply-recommendation();
+    callback set-doh(bool);
+    callback set-doh-provider(int);
+    callback set-doh-http3(bool);
+    callback test-dns();
+    callback open-repo();
+    callback set-connect-on-launch(bool);
+    callback set-launch-login(bool);
+    callback set-dark(bool);
+    callback set-accent(color);
+    callback set-language(bool);
+    callback check-update();
+    callback install-update();
+    callback open-release-notes();
+    callback open-download-page();
+    callback set-check-updates(bool);
+
+    in-out property <int> page: 0;
+
+    // Rounded, bordered shell
+    Rectangle {
+        border-radius: Theme.r-window;
+        background: Theme.window-bg;
+        border-width: 1px;
+        border-color: Theme.separator;
+        clip: true;
+
+        VerticalLayout {
+            HorizontalLayout {
+                // --- Sidebar --- (full height; its empty areas drag the window)
+                Rectangle {
+                    width: 220px;
+                    background: Theme.sidebar-bg;
+                    TouchArea {
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                root.drag-window();
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        padding: 12px;
+                        // Brand row sits a little below the title bar line so it
+                        // has room to breathe at the top of the sidebar.
+                        padding-top: 14px;
+                        spacing: 4px;
+
+                        // Brand: opens the home page (power button + status).
+                        Rectangle {
+                            height: 44px;
+                            border-radius: Theme.r-control;
+                            background: root.page == 0 ? Theme.sidebar-sel : brand-ta.has-hover ? Theme.separator : transparent;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Image {
+                                        source: @image-url("../../../assets/icons/brand.png");
+                                        width: 28px;
+                                        height: 28px;
+                                    }
+                                }
+                                Text {
+                                    text: "Yeager";
+                                    font-size: Theme.fs-title;
+                                    font-weight: 700;
+                                    color: Theme.label;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            brand-ta := TouchArea { clicked => { root.page = 0; } }
+                        }
+                        Rectangle { height: 10px; }
+
+                        SidebarItem { text: Lang.t("Hệ thống", "General"); icon: 0; selected: root.page == 1; clicked => { root.page = 1; } }
+                        SidebarItem { text: "Engine"; icon: 1; selected: root.page == 2; clicked => { root.page = 2; } }
+                        SidebarItem { text: "TCP"; icon: 2; selected: root.page == 3; clicked => { root.page = 3; } }
+                        SidebarItem { text: "DNS"; icon: 3; selected: root.page == 4; clicked => { root.page = 4; } }
+                        SidebarItem { text: Lang.t("Giao diện", "Appearance"); icon: 4; selected: root.page == 5; clicked => { root.page = 5; } }
+
+                        Rectangle { } // push status to bottom
+
+                        // A newer version is out: one click offers it.
+                        Rectangle {
+                            visible: root.update-version != "";
+                            height: self.visible ? 34px : 0px;
+                            border-radius: Theme.r-control;
+                            background: update-ta.has-hover ? #34c75940 : #34c75926;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                Text {
+                                    text: Lang.t("↑ Cập nhật lên ", "↑ Update to ") + root.update-version;
+                                    vertical-alignment: center;
+                                    font-size: Theme.fs-sub;
+                                    font-weight: 600;
+                                    color: #34c759;
+                                }
+                            }
+                            update-ta := TouchArea { clicked => { root.update-dialog = 1; } }
+                        }
+
+                        // The network Yeager is running on.
+                        HorizontalLayout {
+                            visible: root.isp != "";
+                            height: self.visible ? 26px : 0px;
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            Text {
+                                text: Lang.t("Nhà mạng", "ISP");
+                                vertical-alignment: center;
+                                font-size: Theme.fs-sub;
+                                color: Theme.label2;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: root.isp;
+                                vertical-alignment: center;
+                                font-size: Theme.fs-sub;
+                                font-weight: 600;
+                                color: Theme.label;
+                                overflow: elide;
+                            }
+                        }
+
+                        // Live status footer
+                        Rectangle {
+                            height: 34px;
+                            border-radius: Theme.r-control;
+                            background: root.engine-active ? #34c75926 : Theme.sidebar-sel;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                spacing: 8px;
+                                alignment: start;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 8px; height: 8px; border-radius: 4px;
+                                        background: root.engine-active ? #34c759 : Theme.label2;
+                                    }
+                                }
+                                Text {
+                                    text: root.engine-status;
+                                    vertical-alignment: center;
+                                    font-size: Theme.fs-sub;
+                                    font-weight: 600;
+                                    color: root.engine-active ? #34c759 : Theme.label2;
+                                }
+                            }
+                        }
+                        if root.engine-active && root.stats-rst-silenced > 0: Text {
+                            text: Lang.t("Đã chặn " + root.stats-rst-silenced + " lần ngắt kết nối bất thường", "Blocked " + root.stats-rst-silenced + " abnormal connection resets");
+                            font-size: Theme.fs-sub;
+                            color: Theme.label2;
+                            wrap: word-wrap;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                // --- Content ---
+                VerticalLayout {
+                    TitleBar {
+                        title: [Lang.t("Trang chính", "Home"), Lang.t("Hệ thống", "General"), "Engine", "TCP", "DNS", Lang.t("Giao diện", "Appearance")][root.page];
+                        close => { root.close-window(); }
+                        minimize => { root.minimize-window(); }
+                        drag => { root.drag-window(); }
+                    }
+                    Rectangle {
+                        // Page 0: Trang chính (bấm logo)
+                        if root.page == 0: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            VerticalLayout {
+                                spacing: 18px;
+                                Rectangle {
+                                    background: Theme.group;
+                                    border-radius: Theme.r-group;
+                                    border-width: 1px;
+                                    border-color: Theme.separator;
+                                    HorizontalLayout {
+                                        padding: 18px;
+                                        spacing: 18px;
+                                        PowerButton {
+                                            active: root.engine-active;
+                                            clicked => { root.toggle-engine(!root.engine-active); }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 4px;
+                                            Text {
+                                                text: root.engine-active ? Lang.t("Yeager đang bật", "Yeager is on") : Lang.t("Yeager đang tắt", "Yeager is off");
+                                                font-size: 18px;
+                                                font-weight: 700;
+                                                color: Theme.label;
+                                            }
+                                            Text {
+                                                text: root.engine-active
+                                                    ? Lang.t("Bấm nút để tắt. DNS mã hóa vẫn giữ nguyên", "Press to turn it off. Encrypted DNS stays on")
+                                                    : Lang.t("Bấm nút để kích hoạt. DNS mã hóa sẽ tự bật trước", "Press to activate. Encrypted DNS comes on first");
+                                                font-size: Theme.fs-sub;
+                                                color: Theme.label2;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Trạng thái", "Status");
+                                    ValueRow {
+                                        title: "Engine";
+                                        value: root.engine-status;
+                                        value-color: root.engine-active ? #34c759 : Theme.label2;
+                                        clicked => { root.page = 2; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Phạm vi", "Scope");
+                                        value: root.scope == 0 ? Lang.t("Toàn bộ", "All") : Lang.t(root.hosts.length + " tên miền", root.hosts.length + " domains");
+                                        clicked => { root.page = 2; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Cấu hình truyền tải", "Transport profile");
+                                        value: [Lang.t("Tự động", "Auto"), Lang.t("Tối ưu tốc độ", "Fast"), Lang.t("Tăng cường", "Hardened"), Lang.t("Giám sát", "Observe")][root.transport-profile];
+                                        clicked => { root.page = 2; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("DNS mã hóa", "Encrypted DNS");
+                                        value: root.doh-enabled ? root.dns-status : Lang.t("Đã tắt", "Off");
+                                        clicked => { root.page = 4; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Độ trễ DNS", "DNS latency");
+                                        value: root.dns-ping;
+                                        clicked => { root.page = 4; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: "TCP";
+                                        value: root.tcp-enabled ? root.congestion.to-uppercase() : Lang.t("Tắt", "Off");
+                                        clicked => { root.page = 3; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Khởi động cùng Windows", "Start with Windows");
+                                        value: root.launch-login ? Lang.t("Bật", "On") : Lang.t("Tắt", "Off");
+                                        clicked => { root.page = 1; }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Mạng", "Network");
+                                    AddressRow {
+                                        title: Lang.t("IPv4 nội bộ", "Local IPv4");
+                                        value: root.net-local4;
+                                    }
+                                    RowSeparator { }
+                                    AddressRow {
+                                        title: Lang.t("IPv4 công cộng", "Public IPv4");
+                                        value: root.net-public4;
+                                    }
+                                    RowSeparator { }
+                                    AddressRow {
+                                        title: Lang.t("IPv6 nội bộ", "Local IPv6");
+                                        value: root.net-local6;
+                                    }
+                                    RowSeparator { }
+                                    AddressRow {
+                                        title: Lang.t("IPv6 công cộng", "Public IPv6");
+                                        value: root.net-public6;
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Địa chỉ công cộng do Cloudflare trả về", "Public addresses as Cloudflare sees them");
+                                        PillButton {
+                                            text: root.net-busy ? Lang.t("Đang kiểm tra…", "Checking…") : Lang.t("Làm mới", "Refresh");
+                                            enabled: !root.net-busy;
+                                            clicked => { root.refresh-network(); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Page 1: Hệ thống
+                        if root.page == 1: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            VerticalLayout {
+                                spacing: 18px;
+                                GroupBox {
+                                    title: Lang.t("Khởi động", "Startup");
+                                    ToggleRow {
+                                        title: Lang.t("Tự kết nối khi mở", "Connect on launch");
+                                        subtitle: Lang.t("Tự động kích hoạt khi mở ứng dụng", "Turn Yeager on when the app opens");
+                                        checked: root.connect-on-launch;
+                                        toggled(v) => { root.set-connect-on-launch(v); }
+                                    }
+                                    RowSeparator { }
+                                    ToggleRow {
+                                        title: Lang.t("Khởi động cùng Windows", "Start with Windows");
+                                        subtitle: Lang.t("Chạy ngầm ở khay hệ thống khi đăng nhập", "Run in the system tray after sign-in");
+                                        checked: root.launch-login;
+                                        toggled(v) => { root.set-launch-login(v); }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Cập nhật", "Updates");
+                                    Row {
+                                        title: root.update-version != ""
+                                            ? Lang.t("Đã có Yeager ", "Yeager ") + root.update-version + Lang.t("", " is available")
+                                            : Lang.t("Kiểm tra cập nhật", "Check for updates");
+                                        subtitle: root.update-status;
+                                        PillButton {
+                                            text: root.update-version != "" ? Lang.t("Cập nhật", "Update") : Lang.t("Kiểm tra", "Check");
+                                            primary: root.update-version != "";
+                                            enabled: !root.update-busy;
+                                            clicked => {
+                                                if (root.update-version != "") {
+                                                    root.update-dialog = 1;
+                                                } else {
+                                                    root.check-update();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    ToggleRow {
+                                        title: Lang.t("Tự kiểm tra bản mới", "Check for updates automatically");
+                                        subtitle: Lang.t("Khi mở ứng dụng và vài giờ một lần. Chỉ báo, không tự cài", "At start and every few hours. It only tells you, nothing installs by itself");
+                                        checked: root.check-updates;
+                                        toggled(v) => { root.set-check-updates(v); }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Thông tin", "About");
+                                    Row {
+                                        title: Lang.t("Phiên bản", "Version");
+                                        Text {
+                                            text: root.version;
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Nhà phát triển", "Developer");
+                                        subtitle: "github.com/iamcino/Yeager";
+                                        value: "Cino";
+                                        clicked => { root.open-repo(); }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Giấy phép", "License");
+                                        Text {
+                                            text: "MIT";
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Page 2: Engine
+                        if root.page == 2: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            VerticalLayout {
+                                spacing: 18px;
+                                GroupBox {
+                                    title: Lang.t("DNS cho engine", "DNS for the engine");
+                                    ValueRow {
+                                        title: Lang.t("DNS mã hóa (DoH)", "Encrypted DNS (DoH)");
+                                        subtitle: Lang.t("Yêu cầu DoH bật để chống nhiễm độc DNS. Bật engine sẽ tự bật DoH.", "The engine needs DoH against DNS poisoning. Turning the engine on turns DoH on.");
+                                        value: root.doh-enabled ? Lang.t("Đang bật", "On") : Lang.t("Đang tắt", "Off");
+                                        value-color: root.doh-enabled ? #34c759 : Theme.label2;
+                                        clicked => { root.page = 4; }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Phạm vi áp dụng", "Scope");
+                                    Row {
+                                        title: Lang.t("Áp dụng cho", "Apply to");
+                                        subtitle: root.scope == 0
+                                            ? Lang.t("Mọi kết nối đi qua engine", "Every connection goes through the engine")
+                                            : Lang.t("Chỉ các tên miền trong danh sách bên dưới", "Only the domains in the list below");
+                                        Segmented {
+                                            width: 240px;
+                                            options: [Lang.t("Toàn bộ", "All"), Lang.t("Theo tên miền", "By domain")];
+                                            current: root.scope;
+                                            selected(i) => { root.set-scope(i); }
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Cấu hình truyền tải", "Transport profile");
+                                    RadioRow {
+                                        title: Lang.t("Tự động", "Auto");
+                                        subtitle: Lang.t("Không thêm độ trễ, chạy tốt cả trên mạng trực tiếp lẫn trong VPN. Nên dùng", "Adds no delay and works on direct lines and inside VPNs. Recommended");
+                                        selected: root.transport-profile == 0;
+                                        clicked => {
+                                            root.transport-profile = 0;
+                                            root.set-transport-profile(0);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: Lang.t("Tối ưu tốc độ", "Fast");
+                                        subtitle: Lang.t("Gửi đúng thứ tự, không thêm độ trễ; hợp với chơi game và WireGuard / NetBird", "Sends in order with no added delay; suits gaming and WireGuard / NetBird");
+                                        selected: root.transport-profile == 1;
+                                        clicked => {
+                                            root.transport-profile = 1;
+                                            root.set-transport-profile(1);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: Lang.t("Tăng cường", "Hardened");
+                                        subtitle: Lang.t("Giữ kết nối ổn định trên mạng hay bị thiết bị trung gian làm gián đoạn; thêm khoảng 3 ms", "Keeps connections steady on networks whose equipment keeps disrupting them; adds about 3 ms");
+                                        selected: root.transport-profile == 2;
+                                        clicked => {
+                                            root.transport-profile = 2;
+                                            root.set-transport-profile(2);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: Lang.t("Giám sát", "Observe");
+                                        subtitle: Lang.t("Không sửa gói tin nào, chỉ đếm kết nối và gói ngắt kết nối bị chèn để xem mạng đang can thiệp ra sao", "Changes no packets; only counts connections and injected resets to show how the network interferes");
+                                        selected: root.transport-profile == 3;
+                                        clicked => {
+                                            root.transport-profile = 3;
+                                            root.set-transport-profile(3);
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Hoạt động", "Activity");
+                                    Row {
+                                        title: Lang.t("Kết nối đã được ổn định", "Connections stabilised");
+                                        Text {
+                                            text: root.stats-stabilized;
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            font-weight: 500;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Lần ngắt kết nối bất thường đã chặn", "Abnormal resets blocked");
+                                        subtitle: Lang.t("Gói ngắt kết nối bất thường do mạng chèn vào trước khi máy chủ kịp trả lời", "Abnormal resets injected before the server can answer");
+                                        Text {
+                                            text: root.stats-rst-silenced;
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            font-weight: 500;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Danh sách tên miền", "Domain list") + " (" + root.hosts.length + ")";
+                                    Row {
+                                        title: Lang.t("Thêm tên miền", "Add a domain");
+                                        subtitle: Lang.t("Ví dụ: discord.com. Áp dụng cả tên miền con.", "For example discord.com. Subdomains are included.");
+                                        host-input := TextField {
+                                            width: 200px;
+                                            placeholder: Lang.t("tên-miền.com", "domain.com");
+                                            accepted(t) => {
+                                                root.add-host(t);
+                                                self.text = "";
+                                            }
+                                        }
+                                        PillButton {
+                                            text: Lang.t("Thêm", "Add");
+                                            primary: true;
+                                            clicked => {
+                                                root.add-host(host-input.text);
+                                                host-input.text = "";
+                                            }
+                                        }
+                                    }
+                                    for host[i] in root.hosts: VerticalLayout {
+                                        RowSeparator { }
+                                        Row {
+                                            title: host;
+                                            PillButton {
+                                                text: Lang.t("Xoá", "Remove");
+                                                clicked => { root.remove-host(i); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Page 3: TCP (Tùy chọn xếp hàng dọc, nút áp dụng ở trên)
+                        if root.page == 3: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            VerticalLayout {
+                                spacing: 18px;
+                                GroupBox {
+                                    title: Lang.t("Tối ưu TCP", "TCP tuning");
+                                    ToggleRow {
+                                        title: Lang.t("Bật tối ưu TCP", "Enable TCP tuning");
+                                        subtitle: Lang.t("Độc lập với engine và DNS. Tắt là Windows dùng lại thiết lập cũ", "Independent of the engine and DNS. Off puts the previous Windows settings back");
+                                        checked: root.tcp-enabled;
+                                        toggled(v) => { root.set-tcp-enabled(v); }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Khôi phục mặc định Windows", "Restore Windows defaults");
+                                        subtitle: Lang.t("Đặt lại CUBIC, tắt pacing, tắt tối ưu TCP và độ trễ thấp", "Sets CUBIC, turns pacing off, turns TCP tuning and low latency off");
+                                        PillButton {
+                                            text: Lang.t("Khôi phục", "Restore");
+                                            enabled: !root.diag-running && !root.latency-busy;
+                                            clicked => { root.reset-tcp(); }
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Độ trễ thấp", "Low latency");
+                                    ToggleRow {
+                                        title: Lang.t("Bật chế độ độ trễ thấp", "Enable low-latency mode");
+                                        subtitle: Lang.t("Gửi ACK ngay, tắt Nagle, bỏ giới hạn mạng khi phát media, tắt tiết kiệm điện card mạng. Mạng ngắt vài giây khi bật/tắt; giữ nguyên khi thoát app", "Immediate ACKs, no Nagle, no network throttling during media, adapter power saving off. The network drops for a few seconds when switched; stays on after the app exits");
+                                        checked: root.low-latency;
+                                        enabled: !root.latency-busy;
+                                        toggled(v) => { root.set-low-latency(v); }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Điều khiển tắc nghẽn TCP (Congestion Control)", "TCP congestion control");
+                                    Row {
+                                        title: Lang.t("Thuật toán đang chọn", "Selected algorithm");
+                                        subtitle: Lang.t("Đang áp dụng: ", "In use: ") + root.congestion.to-uppercase();
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            PillButton {
+                                                text: Lang.t("Áp dụng ngay", "Apply now");
+                                                primary: true;
+                                                clicked => { root.apply-congestion(); }
+                                            }
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: Lang.t("Tự động (Auto)", "Automatic");
+                                        subtitle: Lang.t("Đo ping khi áp dụng: mạng ổn định dùng CUBIC; mất gói, dao động hoặc đường xa dùng BBRv2", "Pings when applied: CUBIC on a stable link; BBRv2 on loss, jitter or long distance");
+                                        selected: root.congestion-sel == 0;
+                                        clicked => {
+                                            root.congestion-sel = 0;
+                                            root.set-congestion(0);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: "BBRv2 (Google Model-based)";
+                                        subtitle: Lang.t("Đạt băng thông tối đa trên mạng có tỉ lệ mất gói (lossy links)", "Keeps throughput high on lossy links");
+                                        selected: root.congestion-sel == 1;
+                                        clicked => {
+                                            root.congestion-sel = 1;
+                                            root.set-congestion(1);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: "CUBIC";
+                                        subtitle: Lang.t("Thuật toán chuẩn tối ưu đường truyền sạch có độ trễ thấp", "Windows' standard, best on clean low-latency links");
+                                        selected: root.congestion-sel == 2;
+                                        clicked => {
+                                            root.congestion-sel = 2;
+                                            root.set-congestion(2);
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    RadioRow {
+                                        title: "CTCP (Compound TCP)";
+                                        subtitle: Lang.t("Tối ưu hóa độ trễ thấp cho môi trường Windows", "Low-latency tuning for Windows");
+                                        selected: root.congestion-sel == 3;
+                                        clicked => {
+                                            root.congestion-sel = 3;
+                                            root.set-congestion(3);
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Chẩn đoán", "Diagnose");
+                                    Row {
+                                        title: root.diag-running ? Lang.t("Đang chẩn đoán…", "Diagnosing…") : Lang.t("Đo và đề xuất thuật toán", "Measure and suggest");
+                                        subtitle: root.diag-status;
+                                        PillButton {
+                                            text: Lang.t("Chẩn đoán", "Diagnose");
+                                            enabled: !root.diag-running && !root.latency-busy;
+                                            clicked => { root.run-diagnose(); }
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: root.latency-busy ? Lang.t("Đang đo độ trễ…", "Measuring latency…") : Lang.t("Kiểm tra độ trễ", "Latency check");
+                                        subtitle: root.latency-status;
+                                        PillButton {
+                                            text: Lang.t("Đo ping", "Ping test");
+                                            enabled: !root.latency-busy && !root.diag-running;
+                                            clicked => { root.run-latency-check(); }
+                                        }
+                                    }
+                                    // Collapsed rather than `if`: a row created by `if` does
+                                    // not report its wrapped height to the scroll range.
+                                    RowSeparator {
+                                        visible: root.diag-pick >= 0;
+                                        height: root.diag-pick >= 0 ? 1px : 0px;
+                                    }
+                                    Row {
+                                        visible: root.diag-pick >= 0;
+                                        height: root.diag-pick >= 0 ? self.preferred-height : 0px;
+                                        title: Lang.t("Đề xuất: ", "Suggested: ") + root.diag-pick-label;
+                                        subtitle: Lang.t("Áp dụng sẽ chọn thuật toán này và bật tối ưu TCP", "Applying selects this algorithm and turns TCP tuning on");
+                                        PillButton {
+                                            text: Lang.t("Áp dụng đề xuất", "Apply suggestion");
+                                            primary: true;
+                                            clicked => { root.apply-recommendation(); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Page 4: DNS
+                        if root.page == 4: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            GroupBox {
+                                title: Lang.t("DNS mã hóa (DoH)", "Encrypted DNS (DoH)");
+                                ToggleRow {
+                                    title: Lang.t("Bật DNS over HTTPS", "Enable DNS over HTTPS");
+                                    subtitle: root.engine-active
+                                        ? Lang.t("Engine đang dùng DoH: tắt DoH sẽ tắt luôn engine", "The engine uses DoH: turning DoH off also stops the engine")
+                                        : Lang.t("Chống nghe lén và đầu độc DNS qua cổng 443", "Protects DNS from snooping and poisoning over port 443");
+                                    checked: root.doh-enabled;
+                                    toggled(v) => { root.set-doh(v); }
+                                }
+                                RowSeparator { }
+                                ToggleRow {
+                                    title: Lang.t("DNS cục bộ", "Local DNS");
+                                    subtitle: Lang.t("Cache ở cổng 53, tự chọn HTTP/3 hoặc HTTP/2 nhanh hơn, dự phòng khi máy chủ lỗi. Tắt để chỉ dùng DoH của Windows", "A cache on port 53 that picks the faster of HTTP/3 and HTTP/2 and falls back when a server fails. Off uses Windows' own DoH only");
+                                    checked: root.doh-http3;
+                                    toggled(v) => { root.set-doh-http3(v); }
+                                }
+                            }
+                            GroupBox {
+                                title: Lang.t("Nhà cung cấp DNS", "DNS provider");
+                                RadioRow {
+                                    title: Lang.t("Tự động", "Automatic");
+                                    subtitle: root.dns-auto-detail;
+                                    selected: root.doh-provider < 0;
+                                    clicked => { root.doh-provider = -1; root.set-doh-provider(-1); }
+                                }
+                                RowSeparator { }
+                                RadioRow {
+                                    title: "Cloudflare";
+                                    logo: Theme.dark ? @image-url("../../../assets/dns/cloudflare-dark.svg") : @image-url("../../../assets/dns/cloudflare.svg");
+                                    logo-height: 32px;
+                                    subtitle: Lang.t("Nhanh và chú trọng quyền riêng tư", "Fast and privacy-focused");
+                                    badge: root.dns-stats[0];
+                                    selected: root.doh-provider == 0;
+                                    clicked => { root.doh-provider = 0; root.set-doh-provider(0); }
+                                }
+                                RowSeparator { }
+                                RadioRow {
+                                    title: "Google";
+                                    logo: @image-url("../../../assets/dns/google.svg");
+                                    logo-height: 26px;
+                                    subtitle: Lang.t("Ổn định, được dùng rộng rãi", "Reliable and widely used");
+                                    badge: root.dns-stats[1];
+                                    selected: root.doh-provider == 1;
+                                    clicked => { root.doh-provider = 1; root.set-doh-provider(1); }
+                                }
+                                RowSeparator { }
+                                RadioRow {
+                                    title: "AdGuard DNS";
+                                    logo: Theme.dark ? @image-url("../../../assets/dns/adguard-dark.svg") : @image-url("../../../assets/dns/adguard.svg");
+                                    logo-height: 30px;
+                                    subtitle: Lang.t("Chặn quảng cáo và trình theo dõi", "Blocks ads and trackers");
+                                    badge: root.dns-stats[2];
+                                    selected: root.doh-provider == 2;
+                                    clicked => { root.doh-provider = 2; root.set-doh-provider(2); }
+                                }
+                                RowSeparator { }
+                                Row {
+                                    title: Lang.t("Trạng thái", "Status");
+                                    subtitle: root.dns-status;
+                                    PillButton {
+                                        text: Lang.t("Kiểm tra", "Check");
+                                        clicked => { root.test-dns(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Page 5: Giao diện
+                        if root.page == 5: Page {
+                            width: parent.width;
+                            height: parent.height;
+                            VerticalLayout {
+                                spacing: 18px;
+                                GroupBox {
+                                    title: Lang.t("Chế độ hiển thị", "Display");
+                                    ToggleRow {
+                                        title: Lang.t("Chế độ tối (Dark mode)", "Dark mode");
+                                        subtitle: Lang.t("Chuyển đổi giao diện sáng hoặc tối", "Switch between light and dark");
+                                        checked: root.dark;
+                                        toggled(v) => {
+                                            root.dark = v;
+                                            root.set-dark(v);
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Ngôn ngữ", "Language");
+                                    Row {
+                                        title: Lang.t("Ngôn ngữ giao diện", "Display language");
+                                        subtitle: Lang.t("Áp dụng ngay, không cần mở lại ứng dụng", "Takes effect at once, no restart needed");
+                                        Segmented {
+                                            width: 220px;
+                                            options: ["Tiếng Việt", "English"];
+                                            current: root.english ? 1 : 0;
+                                            selected(i) => {
+                                                root.english = i == 1;
+                                                root.set-language(i == 1);
+                                            }
+                                        }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Màu nhấn (Accent color)", "Accent color");
+                                    Row {
+                                        title: Lang.t("Tông màu chủ đạo", "Main color");
+                                        subtitle: Lang.t("Áp dụng cho các nút, thanh chuyển đổi và mục đang chọn", "Used by buttons, switches and the selected item");
+                                        HorizontalLayout {
+                                            spacing: 12px;
+                                            Swatch { swatch-color: #0a7aff; selected: Theme.accent == #0a7aff; clicked => { root.set-accent(#0a7aff); } }
+                                            Swatch { swatch-color: #34c759; selected: Theme.accent == #34c759; clicked => { root.set-accent(#34c759); } }
+                                            Swatch { swatch-color: #ff9500; selected: Theme.accent == #ff9500; clicked => { root.set-accent(#ff9500); } }
+                                            Swatch { swatch-color: #ff375f; selected: Theme.accent == #ff375f; clicked => { root.set-accent(#ff375f); } }
+                                            Swatch { swatch-color: #af52de; selected: Theme.accent == #af52de; clicked => { root.set-accent(#af52de); } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Status line footer
+                    HorizontalLayout {
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        padding-bottom: 14px;
+                        padding-top: 4px;
+                        Text {
+                            text: root.log;
+                            font-size: Theme.fs-sub;
+                            color: Theme.label2;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update dialog, over the whole window.
+        if root.update-dialog != 0: Rectangle {
+            background: #00000080;
+            // Swallows clicks so nothing behind the dialog reacts.
+            TouchArea { }
+            Rectangle {
+                width: 380px;
+                height: dialog.preferred-height;
+                background: Theme.group;
+                border-radius: Theme.r-group;
+                border-width: 1px;
+                border-color: Theme.separator;
+                dialog := VerticalLayout {
+                    padding: 20px;
+                    spacing: 10px;
+                    Text {
+                        text: root.update-dialog == 3
+                            ? Lang.t("Chưa cập nhật được", "The update did not finish")
+                            : Lang.t("Đã có Yeager ", "Yeager ") + root.update-version + Lang.t("", " is available");
+                        font-size: Theme.fs-title;
+                        font-weight: 700;
+                        color: Theme.label;
+                    }
+                    Text {
+                        text: root.update-dialog == 3 ? root.update-error
+                            : root.update-dialog == 2 ? Lang.t("Đang tải bản mới… Yeager sẽ tự khởi động lại khi xong.", "Downloading… Yeager restarts by itself when it is done.")
+                            : Lang.t("Cập nhật ngay? Yeager sẽ tự tải về, thay file và khởi động lại. TCP và DNS được trả về như cũ trong lúc khởi động lại.",
+                                "Update now? Yeager downloads it, replaces itself and restarts. TCP and DNS are put back while it restarts.");
+                        font-size: Theme.fs-body;
+                        color: Theme.label2;
+                        wrap: word-wrap;
+                    }
+                    if root.update-dialog == 1: Text {
+                        text: Lang.t("Xem có gì mới", "See what's new");
+                        font-size: Theme.fs-body;
+                        color: Theme.accent;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.open-release-notes(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-top: 6px;
+                        spacing: 8px;
+                        alignment: end;
+                        PillButton {
+                            text: root.update-dialog == 3 ? Lang.t("Đóng", "Close") : Lang.t("Để sau", "Later");
+                            enabled: root.update-dialog != 2;
+                            clicked => { root.update-dialog = 0; }
+                        }
+                        PillButton {
+                            primary: true;
+                            text: root.update-dialog == 3 ? Lang.t("Mở trang tải về", "Open download page") : Lang.t("Cập nhật", "Update");
+                            enabled: root.update-dialog != 2;
+                            clicked => {
+                                if (root.update-dialog == 3) {
+                                    root.open-download-page();
+                                    root.update-dialog = 0;
+                                } else {
+                                    root.install-update();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The window has no frame, so its edges and corners resize it here.
+    ResizeEdge { edge: 0; x: 8px; y: 0; width: parent.width - 16px; height: 5px; mouse-cursor: ns-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 1; x: 8px; y: parent.height - 5px; width: parent.width - 16px; height: 5px; mouse-cursor: ns-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 2; x: 0; y: 8px; width: 5px; height: parent.height - 16px; mouse-cursor: ew-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 3; x: parent.width - 5px; y: 8px; width: 5px; height: parent.height - 16px; mouse-cursor: ew-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 4; x: 0; y: 0; width: 8px; height: 8px; mouse-cursor: nwse-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 5; x: parent.width - 8px; y: 0; width: 8px; height: 8px; mouse-cursor: nesw-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 6; x: 0; y: parent.height - 8px; width: 8px; height: 8px; mouse-cursor: nesw-resize; resize(e) => { root.resize-window(e); } }
+    ResizeEdge { edge: 7; x: parent.width - 8px; y: parent.height - 8px; width: 8px; height: 8px; mouse-cursor: nwse-resize; resize(e) => { root.resize-window(e); } }
+}

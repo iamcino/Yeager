@@ -1,0 +1,10 @@
+// UI language. Every label carries its Vietnamese and English text side by
+// side; `Lang.t` picks one, so switching re-renders without a restart.
+
+export global Lang {
+    in-out property <bool> english: false;
+
+    public pure function t(vi: string, en: string) -> string {
+        return self.english ? en : vi;
+    }
+}

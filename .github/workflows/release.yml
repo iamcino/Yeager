@@ -1,0 +1,135 @@
+name: Release
+
+# Pushing a tag like v1.0.0 builds Yeager on Windows and publishes a GitHub
+# release with the installer and a portable zip. Run it by hand to get the
+# same files as a workflow artifact; tick "publish" to also create the
+# v<Cargo version> tag on the chosen commit and release it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Create the v<version> tag and publish the release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'yeager' | Select-Object -ExpandProperty version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match the Cargo version $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Test
+        run: cargo test --locked --workspace --exclude levi
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=${{ steps.version.outputs.version }} installer\setup.iss
+
+      - name: Portable zip and checksums
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $stage = 'dist\Yeager-portable'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist\yeager.exe, LICENSE $stage
+          if (Test-Path THIRD-PARTY-NOTICES.md) { Copy-Item THIRD-PARTY-NOTICES.md $stage }
+          if (Test-Path licenses) { Copy-Item licenses $stage -Recurse }
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\Yeager-$v-portable-x64.zip" -Force
+          # yeager.exe on its own is what the in-app updater downloads; it
+          # checks it against this list.
+          Get-ChildItem dist\Yeager-Setup-$v.exe, dist\Yeager-$v-portable-x64.zip, dist\yeager.exe |
+            ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content dist\SHA256SUMS.txt -Encoding ascii
+
+      - name: Release notes
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          # This version's section of a changelog, without its heading.
+          function Section($file) {
+            $out = @()
+            if (Test-Path $file) {
+              $inside = $false
+              foreach ($line in Get-Content $file -Encoding utf8) {
+                if ($line -match '^## ') {
+                  if ($inside) { break }
+                  $inside = $line -match [regex]::Escape($v)
+                  continue
+                }
+                if ($inside) { $out += $line }
+              }
+            }
+            return ,$out
+          }
+          # English first, then Vietnamese under its own heading.
+          $notes = @()
+          $notes += Section 'CHANGELOG.md'
+          $vi = Section 'CHANGELOG.vi.md'
+          if ($vi.Count -gt 0) {
+            $notes += ''
+            $notes += '## Tiếng Việt'
+            $notes += $vi
+          }
+          $notes += ''
+          $notes += '---'
+          $notes += ''
+          $notes += 'Run `Yeager-Setup-' + $v + '.exe` to install, or unzip the portable build and run `yeager.exe` as administrator. Windows 10 1809 or later, x64.'
+          $notes += ''
+          $notes += '[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)'
+          $notes -join "`n" | Set-Content dist\RELEASE_NOTES.md -Encoding utf8
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: yeager-${{ steps.version.outputs.version }}
+          path: |
+            dist/Yeager-Setup-*.exe
+            dist/Yeager-*-portable-x64.zip
+            dist/yeager.exe
+            dist/SHA256SUMS.txt
+            dist/RELEASE_NOTES.md
+
+      - name: Publish release
+        if: github.ref_type == 'tag' || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Yeager ${{ steps.version.outputs.version }}
+          body_path: dist/RELEASE_NOTES.md
+          files: |
+            dist/Yeager-Setup-${{ steps.version.outputs.version }}.exe
+            dist/Yeager-${{ steps.version.outputs.version }}-portable-x64.zip
+            dist/yeager.exe
+            dist/SHA256SUMS.txt
+            LICENSE
+            THIRD-PARTY-NOTICES.md
+          fail_on_unmatched_files: false
