@@ -8,6 +8,9 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The installer and release notes now state the real requirement, Windows 11 or Windows Server 2022 (x64). Earlier notes said Windows 10 1809, but Yeager's DNS over HTTPS relies on Windows features that only exist on Windows 11.
+
 ## [1.1.1] - 2026-11-01
 
 ### Added
@@ -20,7 +23,6 @@ All notable changes to Yeager are documented here. The format follows
 ### Changed
 - The Engine page is shorter: domain lists no longer sit on the page, only their counts, and the target domain list only shows when the scope is "By domain".
 - List edits are saved as you type and applied once when you close the window, instead of restarting the engine after every change.
-
 
 ## [1.1.0] - 2026-10-31
 
