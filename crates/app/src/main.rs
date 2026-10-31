@@ -134,7 +134,7 @@ fn main() -> Result<(), slint::PlatformError> {
     updater::finish_previous_update(updated);
 
     #[cfg(windows)]
-    let _instance_guard = match platform::ensure_single_instance() {
+    let instance_guard = match platform::ensure_single_instance(updated) {
         platform::SingleInstanceDecision::Proceed(guard) => guard,
         platform::SingleInstanceDecision::AlreadyRunning => return Ok(()),
     };
@@ -155,6 +155,8 @@ fn main() -> Result<(), slint::PlatformError> {
 
     #[cfg(windows)]
     let tray = platform::setup(&ui);
+    #[cfg(windows)]
+    platform::watch_show_requests(&ui, &instance_guard);
     #[cfg(windows)]
     let has_tray = tray.is_some();
     #[cfg(not(windows))]
