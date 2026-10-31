@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 pub const PING_TARGETS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
 
 const SPEED_HOST: &str = "speed.cloudflare.com";
+/// Connect and read timeout for [`public_ip`]; Cloudflare answers well within it.
+const PUBLIC_IP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Round-trip times of the echoes that came back, out of `sent`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -145,11 +147,12 @@ pub fn download(bytes: u64, max_time: Duration) -> Result<Download> {
 /// A fresh TLS connection to the speed-test host, trusting the Windows
 /// certificate store (so it works behind antivirus TLS scanning).
 fn connect() -> Result<(rustls::ClientConnection, TcpStream)> {
-    connect_over(None)
+    connect_over(None, Duration::from_secs(5))
 }
 
-/// Like [`connect`], over IPv6 if `Some(true)` and IPv4 if `Some(false)`.
-fn connect_over(ipv6: Option<bool>) -> Result<(rustls::ClientConnection, TcpStream)> {
+/// Like [`connect`], over IPv6 if `Some(true)` and IPv4 if `Some(false)`,
+/// giving up on connecting and on each read after `timeout`.
+fn connect_over(ipv6: Option<bool>, timeout: Duration) -> Result<(rustls::ClientConnection, TcpStream)> {
     let err = |e: &dyn std::fmt::Display| Error::new(e.to_string());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
@@ -166,8 +169,8 @@ fn connect_over(ipv6: Option<bool>) -> Result<(rustls::ClientConnection, TcpStre
         .map_err(|e| err(&e))?
         .find(|a| ipv6.is_none_or(|v6| a.is_ipv6() == v6))
         .ok_or_else(|| err(&common::lang::tr("không phân giải được tên miền", "could not resolve the host")))?;
-    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| err(&e))?;
-    sock.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| err(&e))?;
+    let sock = TcpStream::connect_timeout(&addr, timeout).map_err(|e| err(&e))?;
+    sock.set_read_timeout(Some(timeout)).map_err(|e| err(&e))?;
     Ok((conn, sock))
 }
 
@@ -237,9 +240,11 @@ struct Response {
 }
 
 /// The address this PC uses on the Internet over IPv4 or IPv6, as Cloudflare
-/// sees it. Fails when there is no route over that family.
+/// sees it. Fails when there is no route over that family, and gives up
+/// quickly on a family that has a local address but does not get through
+/// (common with broken IPv6), so the network card does not hang on it.
 pub fn public_ip(ipv6: bool) -> Result<IpAddr> {
-    let meta = get_over("/meta", Some(ipv6))?;
+    let meta = get_over("/meta", Some(ipv6), PUBLIC_IP_TIMEOUT)?;
     let v: serde_json::Value = serde_json::from_slice(&meta.body).map_err(|e| Error::new(e.to_string()))?;
     v.get("clientIp")
         .and_then(|ip| ip.as_str()?.parse().ok())
@@ -262,12 +267,12 @@ pub fn local_ip(ipv6: bool) -> Option<IpAddr> {
 
 /// A small GET to the speed-test host over a fresh connection.
 fn get(path: &str) -> Result<Response> {
-    get_over(path, None)
+    get_over(path, None, Duration::from_secs(5))
 }
 
-fn get_over(path: &str, ipv6: Option<bool>) -> Result<Response> {
+fn get_over(path: &str, ipv6: Option<bool>, timeout: Duration) -> Result<Response> {
     let err = |e: &dyn std::fmt::Display| Error::new(e.to_string());
-    let (mut conn, mut sock) = connect_over(ipv6)?;
+    let (mut conn, mut sock) = connect_over(ipv6, timeout)?;
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {SPEED_HOST}\r\nUser-Agent: Yeager\r\nAccept: */*\r\nReferer: https://{SPEED_HOST}/\r\nConnection: close\r\n\r\n"
