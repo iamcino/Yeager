@@ -103,6 +103,17 @@ pub fn is_builtin_bypass(domain: &str) -> bool {
     is_builtin_doh(domain) || is_builtin_game(domain)
 }
 
+/// Evaluates whether an SNI connection should pass through raw without packet mutation.
+/// 1. Built-in DoH resolvers: ALWAYS pass-through raw (never fragmented).
+/// 2. Built-in Game & Anti-Cheat: pass-through if game_protection is active.
+/// 3. User-defined custom excluded domains: always pass-through.
+#[inline]
+pub fn should_pass_through(sni: &str, game_protection: bool, custom_excluded: &[String]) -> bool {
+    is_builtin_doh(sni)
+        || (game_protection && is_builtin_game(sni))
+        || custom_excluded.iter().any(|b| matches_host(sni, b))
+}
+
 /// Transport Layer Resilience & Stabilization Profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResilienceProfile {
@@ -438,19 +449,12 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     if let Some(ref inf) = info {
                         if let Some(sni) = inf.sni {
                             let s = sni.to_lowercase();
-                            // Check pass-through:
-                            // 1. Built-in DoH resolvers: ALWAYS pass-through raw (never fragmented).
-                            // 2. Built-in Game & Anti-Cheat: pass-through if game_protection is active.
-                            // 3. User-defined custom excluded domains: always pass-through.
-                            let is_doh = is_builtin_doh(&s);
-                            let is_game = game_protection && is_builtin_game(&s);
-                            let is_custom = custom_excluded.iter().any(|b| matches_host(&s, b));
-                            let is_bypassed = is_doh || is_game || is_custom;
+                            let is_bypassed = should_pass_through(&s, game_protection, &custom_excluded);
 
                             if is_bypassed {
                                 should_stabilize = false;
                                 STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
-                                if is_game {
+                                if game_protection && is_builtin_game(&s) {
                                     STATS_GAME_PROTECTED.fetch_add(1, Ordering::Relaxed);
                                 }
                             } else if is_hostlist {
@@ -642,23 +646,20 @@ mod tests {
         let game_protection = false;
         let custom_excluded: Vec<String> = vec!["mygame.com".to_string()];
 
-        let check_bypass = |sni: &str| -> bool {
-            let is_doh = is_builtin_doh(sni);
-            let is_game = game_protection && is_builtin_game(sni);
-            let is_custom = custom_excluded.iter().any(|b| matches_host(sni, b));
-            is_doh || is_game || is_custom
-        };
-
         // DoH MUST remain bypassed even with game_protection = false!
-        assert!(check_bypass("cloudflare-dns.com"));
-        assert!(check_bypass("dns.google"));
+        assert!(should_pass_through("cloudflare-dns.com", game_protection, &custom_excluded));
+        assert!(should_pass_through("dns.google", game_protection, &custom_excluded));
 
         // Game domains MUST NOT be bypassed when game_protection = false
-        assert!(!check_bypass("public-ubiservices.ubi.com"));
-        assert!(!check_bypass("auth.riotgames.com"));
+        assert!(!should_pass_through("public-ubiservices.ubi.com", game_protection, &custom_excluded));
+        assert!(!should_pass_through("auth.riotgames.com", game_protection, &custom_excluded));
 
         // Custom excluded domain MUST still be bypassed
-        assert!(check_bypass("mygame.com"));
-        assert!(check_bypass("sub.mygame.com"));
+        assert!(should_pass_through("mygame.com", game_protection, &custom_excluded));
+        assert!(should_pass_through("sub.mygame.com", game_protection, &custom_excluded));
+
+        // When game_protection = true, game domains MUST be bypassed
+        assert!(should_pass_through("public-ubiservices.ubi.com", true, &custom_excluded));
+        assert!(should_pass_through("auth.riotgames.com", true, &custom_excluded));
     }
 }
