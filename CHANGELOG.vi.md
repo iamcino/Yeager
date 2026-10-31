@@ -8,10 +8,14 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-10-31
+
+### Thêm
+- Mỗi lúc chỉ chạy một Yeager. Mở lại sẽ đưa cửa sổ đang chạy lên trước, kể cả khi nó đang ẩn ở khay hệ thống. Sau khi cập nhật trong ứng dụng, bản mới chờ bản cũ đóng hẳn, nên cập nhật xong Yeager luôn chạy lại.
+
 ### Thay đổi
-- Mở Yeager khi nó đang chạy (kể cả đang ở khay hệ thống) sẽ đưa cửa sổ đang chạy lên trước thay vì mở thêm bản thứ hai.
-- Thẻ Mạng: trên mạng có địa chỉ IPv6 nhưng IPv6 không thông, IPv6 công khai báo không lấy được sau khoảng 3 giây thay vì tới 10 giây.
-- Độ trễ thấp: mô tả ngắn gọn hơn, nói rõ dùng để làm gì và một phần cần khởi động lại máy.
+- Thẻ Mạng: trên mạng có địa chỉ IPv6 nhưng IPv6 không thông, nút Làm mới báo không lấy được IPv6 công khai sau khoảng 3 giây thay vì tới 10 giây.
+- Độ trễ thấp: mô tả ngắn gọn hơn, nói rõ chế độ dùng để làm gì và một phần chỉ có hiệu lực sau khi khởi động lại máy.
 
 ## [1.0.8] - 2026-10-30
 
@@ -152,6 +156,7 @@ Bản phát hành công khai đầu tiên.
 ### Sửa lỗi
 - Nút "Khôi phục mặc định Windows" ở trang TCP.
 
+[1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
 [1.0.8]: https://github.com/iamcino/Yeager/releases/tag/v1.0.8
 [1.0.7]: https://github.com/iamcino/Yeager/releases/tag/v1.0.7
 [1.0.6]: https://github.com/iamcino/Yeager/releases/tag/v1.0.6

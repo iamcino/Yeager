@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "serde",
 ]
@@ -1232,7 +1232,7 @@ checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
 name = "erwin"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "common",
  "rustls",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "hange"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "common",
  "futures-util",
@@ -2932,7 +2932,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "levi"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "common",
  "windows-sys 0.59.0",
@@ -6827,7 +6827,7 @@ checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
 
 [[package]]
 name = "yeager"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "common",
  "embed-resource",

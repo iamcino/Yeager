@@ -8,10 +8,14 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-10-31
+
+### Added
+- Only one Yeager runs at a time. Opening it again brings the running window to the front, even when it is hidden in the tray. After an in-app update the new version waits for the old one to close, so Yeager is always running again once the update finishes.
+
 ### Changed
-- Opening Yeager while it is already running (even from the tray) brings the running window to the front instead of starting a second copy.
-- Network card: on networks with an IPv6 address that does not get through, the public IPv6 shows as unavailable after about 3 seconds instead of up to 10.
-- Low latency: shorter description that says what it is for and that part of it needs a Windows restart.
+- Network card: on networks that have an IPv6 address but no working IPv6 connection, Refresh shows the public IPv6 address as unavailable after about 3 seconds instead of up to 10.
+- Low latency: a shorter description that says what the mode is for and that part of it only takes effect after a Windows restart.
 
 ## [1.0.8] - 2026-10-30
 
@@ -152,6 +156,7 @@ First public release.
 ### Fixed
 - "Restore Windows defaults" on the TCP page.
 
+[1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
 [1.0.8]: https://github.com/iamcino/Yeager/releases/tag/v1.0.8
 [1.0.7]: https://github.com/iamcino/Yeager/releases/tag/v1.0.7
 [1.0.6]: https://github.com/iamcino/Yeager/releases/tag/v1.0.6
