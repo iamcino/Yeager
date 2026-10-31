@@ -104,7 +104,15 @@ jobs:
           $notes += ''
           $notes += 'Run `Yeager-Setup-' + $v + '.exe` to install, or unzip the portable build and run `yeager.exe` as administrator. Windows 10 1809 or later, x64.'
           $notes += ''
-          $notes += '[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)'
+          $notes += '<p align="center">'
+          $notes += '  <a href="https://slint.dev">'
+          $notes += '    <picture>'
+          $notes += '      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-dark.svg">'
+          $notes += '      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-light.svg">'
+          $notes += '      <img alt="Made with Slint" src="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-light.svg" height="50">'
+          $notes += '    </picture>'
+          $notes += '  </a>'
+          $notes += '</p>'
           $notes -join "`n" | Set-Content dist\RELEASE_NOTES.md -Encoding utf8
 
       - uses: actions/upload-artifact@v5
