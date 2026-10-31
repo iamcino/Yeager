@@ -8,6 +8,11 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Thêm
+- **Game Shield.** Kết nối của game và launcher (Ubisoft Connect, Riot, Steam, Battle.net, EA, Epic, Xbox) giờ đi qua engine nguyên vẹn, nên đăng nhập và anti-cheat không bị ảnh hưởng bởi việc ổn định kết nối. Mặc định bật, có công tắc ở trang Engine; trang chính cho biết đang bật hay tắt.
+- **Tên miền để nguyên:** danh sách ở trang Engine cho các tên miền khác mà engine luôn để nguyên (kể cả tên miền con).
+- Trang Engine đếm số kết nối được để nguyên.
+
 ## [1.0.9] - 2026-10-31
 
 ### Thêm

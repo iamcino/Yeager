@@ -232,6 +232,9 @@ export component MainWindow inherits Window {
     in-out property <int> transport-profile: 0; // 0 Auto, 1 Fast, 2 Hardened, 3 Observe
     in property <int> stats-stabilized: 0;
     in property <int> stats-rst-silenced: 0;
+    in property <int> stats-passed-through: 0;
+    in property <bool> game-protection: true;
+    in property <[string]> excluded-domains;
     in property <string> congestion: "cubic";
     in-out property <int> congestion-sel: 2; // index into congestion options
     in property <bool> tcp-enabled: true;
@@ -274,6 +277,9 @@ export component MainWindow inherits Window {
     callback set-transport-profile(int);
     callback add-host(string);
     callback remove-host(int);
+    callback set-game-protection(bool);
+    callback add-excluded-domain(string);
+    callback remove-excluded-domain(int);
     callback set-congestion(int);
     callback apply-congestion();
     callback reset-tcp();
@@ -511,6 +517,13 @@ export component MainWindow inherits Window {
                                     }
                                     RowSeparator { }
                                     ValueRow {
+                                        title: "Game Shield";
+                                        value: root.game-protection ? Lang.t("Bật", "On") : Lang.t("Tắt", "Off");
+                                        value-color: root.game-protection && root.engine-active ? #34c759 : Theme.label2;
+                                        clicked => { root.page = 2; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
                                         title: Lang.t("DNS mã hóa", "Encrypted DNS");
                                         value: root.doh-enabled ? root.dns-status : Lang.t("Đã tắt", "Off");
                                         clicked => { root.page = 4; }
@@ -724,6 +737,48 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 GroupBox {
+                                    title: "Game Shield";
+                                    ToggleRow {
+                                        title: Lang.t("Để nguyên kết nối game", "Leave game connections untouched");
+                                        subtitle: Lang.t("Không chạm vào kết nối của game và launcher (Ubisoft, Riot, Steam, Battle.net…) để tránh lỗi đăng nhập và anti-cheat", "Game and launcher connections (Ubisoft, Riot, Steam, Battle.net…) pass as they are, avoiding login and anti-cheat errors");
+                                        checked: root.game-protection;
+                                        toggled(v) => { root.set-game-protection(v); }
+                                    }
+                                }
+                                GroupBox {
+                                    title: Lang.t("Tên miền để nguyên", "Excluded domains") + " (" + root.excluded-domains.length + ")";
+                                    Row {
+                                        title: Lang.t("Thêm tên miền", "Add a domain");
+                                        subtitle: Lang.t("Engine luôn để nguyên các tên miền này, kể cả tên miền con", "The engine always leaves these alone, subdomains included");
+                                        excluded-input := TextField {
+                                            width: 200px;
+                                            placeholder: Lang.t("game-của-bạn.com", "your-game.com");
+                                            accepted(t) => {
+                                                root.add-excluded-domain(t);
+                                                self.text = "";
+                                            }
+                                        }
+                                        PillButton {
+                                            text: Lang.t("Thêm", "Add");
+                                            primary: true;
+                                            clicked => {
+                                                root.add-excluded-domain(excluded-input.text);
+                                                excluded-input.text = "";
+                                            }
+                                        }
+                                    }
+                                    for domain[i] in root.excluded-domains: VerticalLayout {
+                                        RowSeparator { }
+                                        Row {
+                                            title: domain;
+                                            PillButton {
+                                                text: Lang.t("Xoá", "Remove");
+                                                clicked => { root.remove-excluded-domain(i); }
+                                            }
+                                        }
+                                    }
+                                }
+                                GroupBox {
                                     title: Lang.t("Hoạt động", "Activity");
                                     Row {
                                         title: Lang.t("Kết nối đã được ổn định", "Connections stabilised");
@@ -741,6 +796,18 @@ export component MainWindow inherits Window {
                                         subtitle: Lang.t("Gói ngắt kết nối bất thường do mạng chèn vào trước khi máy chủ kịp trả lời", "Abnormal resets injected before the server can answer");
                                         Text {
                                             text: root.stats-rst-silenced;
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            font-weight: 500;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Kết nối được để nguyên", "Connections left untouched");
+                                        subtitle: Lang.t("Game, launcher, DNS mã hóa và tên miền để nguyên", "Games, launchers, encrypted DNS and excluded domains");
+                                        Text {
+                                            text: root.stats-passed-through;
                                             color: Theme.label2;
                                             font-size: Theme.fs-body;
                                             font-weight: 500;

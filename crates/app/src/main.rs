@@ -106,6 +106,8 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &Config) {
     ui.set_doh_provider(provider_index(cfg));
     ui.set_doh_http3(cfg.doh_http3);
     set_hosts(ui, cfg);
+    ui.set_game_protection(cfg.game_protection_enabled);
+    set_excluded_domains(ui, cfg);
     ui.set_transport_profile(transport_profile_index(cfg.transport_profile));
     ui.set_connect_on_launch(cfg.connect_on_launch);
     ui.set_launch_login(cfg.launch_at_login);
@@ -322,6 +324,57 @@ fn main() -> Result<(), slint::PlatformError> {
             let host = cfg.borrow_mut().hosts.remove(i);
             config::save(&cfg.borrow());
             set_hosts(&ui, &cfg.borrow());
+            ui.set_log(t!("Đã xoá {host}.", "Removed {host}.").into());
+            restart_engine_if_active(&ui, &cfg.borrow());
+        });
+    }
+
+    // --- Game Shield ---
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        ui.on_set_game_protection(move |on| {
+            let Some(ui) = w.upgrade() else { return };
+            cfg.borrow_mut().game_protection_enabled = on;
+            config::save(&cfg.borrow());
+            ui.set_game_protection(on);
+            restart_engine_if_active(&ui, &cfg.borrow());
+        });
+    }
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        ui.on_add_excluded_domain(move |text| {
+            let Some(ui) = w.upgrade() else { return };
+            let Some(host) = normalize_host(&text) else {
+                if !text.trim().is_empty() {
+                    ui.set_log(t!("\"{}\" không phải tên miền hợp lệ.", "\"{}\" is not a valid domain.", text.trim()).into());
+                }
+                return;
+            };
+            if cfg.borrow().custom_excluded_domains.contains(&host) {
+                ui.set_log(t!("{host} đã có trong danh sách.", "{host} is already in the list.").into());
+                return;
+            }
+            cfg.borrow_mut().custom_excluded_domains.push(host.clone());
+            config::save(&cfg.borrow());
+            set_excluded_domains(&ui, &cfg.borrow());
+            ui.set_log(t!("Đã thêm {host}.", "Added {host}.").into());
+            restart_engine_if_active(&ui, &cfg.borrow());
+        });
+    }
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        ui.on_remove_excluded_domain(move |i| {
+            let Some(ui) = w.upgrade() else { return };
+            let i = i as usize;
+            if i >= cfg.borrow().custom_excluded_domains.len() {
+                return;
+            }
+            let host = cfg.borrow_mut().custom_excluded_domains.remove(i);
+            config::save(&cfg.borrow());
+            set_excluded_domains(&ui, &cfg.borrow());
             ui.set_log(t!("Đã xoá {host}.", "Removed {host}.").into());
             restart_engine_if_active(&ui, &cfg.borrow());
         });
@@ -1276,6 +1329,11 @@ fn set_hosts(ui: &MainWindow, cfg: &Config) {
     ui.set_hosts(ModelRc::new(VecModel::from(hosts)));
 }
 
+fn set_excluded_domains(ui: &MainWindow, cfg: &Config) {
+    let domains: Vec<SharedString> = cfg.custom_excluded_domains.iter().map(SharedString::from).collect();
+    ui.set_excluded_domains(ModelRc::new(VecModel::from(domains)));
+}
+
 /// Turns user input like `https://www.Discord.com/app` into `www.discord.com`.
 /// Returns `None` when it is not a plausible domain name.
 fn normalize_host(input: &str) -> Option<String> {
@@ -1305,10 +1363,12 @@ fn refresh_engine_stats(ui: &MainWindow) {
     let (_, stabilized, rsts) = engine::get_telemetry();
     ui.set_stats_stabilized(i32::try_from(stabilized).unwrap_or(i32::MAX));
     ui.set_stats_rst_silenced(i32::try_from(rsts).unwrap_or(i32::MAX));
+    let passed = levi::STATS_BYPASSED.load(std::sync::atomic::Ordering::Relaxed);
+    ui.set_stats_passed_through(i32::try_from(passed).unwrap_or(i32::MAX));
 }
 
-/// The engine reads the scope and host list when it starts, so restart it to
-/// apply a change made while it is running.
+/// The engine reads the scope, host list and Game Shield settings when it
+/// starts, so restart it to apply a change made while it is running.
 fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
     if !ui.get_engine_active() {
         return;

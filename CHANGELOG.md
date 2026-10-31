@@ -8,6 +8,11 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Game Shield.** Connections of games and launchers (Ubisoft Connect, Riot, Steam, Battle.net, EA, Epic, Xbox) now pass through the engine untouched, so logins and anti-cheat checks are not tripped by connection stabilisation. It is on by default and has a switch on the Engine page; the home page shows whether it is on.
+- **Excluded domains:** a list on the Engine page for any other domain the engine should always leave alone (subdomains included).
+- The Engine page counts the connections left untouched.
+
 ## [1.0.9] - 2026-10-31
 
 ### Added
