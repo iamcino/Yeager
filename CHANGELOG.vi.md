@@ -8,6 +8,11 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Thay đổi
+- Mở Yeager khi nó đang chạy (kể cả đang ở khay hệ thống) sẽ đưa cửa sổ đang chạy lên trước thay vì mở thêm bản thứ hai.
+- Thẻ Mạng: trên mạng có địa chỉ IPv6 nhưng IPv6 không thông, IPv6 công khai báo không lấy được sau khoảng 3 giây thay vì tới 10 giây.
+- Độ trễ thấp: mô tả ngắn gọn hơn, nói rõ dùng để làm gì và một phần cần khởi động lại máy.
+
 ## [1.0.8] - 2026-10-30
 
 ### Thay đổi

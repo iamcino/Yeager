@@ -813,7 +813,7 @@ export component MainWindow inherits Window {
                                     title: Lang.t("Độ trễ thấp", "Low latency");
                                     ToggleRow {
                                         title: Lang.t("Bật chế độ độ trễ thấp", "Enable low-latency mode");
-                                        subtitle: Lang.t("Gửi ACK ngay, tắt Nagle, bỏ giới hạn mạng khi phát media, tắt tiết kiệm điện card mạng. Mạng ngắt vài giây khi bật/tắt; giữ nguyên khi thoát app", "Immediate ACKs, no Nagle, no network throttling during media, adapter power saving off. The network drops for a few seconds when switched; stays on after the app exits");
+                                        subtitle: Lang.t("Giảm giật khi chơi game, remote desktop. Mạng ngắt vài giây khi bật/tắt; một phần cần khởi động lại máy. Vẫn giữ khi thoát app", "Less stutter in games and remote desktop. The network drops for a few seconds when switched; part of it needs a Windows restart. Stays on after the app exits");
                                         checked: root.low-latency;
                                         enabled: !root.latency-busy;
                                         toggled(v) => { root.set-low-latency(v); }

@@ -8,6 +8,11 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Opening Yeager while it is already running (even from the tray) brings the running window to the front instead of starting a second copy.
+- Network card: on networks with an IPv6 address that does not get through, the public IPv6 shows as unavailable after about 3 seconds instead of up to 10.
+- Low latency: shorter description that says what it is for and that part of it needs a Windows restart.
+
 ## [1.0.8] - 2026-10-30
 
 ### Changed
