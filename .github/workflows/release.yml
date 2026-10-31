@@ -102,7 +102,7 @@ jobs:
           $notes += ''
           $notes += '---'
           $notes += ''
-          $notes += 'Run `Yeager-Setup-' + $v + '.exe` to install, or unzip the portable build and run `yeager.exe` as administrator. Windows 10 1809 or later, x64.'
+          $notes += 'Run `Yeager-Setup-' + $v + '.exe` to install, or unzip the portable build and run `yeager.exe` as administrator. Requires Windows 11 or Windows Server 2022, x64.'
           $notes += ''
           $notes += '<p align="center">'
           $notes += '  <a href="https://slint.dev">'

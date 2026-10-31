@@ -8,6 +8,9 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The installer and release notes now state the real requirement, Windows 11 or Windows Server 2022 (x64). Earlier notes said Windows 10 1809, but Yeager's DNS over HTTPS relies on Windows features that only exist on Windows 11.
+
 ## [1.1.0] - 2026-10-31
 
 ### Added

@@ -8,6 +8,9 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Sửa lỗi
+- Bộ cài và ghi chú phát hành giờ ghi đúng yêu cầu: Windows 11 hoặc Windows Server 2022 (x64). Ghi chú cũ nói Windows 10 1809, nhưng DNS over HTTPS của Yeager dựa vào tính năng chỉ có trên Windows 11.
+
 ## [1.1.0] - 2026-10-31
 
 ### Thêm

@@ -37,7 +37,8 @@ WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0.17763
+; Windows DNS over HTTPS (DNS_INTERFACE_SETTINGS3) exists only on Windows 11 / Server 2022.
+MinVersion=10.0.20348
 CloseApplications=force
 
 [Languages]
