@@ -32,6 +32,61 @@ static CURRENT_HANDLE: Mutex<Option<(Arc<WinDivertApi>, SafeHandle)>> = Mutex::n
 pub static STATS_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_STABILIZED: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_DROPPED_RSTS: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_BYPASSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Built-in pass-through domains that must NEVER be fragmented or mutated.
+/// Includes DoH resolvers, gaming ecosystems, anti-cheat gateways, and services
+/// with strict WAF/anti-tamper middleboxes (e.g. AWS ALB, Akamai Edge).
+pub const BUILTIN_BYPASS_DOMAINS: &[&str] = &[
+    // Encrypted DNS Resolvers (DoH)
+    "cloudflare-dns.com",
+    "dns.google",
+    "dns.quad9.net",
+    "one.one.one.one",
+    "dns.adguard-dns.com",
+    "dns.adguard.com",
+
+    // Ubisoft Connect & Services
+    "ubi.com",
+    "ubisoft.com",
+    "ubisoftconnect.com",
+    "uplay.com",
+    "ubi.li",
+
+    // Riot Games (Vanguard / LoL / Valorant)
+    "riotgames.com",
+    "pvp.net",
+    "leagueoflegends.com",
+    "valgame.net",
+
+    // Blizzard / Battle.net
+    "battle.net",
+    "blizzard.com",
+
+    // Electronic Arts / Origin
+    "ea.com",
+    "origin.com",
+
+    // Epic Games & Unreal Engine
+    "epicgames.com",
+    "unrealengine.com",
+
+    // Valve / Steam
+    "steampowered.com",
+    "steamcommunity.com",
+    "steamcontent.com",
+    "steamstatic.com",
+
+    // Microsoft Gaming / Xbox / PlayFab
+    "xboxlive.com",
+    "playfabapi.com",
+];
+
+/// Checks whether a domain should be bypassed without packet mutation.
+#[inline]
+pub fn is_builtin_bypass(domain: &str) -> bool {
+    BUILTIN_BYPASS_DOMAINS.iter().any(|target| matches_host(domain, target))
+}
 
 /// Transport Layer Resilience & Stabilization Profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -361,15 +416,10 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     if let Some(ref inf) = info {
                         if let Some(sni) = inf.sni {
                             let s = sni.to_lowercase();
-                            // Never mutate upstream DoH traffic to DNS resolvers (Cloudflare, Google, Quad9, AdGuard)
-                            if s == "cloudflare-dns.com"
-                                || s == "dns.google"
-                                || s == "dns.quad9.net"
-                                || s == "one.one.one.one"
-                                || s == "dns.adguard-dns.com"
-                                || s == "dns.adguard.com"
-                            {
+                            // Check built-in bypass: DoH resolvers, game launchers & sensitive WAF endpoints
+                            if is_builtin_bypass(&s) {
                                 should_stabilize = false;
+                                STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
                             } else if is_hostlist {
                                 should_stabilize = target_hosts.iter().any(|target| {
                                     matches_host(&s, target)
@@ -523,5 +573,30 @@ mod tests {
 
         let prof2 = "passive".parse::<ResilienceProfile>().expect("Should parse passive");
         assert_eq!(prof2, ResilienceProfile::Observe);
+    }
+
+    #[test]
+    fn test_is_builtin_bypass_domains() {
+        // Game ecosystems & sensitive WAF endpoints (MUST bypass)
+        assert!(is_builtin_bypass("public-ubiservices.ubi.com"));
+        assert!(is_builtin_bypass("connect.ubisoft.com"));
+        assert!(is_builtin_bypass("uplaypc-s-ubisoft.cdn.ubi.com"));
+        assert!(is_builtin_bypass("auth.riotgames.com"));
+        assert!(is_builtin_bypass("client.battle.net"));
+        assert!(is_builtin_bypass("origin.com"));
+        assert!(is_builtin_bypass("epicgames.com"));
+        assert!(is_builtin_bypass("steamcontent.com"));
+        assert!(is_builtin_bypass("playfabapi.com"));
+
+        // DoH resolvers (MUST bypass)
+        assert!(is_builtin_bypass("cloudflare-dns.com"));
+        assert!(is_builtin_bypass("dns.google"));
+        assert!(is_builtin_bypass("dns.adguard-dns.com"));
+
+        // Target domains that should be stabilized (MUST NOT bypass)
+        assert!(!is_builtin_bypass("discord.com"));
+        assert!(!is_builtin_bypass("google.com"));
+        assert!(!is_builtin_bypass("youtube.com"));
+        assert!(!is_builtin_bypass("notubi.com"));
     }
 }
