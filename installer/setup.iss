@@ -1,12 +1,12 @@
 ; Yeager — Windows installer (Inno Setup 6)
 ;
 ; Build: run build.ps1 first (it puts yeager.exe in dist\), then
-;   iscc /DAppVersion=1.0.9 installer\setup.iss
+;   iscc /DAppVersion=1.1.0 installer\setup.iss
 ; The release workflow does both and passes the version from the git tag.
 
 #define AppName "Yeager"
 #ifndef AppVersion
-  #define AppVersion "1.0.9"
+  #define AppVersion "1.1.0"
 #endif
 #define AppPublisher "Cino"
 #define AppURL "https://github.com/iamcino/Yeager"

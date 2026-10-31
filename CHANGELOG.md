@@ -8,6 +8,8 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-31
+
 ### Added
 - **Game Shield.** Connections of games and launchers (Ubisoft Connect, Riot, Steam, Battle.net, EA, Epic, Xbox) now pass through the engine untouched, so logins and anti-cheat checks are not tripped by connection stabilisation. It is on by default and has a switch on the Engine page; the home page shows whether it is on.
 - **Excluded domains:** a list on the Engine page for any other domain the engine should always leave alone (subdomains included).
@@ -163,6 +165,7 @@ First public release.
 ### Fixed
 - "Restore Windows defaults" on the TCP page.
 
+[1.1.0]: https://github.com/iamcino/Yeager/releases/tag/v1.1.0
 [1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
 [1.0.8]: https://github.com/iamcino/Yeager/releases/tag/v1.0.8
 [1.0.7]: https://github.com/iamcino/Yeager/releases/tag/v1.0.7
