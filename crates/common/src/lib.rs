@@ -201,6 +201,10 @@ pub struct Config {
     pub transport_profile: TransportProfile,
     /// Window size in logical pixels, as the user last left it.
     pub window_size: Option<[u32; 2]>,
+    /// Whether automatic game launcher and anti-cheat safe pass-through is enabled.
+    pub game_protection_enabled: bool,
+    /// User-defined domains excluded from transport resilience (raw pass-through).
+    pub custom_excluded_domains: Vec<String>,
 }
 
 impl Default for Config {
@@ -231,6 +235,8 @@ impl Default for Config {
             language: None,
             transport_profile: TransportProfile::default(),
             window_size: None,
+            game_protection_enabled: true,
+            custom_excluded_domains: Vec::new(),
         }
     }
 }

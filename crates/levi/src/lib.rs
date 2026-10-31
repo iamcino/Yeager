@@ -267,6 +267,13 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
         .iter()
         .map(|h| h.trim().to_lowercase())
         .collect();
+    let game_protection = cfg.game_protection_enabled;
+    let custom_excluded: Vec<String> = cfg
+        .custom_excluded_domains
+        .iter()
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
 
     RUNNING.store(true, Ordering::SeqCst);
 
@@ -416,8 +423,12 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     if let Some(ref inf) = info {
                         if let Some(sni) = inf.sni {
                             let s = sni.to_lowercase();
-                            // Check built-in bypass: DoH resolvers, game launchers & sensitive WAF endpoints
-                            if is_builtin_bypass(&s) {
+                            // Check built-in bypass: DoH resolvers, game launchers & sensitive WAF endpoints,
+                            // or user-defined custom excluded domains
+                            let is_bypassed = (game_protection && is_builtin_bypass(&s))
+                                || custom_excluded.iter().any(|b| matches_host(&s, b));
+
+                            if is_bypassed {
                                 should_stabilize = false;
                                 STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
                             } else if is_hostlist {
