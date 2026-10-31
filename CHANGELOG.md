@@ -11,11 +11,13 @@ All notable changes to Yeager are documented here. The format follows
 ## [1.0.9] - 2026-10-31
 
 ### Added
-- Only one Yeager runs at a time. Opening it again brings the running window to the front, even when it is hidden in the tray. After an in-app update the new version waits for the old one to close, so Yeager is always running again once the update finishes.
+- **One Yeager at a time.** Opening Yeager while it is already running, from the Start menu, the desktop shortcut or a second double-click, brings the running window to the front, even when it is hidden in the tray, instead of starting a second copy that would fight over the same TCP and DNS settings.
 
 ### Changed
-- Network card: on networks that have an IPv6 address but no working IPv6 connection, Refresh shows the public IPv6 address as unavailable after about 3 seconds instead of up to 10.
-- Low latency: a shorter description that says what the mode is for and that part of it only takes effect after a Windows restart.
+- **Updates finish cleanly.** After an in-app update the new version waits for the old one to close and put the network settings back before it starts, so Yeager is always running again once the update is done.
+- **Network card:** on networks that have an IPv6 address but no working IPv6 connection, Refresh shows the public IPv6 address as unavailable after about 3 seconds instead of up to 10. IPv4-only networks still finish at once.
+- **Low latency:** a shorter description that says what the mode is for (games, remote desktop), that the network drops for a few seconds when it is switched, and that part of it only takes effect after a Windows restart.
+- `yeager.exe` file properties now describe Yeager as a Windows network optimization and transport resilience app.
 
 ## [1.0.8] - 2026-10-30
 

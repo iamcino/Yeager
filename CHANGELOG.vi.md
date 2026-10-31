@@ -11,11 +11,13 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 ## [1.0.9] - 2026-10-31
 
 ### Thêm
-- Mỗi lúc chỉ chạy một Yeager. Mở lại sẽ đưa cửa sổ đang chạy lên trước, kể cả khi nó đang ẩn ở khay hệ thống. Sau khi cập nhật trong ứng dụng, bản mới chờ bản cũ đóng hẳn, nên cập nhật xong Yeager luôn chạy lại.
+- **Mỗi lúc chỉ một Yeager.** Mở Yeager khi nó đang chạy, từ menu Start, shortcut ngoài desktop hay bấm đúp thêm lần nữa, sẽ đưa cửa sổ đang chạy lên trước, kể cả khi nó đang ẩn ở khay hệ thống, thay vì mở thêm bản thứ hai tranh nhau cùng thiết lập TCP và DNS.
 
 ### Thay đổi
-- Thẻ Mạng: trên mạng có địa chỉ IPv6 nhưng IPv6 không thông, nút Làm mới báo không lấy được IPv6 công khai sau khoảng 3 giây thay vì tới 10 giây.
-- Độ trễ thấp: mô tả ngắn gọn hơn, nói rõ chế độ dùng để làm gì và một phần chỉ có hiệu lực sau khi khởi động lại máy.
+- **Cập nhật hoàn tất gọn gàng.** Sau khi cập nhật trong ứng dụng, bản mới chờ bản cũ đóng hẳn và trả thiết lập mạng về như cũ rồi mới chạy, nên cập nhật xong Yeager luôn chạy lại.
+- **Thẻ Mạng:** trên mạng có địa chỉ IPv6 nhưng IPv6 không thông, nút Làm mới báo không lấy được IPv6 công khai sau khoảng 3 giây thay vì tới 10 giây. Mạng chỉ có IPv4 vẫn xong ngay.
+- **Độ trễ thấp:** mô tả ngắn gọn hơn, nói rõ chế độ dùng để làm gì (chơi game, remote desktop), mạng ngắt vài giây khi bật/tắt, và một phần chỉ có hiệu lực sau khi khởi động lại máy.
+- Thuộc tính file `yeager.exe` giờ mô tả Yeager là ứng dụng tối ưu mạng và tăng độ ổn định đường truyền cho Windows.
 
 ## [1.0.8] - 2026-10-30
 
