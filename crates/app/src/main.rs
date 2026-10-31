@@ -133,6 +133,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let resume = std::env::args().any(|a| a == updater::CONNECT_ARG);
     updater::finish_previous_update(updated);
 
+    #[cfg(windows)]
+    let _instance_guard = match platform::ensure_single_instance() {
+        platform::SingleInstanceDecision::Proceed(guard) => guard,
+        platform::SingleInstanceDecision::AlreadyRunning => return Ok(()),
+    };
+
     let ui = MainWindow::new()?;
     let cfg = Rc::new(RefCell::new(config::load()));
     if let Some([width, height]) = cfg.borrow().window_size {
@@ -835,10 +841,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let w = ui.as_weak();
         let cfg = cfg.clone();
         move || {
-            if let Some(ui) = w.upgrade() {
-                if cfg.borrow().check_updates {
-                    check_for_update(&ui, w.clone(), true);
-                }
+            if let Some(ui) = w.upgrade()
+                && cfg.borrow().check_updates {
+                check_for_update(&ui, w.clone(), true);
             }
         }
     };

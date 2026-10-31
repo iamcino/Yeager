@@ -10,7 +10,7 @@ pub fn start(cfg: &Config) -> Result<()> {
         TransportProfile::Hardened => levi::ResilienceProfile::Hardened,
         TransportProfile::Observe => levi::ResilienceProfile::Observe,
     };
-    levi::start_with_profile(cfg, profile).map_err(|e| Error::new(e))
+    levi::start_with_profile(cfg, profile).map_err(Error::new)
 }
 
 /// Stops the native Levi engine.

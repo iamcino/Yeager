@@ -46,7 +46,7 @@ BLOCK "StringFileInfo"
 {{
 BLOCK "000004b0"
 {{
-VALUE "FileDescription", "Yeager - Pure Networking Freedom & TCP Engine\0"
+VALUE "FileDescription", "Yeager - Modern Windows Network Optimization & Transport Resilience Platform\0"
 VALUE "ProductName", "Yeager\0"
 VALUE "OriginalFilename", "yeager.exe\0"
 VALUE "ProductVersion", "{version}\0"

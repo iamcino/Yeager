@@ -18,5 +18,12 @@ $dist = Join-Path $PSScriptRoot "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Copy-Item $exe (Join-Path $dist "yeager.exe") -Force
 
+$leviExe = Join-Path $PSScriptRoot "target\release\levi.exe"
+if (Test-Path $leviExe) {
+    Copy-Item $leviExe (Join-Path $dist "levi.exe") -Force
+    $leviSize = [math]::Round((Get-Item $leviExe).Length / 1KB, 0)
+    Write-Host "Done. dist\levi.exe ($leviSize KB)" -ForegroundColor Green
+}
+
 $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host "Done. dist\yeager.exe ($size MB)" -ForegroundColor Green

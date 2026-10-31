@@ -428,3 +428,142 @@ pub fn apply_window_chrome(ui: &MainWindow) {
         );
     }
 }
+
+
+const INVALID_HANDLE_VALUE: windows_sys::Win32::Foundation::HANDLE = (-1isize) as _;
+const SYNCHRONIZE: u32 = 0x00100000;
+const PROCESS_TERMINATE: u32 = 0x0001;
+
+/// Handle guard that holds the Windows named mutex for the process lifetime.
+pub struct SingleInstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+pub enum SingleInstanceDecision {
+    /// Proceed running as the unique instance.
+    Proceed(SingleInstanceGuard),
+    /// An existing responsive instance was brought to front; exit immediately.
+    AlreadyRunning,
+}
+
+struct EnumWndContext {
+    target_pid: u32,
+    found_hwnds: Vec<HWND>,
+}
+
+unsafe extern "system" fn enum_wnd_proc(hwnd: HWND, lparam: windows_sys::Win32::Foundation::LPARAM) -> i32 {
+    let ctx = unsafe { &mut *(lparam as *mut EnumWndContext) };
+    let mut pid = 0;
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == ctx.target_pid {
+        ctx.found_hwnds.push(hwnd);
+    }
+    1
+}
+
+/// Enforces a single unique Yeager instance on the system.
+///
+/// If an existing instance is active and responsive:
+/// - Brings its window to foreground, and returns SingleInstanceDecision::AlreadyRunning.
+///
+/// If an existing instance is hung, deadlocked, or a headless zombie stuck in Task Manager:
+/// - Forcefully terminates the dead process so the new instance can start cleanly.
+pub fn ensure_single_instance() -> SingleInstanceDecision {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateMutexW, GetCurrentProcessId, OpenProcess, TerminateProcess, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, IsHungAppWindow, SendMessageTimeoutW, SetForegroundWindow, ShowWindow,
+        SMTO_ABORTIFHUNG, SW_RESTORE, SW_SHOW, WM_NULL,
+    };
+
+    let my_pid = unsafe { GetCurrentProcessId() };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot != INVALID_HANDLE_VALUE {
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snapshot, &mut pe) != 0 {
+                loop {
+                    if pe.th32ProcessID != my_pid && pe.th32ProcessID != 0 {
+                        let exe_len = (0..).take_while(|&i| pe.szExeFile[i] != 0).count();
+                        let exe_name = String::from_utf16_lossy(&pe.szExeFile[..exe_len]).to_lowercase();
+
+                        if exe_name == "yeager.exe" {
+                            let target_pid = pe.th32ProcessID;
+                            let mut ctx = EnumWndContext {
+                                target_pid,
+                                found_hwnds: Vec::new(),
+                            };
+                            EnumWindows(Some(enum_wnd_proc), &mut ctx as *mut _ as isize);
+
+                            let mut responsive_hwnd = None;
+                            for &w in &ctx.found_hwnds {
+                                if IsHungAppWindow(w) == 0 {
+                                    let mut dummy = 0;
+                                    let ok = SendMessageTimeoutW(
+                                        w,
+                                        WM_NULL,
+                                        0,
+                                        0,
+                                        SMTO_ABORTIFHUNG,
+                                        1500,
+                                        &mut dummy,
+                                    );
+                                    if ok != 0 {
+                                        responsive_hwnd = Some(w);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(w) = responsive_hwnd {
+                                ShowWindow(w, SW_SHOW);
+                                ShowWindow(w, SW_RESTORE);
+                                SetForegroundWindow(w);
+                                CloseHandle(snapshot);
+                                return SingleInstanceDecision::AlreadyRunning;
+                            } else {
+                                // Stuck or headless zombie without responsive UI/tray: terminate it
+                                let h_proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, target_pid);
+                                if !h_proc.is_null() {
+                                    TerminateProcess(h_proc, 1);
+                                    WaitForSingleObject(h_proc, 2500);
+                                    CloseHandle(h_proc);
+                                }
+                            }
+                        }
+                    }
+
+                    if Process32NextW(snapshot, &mut pe) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+
+        let mutex_name: Vec<u16> = "Local\\Yeager_SingleInstance_Mutex\0".encode_utf16().collect();
+        let handle = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+
+        SingleInstanceDecision::Proceed(SingleInstanceGuard { handle })
+    }
+}

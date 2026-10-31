@@ -6,7 +6,7 @@
 
 #define AppName "Yeager"
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.8"
 #endif
 #define AppPublisher "Cino"
 #define AppURL "https://github.com/iamcino/Yeager"
