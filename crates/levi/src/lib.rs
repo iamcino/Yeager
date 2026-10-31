@@ -33,19 +33,22 @@ pub static STATS_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_STABILIZED: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_DROPPED_RSTS: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_BYPASSED: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_GAME_PROTECTED: AtomicUsize = AtomicUsize::new(0);
 
-/// Built-in pass-through domains that must NEVER be fragmented or mutated.
-/// Includes DoH resolvers, gaming ecosystems, anti-cheat gateways, and services
-/// with strict WAF/anti-tamper middleboxes (e.g. AWS ALB, Akamai Edge).
-pub const BUILTIN_BYPASS_DOMAINS: &[&str] = &[
-    // Encrypted DNS Resolvers (DoH)
+/// Encrypted DNS Resolvers (DoH) that must ALWAYS pass through raw without mutation,
+/// ensuring reliable DNS queries regardless of whether Game Shield is enabled.
+pub const BUILTIN_DOH_DOMAINS: &[&str] = &[
     "cloudflare-dns.com",
     "dns.google",
     "dns.quad9.net",
     "one.one.one.one",
     "dns.adguard-dns.com",
     "dns.adguard.com",
+];
 
+/// Gaming ecosystems, launchers, anti-cheat gateways, and sensitive game APIs
+/// that pass through raw when Game Shield (`game_protection_enabled`) is active.
+pub const BUILTIN_GAME_DOMAINS: &[&str] = &[
     // Ubisoft Connect & Services
     "ubi.com",
     "ubisoft.com",
@@ -82,10 +85,22 @@ pub const BUILTIN_BYPASS_DOMAINS: &[&str] = &[
     "playfabapi.com",
 ];
 
-/// Checks whether a domain should be bypassed without packet mutation.
+/// Checks whether a domain is a built-in encrypted DNS resolver (always pass-through).
+#[inline]
+pub fn is_builtin_doh(domain: &str) -> bool {
+    BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(domain, target))
+}
+
+/// Checks whether a domain belongs to the built-in game and anti-cheat pass-through list.
+#[inline]
+pub fn is_builtin_game(domain: &str) -> bool {
+    BUILTIN_GAME_DOMAINS.iter().any(|target| matches_host(domain, target))
+}
+
+/// Checks whether a domain is in either DoH or Game built-in pass-through list.
 #[inline]
 pub fn is_builtin_bypass(domain: &str) -> bool {
-    BUILTIN_BYPASS_DOMAINS.iter().any(|target| matches_host(domain, target))
+    is_builtin_doh(domain) || is_builtin_game(domain)
 }
 
 /// Transport Layer Resilience & Stabilization Profiles.
@@ -423,14 +438,21 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     if let Some(ref inf) = info {
                         if let Some(sni) = inf.sni {
                             let s = sni.to_lowercase();
-                            // Check built-in bypass: DoH resolvers, game launchers & sensitive WAF endpoints,
-                            // or user-defined custom excluded domains
-                            let is_bypassed = (game_protection && is_builtin_bypass(&s))
-                                || custom_excluded.iter().any(|b| matches_host(&s, b));
+                            // Check pass-through:
+                            // 1. Built-in DoH resolvers: ALWAYS pass-through raw (never fragmented).
+                            // 2. Built-in Game & Anti-Cheat: pass-through if game_protection is active.
+                            // 3. User-defined custom excluded domains: always pass-through.
+                            let is_doh = is_builtin_doh(&s);
+                            let is_game = game_protection && is_builtin_game(&s);
+                            let is_custom = custom_excluded.iter().any(|b| matches_host(&s, b));
+                            let is_bypassed = is_doh || is_game || is_custom;
 
                             if is_bypassed {
                                 should_stabilize = false;
                                 STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
+                                if is_game {
+                                    STATS_GAME_PROTECTED.fetch_add(1, Ordering::Relaxed);
+                                }
                             } else if is_hostlist {
                                 should_stabilize = target_hosts.iter().any(|target| {
                                     matches_host(&s, target)
@@ -588,26 +610,55 @@ mod tests {
 
     #[test]
     fn test_is_builtin_bypass_domains() {
-        // Game ecosystems & sensitive WAF endpoints (MUST bypass)
-        assert!(is_builtin_bypass("public-ubiservices.ubi.com"));
-        assert!(is_builtin_bypass("connect.ubisoft.com"));
-        assert!(is_builtin_bypass("uplaypc-s-ubisoft.cdn.ubi.com"));
-        assert!(is_builtin_bypass("auth.riotgames.com"));
-        assert!(is_builtin_bypass("client.battle.net"));
-        assert!(is_builtin_bypass("origin.com"));
-        assert!(is_builtin_bypass("epicgames.com"));
-        assert!(is_builtin_bypass("steamcontent.com"));
-        assert!(is_builtin_bypass("playfabapi.com"));
-
-        // DoH resolvers (MUST bypass)
+        // DoH resolvers: MUST match is_builtin_doh and is_builtin_bypass, but NOT is_builtin_game
+        assert!(is_builtin_doh("cloudflare-dns.com"));
+        assert!(is_builtin_doh("dns.google"));
+        assert!(is_builtin_doh("dns.adguard-dns.com"));
+        assert!(!is_builtin_game("cloudflare-dns.com"));
         assert!(is_builtin_bypass("cloudflare-dns.com"));
-        assert!(is_builtin_bypass("dns.google"));
-        assert!(is_builtin_bypass("dns.adguard-dns.com"));
 
-        // Target domains that should be stabilized (MUST NOT bypass)
+        // Game ecosystems & sensitive WAF endpoints: MUST match is_builtin_game and is_builtin_bypass, but NOT is_builtin_doh
+        assert!(is_builtin_game("public-ubiservices.ubi.com"));
+        assert!(is_builtin_game("connect.ubisoft.com"));
+        assert!(is_builtin_game("uplaypc-s-ubisoft.cdn.ubi.com"));
+        assert!(is_builtin_game("auth.riotgames.com"));
+        assert!(is_builtin_game("client.battle.net"));
+        assert!(is_builtin_game("origin.com"));
+        assert!(is_builtin_game("epicgames.com"));
+        assert!(is_builtin_game("steamcontent.com"));
+        assert!(is_builtin_game("playfabapi.com"));
+        assert!(!is_builtin_doh("public-ubiservices.ubi.com"));
+        assert!(is_builtin_bypass("public-ubiservices.ubi.com"));
+
+        // Target domains that should be stabilized (MUST NOT match either)
         assert!(!is_builtin_bypass("discord.com"));
         assert!(!is_builtin_bypass("google.com"));
         assert!(!is_builtin_bypass("youtube.com"));
         assert!(!is_builtin_bypass("notubi.com"));
+    }
+
+    #[test]
+    fn test_doh_always_bypassed_even_if_game_protection_disabled() {
+        let game_protection = false;
+        let custom_excluded: Vec<String> = vec!["mygame.com".to_string()];
+
+        let check_bypass = |sni: &str| -> bool {
+            let is_doh = is_builtin_doh(sni);
+            let is_game = game_protection && is_builtin_game(sni);
+            let is_custom = custom_excluded.iter().any(|b| matches_host(sni, b));
+            is_doh || is_game || is_custom
+        };
+
+        // DoH MUST remain bypassed even with game_protection = false!
+        assert!(check_bypass("cloudflare-dns.com"));
+        assert!(check_bypass("dns.google"));
+
+        // Game domains MUST NOT be bypassed when game_protection = false
+        assert!(!check_bypass("public-ubiservices.ubi.com"));
+        assert!(!check_bypass("auth.riotgames.com"));
+
+        // Custom excluded domain MUST still be bypassed
+        assert!(check_bypass("mygame.com"));
+        assert!(check_bypass("sub.mygame.com"));
     }
 }
