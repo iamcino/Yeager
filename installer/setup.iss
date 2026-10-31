@@ -48,8 +48,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\dist\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; Headless CLI of the engine, for scripts and power users.
-Source: "..\dist\levi.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
@@ -66,7 +64,6 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 ; Close Yeager, then let it put Windows' TCP and DNS settings back and remove
 ; its logon task before the files go.
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExeName}"; Flags: runhidden; RunOnceId: "KillYeager"
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM levi.exe"; Flags: runhidden; RunOnceId: "KillLevi"
 Filename: "{app}\{#AppExeName}"; Parameters: "--cleanup"; Flags: runhidden waituntilterminated; RunOnceId: "CleanupYeager"
 
 [UninstallDelete]
