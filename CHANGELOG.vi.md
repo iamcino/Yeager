@@ -8,8 +8,16 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-01
+
 ### Sửa lỗi
+- UltraViewer lại lấy được ID ngay khi kết nối qua cổng 443. Kết nối có tên máy chủ không phải tên miền đầy đủ (chỉ một từ như "ultraviewer", "localhost" hoặc địa chỉ IP) giờ luôn được giữ nguyên.
 - Bộ cài và ghi chú phát hành giờ ghi đúng yêu cầu: Windows 11 hoặc Windows Server 2022 (x64). Ghi chú cũ nói Windows 10 1809, nhưng DNS over HTTPS của Yeager dựa vào tính năng chỉ có trên Windows 11.
+
+### Thay đổi
+- **Logo mới:** đôi cánh vút lên, chuyển màu từ xanh sang trắng, dùng cho ứng dụng, bộ cài, thanh tác vụ và khay hệ thống. Ở thanh bên logo đổi theo màu nhấn bạn chọn trong trang Giao diện, và khi Yeager đang bật, icon khay cũng sáng lên theo màu đó.
+- Bật/tắt Chế độ tương thích và sửa danh sách tên miền giờ có hiệu lực ngay mà không cần khởi động lại engine, nên các kết nối đang mở (game, phiên điều khiển từ xa, tải xuống) không bị ngắt.
+- Nút nhập "Game" và "Điều khiển từ xa" dùng danh sách của chính engine, nên công cụ từ xa mới không bị nhập nhầm thành game.
 
 ## [1.1.1] - 2026-11-01
 
@@ -181,6 +189,7 @@ Bản phát hành công khai đầu tiên.
 ### Sửa lỗi
 - Nút "Khôi phục mặc định Windows" ở trang TCP.
 
+[1.1.2]: https://github.com/iamcino/Yeager/releases/tag/v1.1.2
 [1.1.1]: https://github.com/iamcino/Yeager/releases/tag/v1.1.1
 [1.1.0]: https://github.com/iamcino/Yeager/releases/tag/v1.1.0
 [1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
