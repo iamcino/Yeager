@@ -30,6 +30,7 @@
 - [Gỡ cài đặt](#gỡ-cài-đặt)
 - [Build từ mã nguồn](#build-từ-mã-nguồn)
 - [Câu hỏi thường gặp](#câu-hỏi-thường-gặp)
+- [Bảo mật & kết quả quét virus](#bảo-mật--kết-quả-quét-virus)
 - [Tuyên bố miễn trừ trách nhiệm](#tuyên-bố-miễn-trừ-trách-nhiệm)
 - [Giấy phép và phần mềm bên thứ ba](#giấy-phép-và-phần-mềm-bên-thứ-ba)
 
@@ -312,6 +313,45 @@ Không ảnh hưởng đáng kể tới lưu lượng thông thường. Nếu mu
 **Có gì đó không chạy. Làm sao hoàn tác tất cả?**
 Tắt Yeager, hoặc bấm **Khôi phục mặc định Windows** ở trang TCP. Thoát ứng dụng
 cũng trả lại thiết lập TCP và DNS.
+
+## Bảo mật & kết quả quét virus
+
+Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator và nạp driver mạng WinDivert), nên chúng tôi công khai kết quả phân tích nhị phân thay vì để người dùng tự suy đoán.
+
+**Báo cáo VirusTotal — v1.1.2** (phân tích 2026-11-01):
+[SHA-256 eef2d28…f0864a](https://www.virustotal.com/gui/file/eef2d283e4e7a4d702f67324021c5cc51ce9baa622ce9a789a01f15f36f0864a)
+— **1/70** hãng ghi nhận, duy nhất `Trapmine` với nhãn `Malicious.moderate.ml.score` (điểm thống kê từ mô hình học máy, không phải nhận diện theo chữ ký độc hại). **0/69 vendor còn lại** ghi nhận dấu hiệu độc hại.
+
+### Vì sao có cảnh báo giả
+
+- **Chưa ký số thương mại:** binary chưa gắn Code Signing Certificate, nên một số engine heuristic/ML xếp vào nhóm "chưa xác thực".
+- **Nhãn `obfuscated`:** do entropy section `.rsrc` = 7.92, hệ quả chuẩn của Rust khi nhúng 9 icon PNG đa phân giải + manifest. DetectItEasy không phát hiện packer/protector nào; mã nguồn không chứa bước làm rối hay đóng gói.
+- Vài engine di động báo `Unable to process file type` vì chúng không phân tích PE x64.
+
+### Hành vi mạng (toàn bộ IOC)
+
+| Điểm kết nối | Mục đích |
+|---|---|
+| `1.1.1.1` / `1.0.0.1` | DNS-over-HTTPS (Hange) |
+| `github.com/iamcino/Yeager/releases/latest` | Kiểm tra cập nhật |
+| `speed.cloudflare.com` | Probe độ trễ (Erwin) |
+| `www.ssl.com` | Tải root CA theo TLS AIA khi verify chuỗi chứng chỉ |
+
+Không có C2, không telemetry, không exfiltration trong mã nguồn. *(Cờ 1/92 trên IP `1.1.1.1` là danh tiếng riêng của Cloudflare Anycast công cộng, không liên quan binary.)*
+
+### Tự kiểm chứng
+
+Đừng tin — hãy verify:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\yeager.exe
+```
+So output với hash trong link ở trên. Hoặc build từ source để tự sinh binary:
+```bash
+cargo build --release
+```
+
+> Kết quả gắn với SHA-256 của bản v1.1.2 tại thời điểm phân tích. VT có thể re-analyze và thay đổi số detection; mỗi release sẽ cập nhật hash + link tương ứng.
 
 ## Tuyên bố miễn trừ trách nhiệm
 
