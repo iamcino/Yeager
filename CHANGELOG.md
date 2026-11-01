@@ -8,6 +8,20 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-01
+
+### Added
+- **Compatibility Mode** (replaces Game Shield, your setting carries over). Besides games and launchers, remote support tools such as UltraViewer, TeamViewer, AnyDesk, RustDesk, Parsec and Splashtop now pass through untouched, which fixes UltraViewer's "Cannot get ID".
+- Connections that do not name a server (for example apps that connect straight to an IP address) are always left untouched.
+- **Domain list sheets.** Custom exclusions and the target domain list now open in their own window from a Manage button: Enter adds, Delete removes the selected row, Esc closes. Duplicates are pointed out instead of added twice, and `*.example.com` is accepted as `example.com`.
+- The target domain list can import suggested game and remote tool domains in one click.
+- The home page shows whether Compatibility Mode is on and how many connections were left untouched.
+
+### Changed
+- The Engine page is shorter: domain lists no longer sit on the page, only their counts, and the target domain list only shows when the scope is "By domain".
+- List edits are saved as you type and applied once when you close the window, instead of restarting the engine after every change.
+
+
 ## [1.1.0] - 2026-10-31
 
 ### Added
@@ -165,6 +179,7 @@ First public release.
 ### Fixed
 - "Restore Windows defaults" on the TCP page.
 
+[1.1.1]: https://github.com/iamcino/Yeager/releases/tag/v1.1.1
 [1.1.0]: https://github.com/iamcino/Yeager/releases/tag/v1.1.0
 [1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
 [1.0.8]: https://github.com/iamcino/Yeager/releases/tag/v1.0.8
