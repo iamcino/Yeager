@@ -337,6 +337,8 @@ Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator 
 | `speed.cloudflare.com` | Probe độ trễ (Erwin) |
 | `www.ssl.com` | Tải root CA theo TLS AIA khi verify chuỗi chứng chỉ |
 
+*(Bảy IP trong tab Relations thuộc ba autonomous system đã biết: AS13335 Cloudflare — DNS `1.1.1.1`/`1.0.0.1` và CDN cho `speed.cloudflare.com`; AS36459 GitHub; AS14618 AWS — hạ tầng cloud liên quan. Không IP nào là điểm kết nối thứ ba hay hạ tầng C2.)*
+
 Không có C2, không telemetry, không exfiltration trong mã nguồn. *(Cờ 1/92 trên IP `1.1.1.1` là danh tiếng riêng của Cloudflare Anycast công cộng, không liên quan binary.)*
 
 ### Tự kiểm chứng

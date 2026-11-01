@@ -338,6 +338,8 @@ Yeager runs at the system level (Administrator privileges + the WinDivert networ
 | `speed.cloudflare.com` | Latency probe (Erwin) |
 | `www.ssl.com` | Root CA fetch via TLS AIA during chain validation |
 
+*(All seven IPs in the Relations tab belong to three known autonomous systems: AS13335 Cloudflare — DNS `1.1.1.1`/`1.0.0.1` and CDN for `speed.cloudflare.com`; AS36459 GitHub; AS14618 AWS — related cloud infrastructure. None is a third-party endpoint or C2.)*
+
 No C2, no telemetry, no exfiltration in the source. *(The 1/92 flag on IP `1.1.1.1` is Cloudflare Anycast's own reputation, unrelated to this binary.)*
 
 ### Verify it yourself
