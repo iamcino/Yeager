@@ -279,11 +279,13 @@ iscc installer\setup.iss         # dist\Yeager-Setup-<phiên bản>.exe
 Trên Linux có thể kiểm tra bản build Windows bằng
 `cargo check --target x86_64-pc-windows-gnu` (cần `mingw-w64`).
 
-Icon được thu nhỏ từ ảnh gốc `assets/icons/src/yeager.png`, mỗi cỡ dựng riêng.
-Viền icon khay sáng lên theo màu nhấn của giao diện khi Yeager đang bật:
+Logo là file vector `assets/logo/yeager.svg`. Script dựng nó thành ảnh gốc
+1024 px `assets/icons/src/yeager.png` rồi thu nhỏ ra từng cỡ icon. Logo ở thanh
+bên được vẽ từ cùng đường cánh, và khi Yeager đang bật, viền và cánh của icon
+khay sáng lên theo màu nhấn của giao diện:
 
 ```bash
-python3 tools/make_icons.py      # cần Pillow và numpy
+python3 tools/make_icons.py      # cần Pillow, numpy và rsvg-convert (librsvg)
 ```
 
 Mọi đóng góp đều được hoan nghênh; vui lòng đọc [CONTRIBUTING.md](CONTRIBUTING.md).

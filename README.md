@@ -280,12 +280,13 @@ iscc installer\setup.iss         # dist\Yeager-Setup-<version>.exe
 From Linux you can type-check the Windows build with
 `cargo check --target x86_64-pc-windows-gnu` (needs `mingw-w64`).
 
-Icons are reduced from the master artwork in `assets/icons/src/yeager.png`,
-each size natively. The tray icon's rim lights up in the UI accent color
-while Yeager is on:
+The logo is the vector `assets/logo/yeager.svg`. The script renders it to the
+1024 px master `assets/icons/src/yeager.png` and reduces every icon size from
+it natively. The sidebar mark is drawn from the same wing path, and while
+Yeager is on the tray icon's rim and wing light up in the UI accent color:
 
 ```bash
-python3 tools/make_icons.py      # needs Pillow and numpy
+python3 tools/make_icons.py      # needs Pillow, numpy and rsvg-convert (librsvg)
 ```
 
 Contributions are welcome; please read [CONTRIBUTING.md](CONTRIBUTING.md).

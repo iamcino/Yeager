@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Yeager logo: an ascending wing in an accent-to-light ombre on a dark
+       rounded tile. The wing path and gradient are shared with the app
+       (BrandMark in crates/app/ui/widgets.slint, tray recolouring in
+       crates/app/src/platform.rs); keep them in step. The gradient runs from
+       (110,410) to (410,110): the accent (#2f7bff by default) at the root,
+       #f3f1ea at the tip. -->
+  <defs>
+    <linearGradient id="wing" gradientUnits="userSpaceOnUse" x1="110" y1="410" x2="410" y2="110">
+      <stop offset="0" stop-color="#2f7bff"/>
+      <stop offset="1" stop-color="#f3f1ea"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1e24"/>
+      <stop offset="1" stop-color="#121418"/>
+    </linearGradient>
+  </defs>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="106.5" fill="url(#tile)" stroke="#2e323a" stroke-width="3"/>
+  <path id="wing-path" fill="url(#wing)" d="M96 414C132 296 200 214 298 176C350 156 398 136 418 96C422 164 384 214 300 246C344 242 380 232 404 220C386 274 330 306 252 314C292 316 328 312 356 304C328 346 272 366 200 366C230 372 260 374 284 370C238 404 172 414 96 414Z"/>
+</svg>

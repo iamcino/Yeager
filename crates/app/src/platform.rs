@@ -260,13 +260,13 @@ pub fn show(ui: &MainWindow) {
 }
 
 /// The tray icon at the small-icon size for the current DPI, with its rim lit
-/// in `glow` while Yeager is on, and a small green arrow top right when `update`
-/// is out.
+/// and its wing recoloured in `glow` while Yeager is on, and a small green
+/// arrow top right when `update` is out.
 ///
 /// `tray.bin` (from `tools/make_icons.py`) holds the icon rendered natively at
 /// each tray size, so Windows never has to scale it: a little-endian u32
-/// count, then per size a u32 size, `size * size * 4` RGBA bytes and a
-/// `size * size` rim mask.
+/// count, then per size a u32 size, `size * size * 4` RGBA bytes, a
+/// `size * size` rim mask and a `size * size` wing mask.
 fn tray_icon(glow: Option<slint::Color>, update: bool) -> Icon {
     const BIN: &[u8] = include_bytes!("../../../assets/icons/tray.bin");
     let want = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16) as usize;
@@ -281,11 +281,13 @@ fn tray_icon(glow: Option<slint::Color>, update: bool) -> Icon {
         if pick.is_none_or(|(best, _)| (best < want && size > best) || (size >= want && size < best)) {
             pick = Some(entry);
         }
-        at += 4 + size * size * 5;
+        at += 4 + size * size * 6;
     }
     let (size, at) = pick.expect("tray.bin has icons");
     let mut rgba = BIN[at..at + size * size * 4].to_vec();
     if let Some(c) = glow {
+        let wing = &BIN[at + size * size * 5..at + size * size * 6];
+        recolor_wing(&mut rgba, wing, size, c);
         let mask = &BIN[at + size * size * 4..at + size * size * 5];
         for (px, &m) in rgba.chunks_exact_mut(4).zip(mask) {
             let a = m as u32;
@@ -300,6 +302,34 @@ fn tray_icon(glow: Option<slint::Color>, update: bool) -> Icon {
         update_badge(&mut rgba, size);
     }
     Icon::from_rgba(rgba, size as u32, size as u32).expect("tray icon")
+}
+
+/// The wing's ombre runs from the accent at its root to this near-white at its
+/// tip, along the line (110,410) -> (410,110) of the 512 px logo
+/// (`assets/logo/yeager.svg`). The icon art is drawn with `LOGO_ACCENT`.
+const WING_TIP: [f32; 3] = [0xf3 as f32, 0xf1 as f32, 0xea as f32];
+const LOGO_ACCENT: [f32; 3] = [0x2f as f32, 0x7b as f32, 0xff as f32];
+
+/// Repaints the wing with the ombre starting from `accent` instead of the
+/// logo's blue. Each pixel is `a * wing + (1 - a) * tile`, so adding
+/// `a * (new - old)` swaps the wing colour and keeps the anti-aliased edge.
+fn recolor_wing(rgba: &mut [u8], wing: &[u8], size: usize, accent: slint::Color) {
+    let accent = [accent.red() as f32, accent.green() as f32, accent.blue() as f32];
+    let scale = 512.0 / size as f32;
+    for (i, (px, &m)) in rgba.chunks_exact_mut(4).zip(wing).enumerate() {
+        if m == 0 {
+            continue;
+        }
+        let x = ((i % size) as f32 + 0.5) * scale;
+        let y = ((i / size) as f32 + 0.5) * scale;
+        let t = (((x - 110.0) + (410.0 - y)) / 600.0).clamp(0.0, 1.0);
+        let a = m as f32 / 255.0;
+        for k in 0..3 {
+            let old = LOGO_ACCENT[k] + (WING_TIP[k] - LOGO_ACCENT[k]) * t;
+            let new = accent[k] + (WING_TIP[k] - accent[k]) * t;
+            px[k] = (px[k] as f32 + a * (new - old)).round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 /// Paints a small green up arrow over the top-right corner of a `size` x `size`
