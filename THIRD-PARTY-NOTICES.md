@@ -73,11 +73,11 @@ collect.
 
 ## Names and artwork
 
-"Yeager", "Levi", "Erwin" and "Hange", and the Wings of Freedom crest used for
-the icon, are fan references to *Attack on Titan* (*Shingeki no Kyojin*) by
+The names "Yeager", "Levi", "Erwin" and "Hange" are fan references to *Attack on Titan* (*Shingeki no Kyojin*) by
 Hajime Isayama, published by Kodansha. Yeager is an independent project and is
 not affiliated with or endorsed by the creator, the publisher or any licensee.
-All trademarks belong to their respective owners.
+All trademarks belong to their respective owners. The wing logo
+(`assets/logo/yeager.svg`) is original artwork made for Yeager.
 
 ---
 
@@ -129,8 +129,8 @@ từng thư viện, chạy `cargo about` hoặc `cargo license` ở thư mục g
 
 ### Tên gọi và hình ảnh
 
-Các tên "Yeager", "Levi", "Erwin", "Hange" và biểu tượng Đôi cánh Tự do dùng
-làm icon là sự tri ân dành cho *Attack on Titan* (*Shingeki no Kyojin*) của tác
+Các tên "Yeager", "Levi", "Erwin" và "Hange" là sự tri ân dành cho *Attack on Titan* (*Shingeki no Kyojin*) của tác
 giả Hajime Isayama, do Kodansha phát hành. Yeager là dự án độc lập, không liên
 kết và không được tác giả, nhà phát hành hay bên được cấp phép nào bảo trợ. Mọi
-nhãn hiệu thuộc về chủ sở hữu tương ứng.
+nhãn hiệu thuộc về chủ sở hữu tương ứng. Logo đôi cánh (`assets/logo/yeager.svg`)
+là hình vẽ riêng của Yeager.

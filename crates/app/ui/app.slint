@@ -4,7 +4,7 @@ import "../../../assets/fonts/BeVietnamPro-SemiBold.ttf";
 import { Theme } from "theme.slint";
 import { Lang } from "lang.slint";
 import { DomainListSheet } from "domain_list_sheet.slint";
-import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, PowerButton, ScrollBar } from "widgets.slint";
+import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, PowerButton, ScrollBar, BrandMark } from "widgets.slint";
 export { Theme } from "theme.slint";
 export { Lang } from "lang.slint";
 
@@ -350,8 +350,7 @@ export component MainWindow inherits Window {
                                 spacing: 10px;
                                 VerticalLayout {
                                     alignment: center;
-                                    Image {
-                                        source: @image-url("../../../assets/icons/brand.png");
+                                    BrandMark {
                                         width: 28px;
                                         height: 28px;
                                     }

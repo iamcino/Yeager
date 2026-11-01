@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
-"""Render Yeager's icons from Cino's master artwork.
+"""Render Yeager's icons from the vector logo.
 
-The master is `assets/icons/src/yeager.png`: the finished "Wings of Freedom"
-tile (white wing behind, blue wing in front, on a dark rounded square) at
-1024 px with a transparent background. Every size is reduced from it
-directly, never scaled up, so each one is as sharp as the art allows.
+The source is `assets/logo/yeager.svg`: an ascending wing in an accent-to-light
+ombre on a dark rounded tile. It is rendered once at 1024 px to the master
+`assets/icons/src/yeager.png` (with `rsvg-convert`, from librsvg), and every
+size is reduced from that master directly, so each one is as sharp as the art
+allows. Without `rsvg-convert` the committed master is used as is.
 
 Produces:
-  assets/icons/yeager.ico   multi-size app / desktop / taskbar icon
-  assets/icons/yeager.png   256px window icon / preview
-  assets/icons/brand.png    56px sidebar brand mark (28px @2x)
-  assets/icons/tray.bin     the tray icon at each small size, with a rim mask
-                            the app paints in the UI accent while Yeager is on
+  assets/icons/src/yeager.png  1024px master (rendered from the SVG)
+  assets/icons/yeager.ico      multi-size app / desktop / taskbar icon
+  assets/icons/yeager.png      256px window icon / preview
+  assets/icons/tray.bin        the tray icon at each small size, with a rim
+                               mask and a wing mask: while Yeager is on, the
+                               app paints the rim and the wing in the UI accent
 
-Run from the repo root:  python3 tools/make_icons.py   (needs Pillow, numpy)
+The sidebar mark is drawn by the app itself (BrandMark in widgets.slint) from
+the same wing path, so it follows the accent too.
 
-To replace the master with a new export on a white background:
-  python3 tools/make_icons.py --import path/to/export.png
+Run from the repo root:  python3 tools/make_icons.py
+(needs Pillow, numpy, and rsvg-convert to re-render the master)
 """
 import os
+import re
+import shutil
 import struct
-import sys
+import subprocess
+import tempfile
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SVG = os.path.join(ROOT, "assets", "logo", "yeager.svg")
 MASTER = os.path.join(ROOT, "assets", "icons", "src", "yeager.png")
 
 # Tray sizes: 16 px at 100% DPI up to 40 at 250%, plus 48/64 for larger setups.
@@ -37,83 +44,20 @@ def odd(n):
     return max(3, 2 * int(n) + 1)
 
 
-def import_master(path):
-    """Cuts an export on a white background out to a transparent master.
-
-    The export's tile runs a few pixels past the canvas, so its straight sides
-    are cut flat and their rim is lost. The tile is therefore redrawn: its
-    outline (a superellipse) is fitted to the parts the canvas does not cut,
-    shrunk just enough to fit, and drawn anti-aliased with an even grey rim on
-    all four sides. Inside, the dark surface is repainted from its own colours
-    so compression noise and smudges (an export watermark, say) are gone."""
-    rgb = np.array(Image.open(path).convert("RGB"))
-    near_white = Image.fromarray(((rgb.min(axis=2) > 200) * 255).astype(np.uint8), "L").copy()
-    w, h = near_white.size
-    for corner in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
-        ImageDraw.floodfill(near_white, corner, 128)
-    tile = np.array(near_white) != 128
-
-    n, half = fit_outline(tile)
-    rim_width = w / 256
-    inside = (w - 1) / 2 - 1.5  # the new half-size: inside the canvas, with room to anti-alias
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
-    cx, cy = (w - 1) / 2, (h - 1) / 2
-    # Roughly the signed distance to the outline, in pixels (negative inside).
-    dist = ((np.abs(xx - cx) ** n + np.abs(yy - cy) ** n) ** (1 / n)) - inside
-    alpha = np.clip(0.5 - dist, 0, 1)
-    rim = np.clip(dist + rim_width + 0.5, 0, 1)
-
-    # The rim's grey, from the export's own rim (its outer pixels).
-    old_rim = tile & (dist + (inside - half) > -rim_width)
-    grey = np.median(rgb[old_rim & (rgb.max(axis=2) > 60)], axis=0)
-
-    # The dark surface is a plain vertical gradient; repaint it row by row
-    # from its median.
-    surface = tile & (dist < -rim_width) & (rgb.max(axis=2) < 75)
-    # Export watermarks (a grey sparkle) sit in the bottom-right corner, clear
-    # of the wings: count any grey there as surface too, so it is painted over.
-    grey_px = (rgb.max(axis=2).astype(int) - rgb.min(axis=2) < 25) & (rgb.max(axis=2) < 200)
-    surface |= tile & (dist < -rim_width) & grey_px & (xx > w * 0.8) & (yy > h * 0.8)
-    for y in range(h):
-        row = surface[y]
-        if row.any():
-            rgb[y, row] = np.median(rgb[y, row], axis=0).astype(np.uint8)
-
-    out = rgb * (1 - rim[..., None]) + grey * rim[..., None]
-    img = np.dstack([out, alpha * 255]).round().astype(np.uint8)
-    Image.fromarray(img, "RGBA").resize((1024, 1024), Image.LANCZOS).save(MASTER, optimize=True)
-    print("Wrote", MASTER, "outline n=%.2f, rim" % n, tuple(int(c) for c in grey))
+def rasterize(svg_text, size):
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = os.path.join(tmp, "in.svg"), os.path.join(tmp, "out.png")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+        subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), src, "-o", out], check=True)
+        return Image.open(out).convert("RGBA")
 
 
-def fit_outline(tile):
-    """The superellipse |x|^n + |y|^n = a^n that best matches the tile's edge
-    where the canvas does not cut it. Returns (n, a) in pixels."""
-    h, w = tile.shape
-    cx, cy = (w - 1) / 2, (h - 1) / 2
-    angles, radii = [], []
-    for ang in np.linspace(0, 2 * np.pi, 360, endpoint=False):
-        dx, dy = np.cos(ang), np.sin(ang)
-        r = np.arange(0, max(w, h))
-        x = np.round(cx + dx * r).astype(int)
-        y = np.round(cy + dy * r).astype(int)
-        ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
-        x, y = x[ok], y[ok]
-        out = np.nonzero(~tile[y, x])[0]
-        if not len(out):
-            continue  # runs off the canvas: cut
-        edge = out[0]
-        if 2 < x[edge] < w - 3 and 2 < y[edge] < h - 3:
-            angles.append(ang)
-            radii.append(edge - 0.5)
-    angles, radii = np.array(angles), np.array(radii)
-    best = None
-    for n in np.arange(2.0, 8.0, 0.05):
-        g = (np.abs(np.cos(angles)) ** n + np.abs(np.sin(angles)) ** n) ** (-1 / n)
-        a = (g @ radii) / (g @ g)
-        err = np.mean((a * g - radii) ** 2)
-        if best is None or err < best[0]:
-            best = (err, n, a)
-    return best[1], best[2]
+def wing_only(svg_text):
+    """The SVG with just the wing, in plain white: its alpha is the wing mask."""
+    d = re.search(r'<path id="wing-path"[^>]* d="([^"]+)"', svg_text).group(1)
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+            f'<path fill="#fff" d="{d}"/></svg>')
 
 
 def render(master, size):
@@ -138,9 +82,16 @@ def rim(master, size):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--import":
-        import_master(sys.argv[2])
     out = os.path.join(ROOT, "assets", "icons")
+    with open(SVG, encoding="utf-8") as f:
+        svg = f.read()
+    if shutil.which("rsvg-convert"):
+        os.makedirs(os.path.dirname(MASTER), exist_ok=True)
+        rasterize(svg, 1024).save(MASTER, optimize=True)
+        wing = rasterize(wing_only(svg), 1024).getchannel("A")
+    else:
+        print("rsvg-convert not found: using the committed master, no wing mask")
+        wing = None
     master = Image.open(MASTER).convert("RGBA")
 
     # Full size ladder so Windows picks a native size at every DPI. Pass every
@@ -156,21 +107,20 @@ def main():
     )
     images[-1].save(os.path.join(out, "yeager.png"))
 
-    # Sidebar brand mark: 28px in the UI, rendered at 2x so it stays sharp on
-    # high-DPI screens without Slint having to shrink the 256px image.
-    render(master, 56).save(os.path.join(out, "brand.png"))
-
-    # Tray: per size, the icon (RGBA) and its rim mask (one byte per pixel).
-    # platform.rs picks the size for the DPI and paints the rim in the current
-    # accent color, so the glow follows the accent chosen in the app.
+    # Tray: per size, the icon (RGBA), its rim mask and its wing mask (one
+    # byte per pixel each). platform.rs picks the size for the DPI and, while
+    # Yeager is on, paints the rim and the wing in the current accent color.
+    if wing is None:
+        return
     with open(os.path.join(out, "tray.bin"), "wb") as f:
         f.write(struct.pack("<I", len(TRAY_SIZES)))
         for s in TRAY_SIZES:
             f.write(struct.pack("<I", s))
             f.write(render(master, s).tobytes())
             f.write(rim(master, s).tobytes())
+            f.write(wing.resize((s, s), Image.LANCZOS).tobytes())
 
-    print("Wrote yeager.ico, yeager.png, brand.png, tray.bin to", out)
+    print("Wrote master, yeager.ico, yeager.png, tray.bin to", out)
 
 
 if __name__ == "__main__":
