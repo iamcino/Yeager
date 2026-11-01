@@ -94,6 +94,7 @@ pub const BUILTIN_DOH_DOMAINS: &[&str] = &[
 
 pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     // Remote tools
+    "ultraviewer",
     "ultraviewer.net",
     "uvnc.com",
     "ultraviewer.com",
@@ -148,7 +149,35 @@ pub enum PassThroughReason {
     Doh,
     Compat,
     Custom,
+    /// SNI thiếu, rỗng, hoặc không phải FQDN hợp lệ (nhãn đơn, localhost, IP literal).
     NoSni,
+}
+
+pub fn is_valid_fqdn_sni(sni: &str) -> bool {
+    if sni.is_empty() || sni.len() > 253 || !sni.contains('.') || sni.contains(':') {
+        return false;
+    }
+
+    if sni.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || sni.parse::<std::net::IpAddr>().is_ok()
+    {
+        return false;
+    }
+
+    let mut last_label_has_alpha = false;
+    for label in sni.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+        last_label_has_alpha = label.bytes().any(|b| b.is_ascii_alphabetic());
+    }
+
+    last_label_has_alpha
 }
 
 pub fn evaluate_pass_through(
@@ -157,20 +186,30 @@ pub fn evaluate_pass_through(
     custom_excluded: &[String],
 ) -> Option<PassThroughReason> {
     let s = match sni {
-        Some(s) if !s.trim().is_empty() => s.trim().to_lowercase(),
-        _ => return Some(PassThroughReason::NoSni),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Some(PassThroughReason::NoSni);
+            }
+            trimmed
+        }
+        None => return Some(PassThroughReason::NoSni),
     };
 
-    if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+    if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(s, target)) {
         return Some(PassThroughReason::Doh);
     }
 
-    if compat_mode && UNIFIED_COMPAT_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+    if compat_mode && is_builtin_compat(s) {
         return Some(PassThroughReason::Compat);
     }
 
-    if custom_excluded.iter().any(|target| matches_host(&s, target)) {
+    if custom_excluded.iter().any(|target| matches_host(s, target)) {
         return Some(PassThroughReason::Custom);
+    }
+
+    if !is_valid_fqdn_sni(s) {
+        return Some(PassThroughReason::NoSni);
     }
 
     None
@@ -184,7 +223,9 @@ Nếu TLS ClientHello không có SNI hoặc SNI rỗng:
 - Tăng bộ đếm `STATS_NO_SNI_UNTOUCHED`.
 - Không áp dụng phân mảnh hoặc điều chỉnh thời gian.
 
-Lý do: một số ứng dụng kết nối trực tiếp theo IP hoặc dùng handshake đặc thù (như UltraViewer raw IP relay fallback). Việc phân mảnh có thể khiến kết nối không hoàn tất.
+Lý do: một số ứng dụng kết nối trực tiếp theo IP hoặc dùng handshake đặc thù (như UltraViewer raw IP relay fallback hoặc SNI nhãn đơn `"ultraviewer"`). Việc phân mảnh có thể khiến kết nối không hoàn tất.
+
+> **Giới hạn kỹ thuật:** Yeager chỉ áp dụng chính sách dựa trên tên miền khi SNI là FQDN hợp lệ. Các kết nối dùng SNI nhãn đơn, `localhost`, hoặc IP literal sẽ được giữ nguyên để đảm bảo tương thích.
 
 ### 5.4. Bộ đếm nguyên tử
 
