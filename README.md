@@ -306,6 +306,8 @@ system-level operations in Windows.
 Yeager loads the WinDivert network driver and runs a local DNS resolver,
 which some security products watch closely. Allow `yeager.exe` in your
 antivirus and firewall. Yeager never uses hidden PowerShell or fake packets.
+Current scan result and how to verify the binary yourself:
+[Security & VirusTotal Inspection](#security--virustotal-inspection).
 
 **Will it slow down my games?**
 No noticeable effect on general traffic, but if you prefer, use the

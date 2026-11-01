@@ -305,6 +305,8 @@ Windows.
 Yeager nạp driver mạng WinDivert và chạy bộ phân giải DNS cục bộ, những thứ mà
 một số phần mềm bảo mật theo dõi kỹ. Hãy cho phép `yeager.exe` trong phần mềm
 diệt virus và tường lửa. Yeager không bao giờ dùng PowerShell ẩn hay gói tin giả.
+Kết quả quét hiện tại và cách tự kiểm chứng binary:
+[Bảo mật & kết quả quét virus](#bảo-mật--kết-quả-quét-virus).
 
 **Có làm chậm game không?**
 Không ảnh hưởng đáng kể tới lưu lượng thông thường. Nếu muốn, hãy dùng phạm vi
@@ -320,7 +322,7 @@ Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator 
 
 **Báo cáo VirusTotal — v1.1.2** (phân tích 2026-11-01):
 [SHA-256 eef2d28…f0864a](https://www.virustotal.com/gui/file/eef2d283e4e7a4d702f67324021c5cc51ce9baa622ce9a789a01f15f36f0864a)
-— **1/70** hãng ghi nhận, duy nhất `Trapmine` với nhãn `Malicious.moderate.ml.score` (điểm thống kê từ mô hình học máy, không phải nhận diện theo chữ ký độc hại). **0/69 vendor còn lại** ghi nhận dấu hiệu độc hại.
+— **1/70** hãng ghi nhận, duy nhất `Trapmine` với nhãn `Malicious.moderate.ml.score` (điểm thống kê từ mô hình học máy, không phải nhận diện theo chữ ký độc hại). **0/69** — không vendor nào trong 69 vendor còn lại ghi nhận dấu hiệu độc hại.
 
 ### Vì sao có cảnh báo giả
 
