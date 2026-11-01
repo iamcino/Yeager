@@ -176,7 +176,9 @@ impl DohProvider {
 #[serde(default)]
 pub struct Config {
     pub scope: Scope,
-    pub hosts: Vec<String>,
+    /// Selected target hosts for `Scope::HostList` (alias `hosts` for backwards compatibility).
+    #[serde(alias = "hosts")]
+    pub selected_hosts: Vec<String>,
     pub congestion: Congestion,
     /// Erwin's TCP tuning, independent of the engine and DoH.
     pub tcp_enabled: bool,
@@ -201,8 +203,9 @@ pub struct Config {
     pub transport_profile: TransportProfile,
     /// Window size in logical pixels, as the user last left it.
     pub window_size: Option<[u32; 2]>,
-    /// Whether automatic game launcher and anti-cheat safe pass-through is enabled.
-    pub game_protection_enabled: bool,
+    /// Whether compatibility pass-through mode for game launchers and remote tools is enabled.
+    #[serde(alias = "game_protection_enabled")]
+    pub compatibility_mode_enabled: bool,
     /// User-defined domains excluded from transport resilience (raw pass-through).
     pub custom_excluded_domains: Vec<String>,
 }
@@ -211,7 +214,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scope: Scope::default(),
-            hosts: [
+            selected_hosts: [
                 "discord.com",
                 "discord.gg",
                 "discordapp.com",
@@ -235,7 +238,7 @@ impl Default for Config {
             language: None,
             transport_profile: TransportProfile::default(),
             window_size: None,
-            game_protection_enabled: true,
+            compatibility_mode_enabled: true,
             custom_excluded_domains: Vec::new(),
         }
     }
@@ -267,3 +270,27 @@ impl From<std::io::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backward_compatibility_serde_aliases() {
+        // BC1: v1.1.0 JSON with "game_protection_enabled" reads as compatibility_mode_enabled
+        let json_v110 = r#"{"game_protection_enabled": true}"#;
+        let cfg: Config = serde_json::from_str(json_v110).expect("Should deserialize v1.1.0 config");
+        assert!(cfg.compatibility_mode_enabled);
+
+        // BC2: Older JSON with "hosts" reads as selected_hosts
+        let json_hosts = r#"{"hosts": ["example.com", "test.org"]}"#;
+        let cfg2: Config = serde_json::from_str(json_hosts).expect("Should deserialize hosts config");
+        assert_eq!(cfg2.selected_hosts, vec!["example.com".to_string(), "test.org".to_string()]);
+
+        // BC3: Empty / missing JSON uses safe defaults
+        let json_empty = "{}";
+        let cfg3: Config = serde_json::from_str(json_empty).expect("Should deserialize empty config");
+        assert!(cfg3.compatibility_mode_enabled);
+        assert!(!cfg3.selected_hosts.is_empty());
+    }
+}

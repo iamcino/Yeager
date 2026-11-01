@@ -28,8 +28,8 @@ fn main() {
     } else if let Some(hosts_idx) = args.iter().position(|arg| arg == "--hosts") {
         if let Some(hosts_val) = args.get(hosts_idx + 1) {
             cfg.scope = Scope::HostList;
-            cfg.hosts = hosts_val.split(',').map(|s| s.trim().to_string()).collect();
-            println!("[*] Scope: HostList ({:?})", cfg.hosts);
+            cfg.selected_hosts = hosts_val.split(',').map(|s| s.trim().to_string()).collect();
+            println!("[*] Scope: HostList ({:?})", cfg.selected_hosts);
         }
     } else {
         println!("Usage: levi.exe [--all] [--profile auto|fast|hardened|observe] [--hosts domain1.com,domain2.com]");

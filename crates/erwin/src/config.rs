@@ -71,7 +71,7 @@ mod tests {
         let path = dir.join("config.json");
 
         let mut cfg = Config::default();
-        cfg.hosts = vec!["example.com".into()];
+        cfg.selected_hosts = vec!["example.com".into()];
         save_to(&path, &cfg).unwrap();
         cfg.dark = false;
         save_to(&path, &cfg).unwrap();
@@ -80,7 +80,7 @@ mod tests {
         // A torn write: the previous version comes back.
         std::fs::write(&path, "{\"scope\":").unwrap();
         let loaded = load_from(&path);
-        assert_eq!(loaded.hosts, vec!["example.com".to_string()]);
+        assert_eq!(loaded.selected_hosts, vec!["example.com".to_string()]);
         assert!(loaded.dark);
 
         let _ = std::fs::remove_dir_all(dir);
