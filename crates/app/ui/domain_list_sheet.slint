@@ -127,7 +127,7 @@ export component DomainListSheet {
                         overflow: elide;
                     }
                     Text {
-                        text: Lang.t(root.domains.length + " tên miền", root.domains.length + " domains");
+                        text: Lang.t(root.domains.length + " tên miền", root.domains.length + (root.domains.length == 1 ? " domain" : " domains"));
                         font-size: Theme.fs-sub;
                         color: Theme.label2;
                         vertical-alignment: center;
