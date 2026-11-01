@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod domain;
 pub mod lang;
 pub mod process;
 
