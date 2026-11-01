@@ -8,6 +8,20 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-01
+
+### Thêm
+- **Chế độ tương thích** (thay cho Game Shield, cài đặt cũ được giữ nguyên). Ngoài game và launcher, các công cụ hỗ trợ từ xa như UltraViewer, TeamViewer, AnyDesk, RustDesk, Parsec và Splashtop giờ cũng được giữ nguyên kết nối, khắc phục lỗi "Cannot get ID" của UltraViewer.
+- Kết nối không ghi tên máy chủ (ví dụ ứng dụng kết nối thẳng tới địa chỉ IP) luôn được giữ nguyên.
+- **Cửa sổ quản lý tên miền.** Tên miền loại trừ và danh sách tên miền được xử lý giờ mở trong cửa sổ riêng bằng nút Quản lý: Enter để thêm, Delete để xoá dòng đang chọn, Esc để đóng. Tên trùng được báo thay vì thêm hai lần, và `*.vi-du.com` được hiểu là `vi-du.com`.
+- Danh sách tên miền được xử lý có thể nhập sẵn tên miền game và công cụ điều khiển từ xa chỉ với một cú bấm.
+- Trang chính cho biết Chế độ tương thích đang bật hay tắt và có bao nhiêu kết nối được giữ nguyên.
+
+### Thay đổi
+- Trang Engine gọn hơn: không còn hiện cả danh sách tên miền, chỉ hiện số lượng; danh sách tên miền được xử lý chỉ hiện khi phạm vi là "Theo tên miền".
+- Sửa danh sách được lưu ngay khi gõ và áp dụng một lần khi đóng cửa sổ, thay vì khởi động lại engine sau mỗi thay đổi.
+
+
 ## [1.1.0] - 2026-10-31
 
 ### Thêm
@@ -165,6 +179,7 @@ Bản phát hành công khai đầu tiên.
 ### Sửa lỗi
 - Nút "Khôi phục mặc định Windows" ở trang TCP.
 
+[1.1.1]: https://github.com/iamcino/Yeager/releases/tag/v1.1.1
 [1.1.0]: https://github.com/iamcino/Yeager/releases/tag/v1.1.0
 [1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
 [1.0.8]: https://github.com/iamcino/Yeager/releases/tag/v1.0.8
