@@ -26,6 +26,8 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// How often the network card on the home page looks up the addresses again
 /// while the window shows.
 const NETWORK_REFRESH: Duration = Duration::from_secs(10 * 60);
+/// How long the domain sheets wait after the last edit before writing config.json.
+const DOMAIN_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Runs a blocking operation off the UI thread and reports the result through a
 /// closure back on the UI thread.
@@ -290,46 +292,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    {
-        let w = ui.as_weak();
-        let cfg = cfg.clone();
-        ui.on_add_host(move |text| {
-            let Some(ui) = w.upgrade() else { return };
-            let Some(host) = normalize_host(&text) else {
-                if !text.trim().is_empty() {
-                    ui.set_log(t!("\"{}\" không phải tên miền hợp lệ.", "\"{}\" is not a valid domain.", text.trim()).into());
-                }
-                return;
-            };
-            if cfg.borrow().selected_hosts.contains(&host) {
-                ui.set_log(t!("{host} đã có trong danh sách.", "{host} is already in the list.").into());
-                return;
-            }
-            cfg.borrow_mut().selected_hosts.push(host.clone());
-            config::save(&cfg.borrow());
-            set_hosts(&ui, &cfg.borrow());
-            ui.set_log(t!("Đã thêm {host}.", "Added {host}.").into());
-            restart_engine_if_active(&ui, &cfg.borrow());
-        });
-    }
-    {
-        let w = ui.as_weak();
-        let cfg = cfg.clone();
-        ui.on_remove_host(move |i| {
-            let Some(ui) = w.upgrade() else { return };
-            let i = i as usize;
-            if i >= cfg.borrow().selected_hosts.len() {
-                return;
-            }
-            let host = cfg.borrow_mut().selected_hosts.remove(i);
-            config::save(&cfg.borrow());
-            set_hosts(&ui, &cfg.borrow());
-            ui.set_log(t!("Đã xoá {host}.", "Removed {host}.").into());
-            restart_engine_if_active(&ui, &cfg.borrow());
-        });
-    }
-
-    // --- Game Shield ---
+    // --- Compatibility Mode ---
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
@@ -341,42 +304,106 @@ fn main() -> Result<(), slint::PlatformError> {
             restart_engine_if_active(&ui, &cfg.borrow());
         });
     }
+    // --- Domain list sheet (Custom exclusions / Selected hosts) ---
+    // Edits change `cfg` and the UI at once; the file is written 500 ms after
+    // the last edit, and right away when the sheet closes. The engine reads
+    // the lists when it starts, so it is restarted once on close, not on
+    // every keystroke.
+    let domain_save = Rc::new(slint::Timer::default());
+    let domains_changed = Rc::new(Cell::new(false));
+    let schedule_domain_save = {
+        let timer = domain_save.clone();
+        let cfg = cfg.clone();
+        let changed = domains_changed.clone();
+        move || {
+            changed.set(true);
+            let cfg = cfg.clone();
+            timer.start(slint::TimerMode::SingleShot, DOMAIN_SAVE_DEBOUNCE, move || config::save(&cfg.borrow()));
+        }
+    };
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
-        ui.on_add_excluded_domain(move |text| {
+        let schedule = schedule_domain_save.clone();
+        ui.on_domain_add(move |sheet, text| {
             let Some(ui) = w.upgrade() else { return };
-            let Some(host) = normalize_host(&text) else {
-                if !text.trim().is_empty() {
-                    ui.set_log(t!("\"{}\" không phải tên miền hợp lệ.", "\"{}\" is not a valid domain.", text.trim()).into());
-                }
+            let Some(domain) = common::domain::normalize_domain(&text) else {
+                ui.set_domain_highlight("".into());
+                ui.set_domain_error(if text.trim().is_empty() {
+                    tr("Nhập một tên miền, ví dụ example.com.", "Type a domain, for example example.com.").into()
+                } else {
+                    t!("\"{}\" không phải tên miền hợp lệ.", "\"{}\" is not a valid domain.", text.trim()).into()
+                });
                 return;
             };
-            if cfg.borrow().custom_excluded_domains.contains(&host) {
-                ui.set_log(t!("{host} đã có trong danh sách.", "{host} is already in the list.").into());
-                return;
+            ui.set_domain_highlight(domain.as_str().into());
+            {
+                let mut cfg = cfg.borrow_mut();
+                let list = domain_list(&mut cfg, sheet);
+                if list.contains(&domain) {
+                    ui.set_domain_error(t!("{domain} đã có trong danh sách.", "{domain} is already in the list.").into());
+                    return;
+                }
+                list.push(domain.clone());
             }
-            cfg.borrow_mut().custom_excluded_domains.push(host.clone());
-            config::save(&cfg.borrow());
-            set_excluded_domains(&ui, &cfg.borrow());
-            ui.set_log(t!("Đã thêm {host}.", "Added {host}.").into());
-            restart_engine_if_active(&ui, &cfg.borrow());
+            ui.set_domain_error("".into());
+            set_domain_lists(&ui, &cfg.borrow());
+            schedule();
         });
     }
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
-        ui.on_remove_excluded_domain(move |i| {
+        let schedule = schedule_domain_save.clone();
+        ui.on_domain_remove(move |sheet, domain| {
             let Some(ui) = w.upgrade() else { return };
-            let i = i as usize;
-            if i >= cfg.borrow().custom_excluded_domains.len() {
-                return;
+            {
+                let mut cfg = cfg.borrow_mut();
+                let list = domain_list(&mut cfg, sheet);
+                let before = list.len();
+                list.retain(|d| d != domain.as_str());
+                if list.len() == before {
+                    return;
+                }
             }
-            let host = cfg.borrow_mut().custom_excluded_domains.remove(i);
+            ui.set_domain_error("".into());
+            ui.set_domain_highlight("".into());
+            set_domain_lists(&ui, &cfg.borrow());
+            schedule();
+        });
+    }
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        let changed = domains_changed.clone();
+        let timer = domain_save.clone();
+        ui.on_domain_import(move |kind| {
+            let Some(ui) = w.upgrade() else { return };
+            let added = common::domain::merge_domains(&mut cfg.borrow_mut().selected_hosts, &suggested_domains(&kind));
+            // Imports are saved at once (no debounce).
+            timer.stop();
             config::save(&cfg.borrow());
-            set_excluded_domains(&ui, &cfg.borrow());
-            ui.set_log(t!("Đã xoá {host}.", "Removed {host}.").into());
-            restart_engine_if_active(&ui, &cfg.borrow());
+            changed.set(true);
+            ui.set_domain_highlight("".into());
+            ui.set_domain_error("".into());
+            set_domain_lists(&ui, &cfg.borrow());
+            ui.set_log(t!("Đã nhập {added} tên miền.", "Imported {added} domains.").into());
+        });
+    }
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        let changed = domains_changed.clone();
+        let timer = domain_save.clone();
+        ui.on_domain_sheet_closed(move || {
+            let Some(ui) = w.upgrade() else { return };
+            ui.set_domain_error("".into());
+            ui.set_domain_highlight("".into());
+            if changed.replace(false) {
+                timer.stop();
+                config::save(&cfg.borrow());
+                restart_engine_if_active(&ui, &cfg.borrow());
+            }
         });
     }
 
@@ -934,6 +961,11 @@ fn main() -> Result<(), slint::PlatformError> {
     // `ui.run()` would end as soon as the window hides to the tray, taking the
     // tray with it. Run until the tray's Thoát (or close without a tray) quits.
     slint::run_event_loop_until_quit()?;
+    // A domain edit still waiting for its debounced save.
+    if domain_save.running() {
+        domain_save.stop();
+        config::save(&cfg.borrow());
+    }
     remember_window_size(&ui, &mut cfg.borrow_mut());
     let _ = ui.hide();
     #[cfg(windows)]
@@ -1334,25 +1366,46 @@ fn set_excluded_domains(ui: &MainWindow, cfg: &Config) {
     ui.set_excluded_domains(ModelRc::new(VecModel::from(domains)));
 }
 
-/// Turns user input like `https://www.Discord.com/app` into `www.discord.com`.
-/// Returns `None` when it is not a plausible domain name.
-fn normalize_host(input: &str) -> Option<String> {
-    let mut s = input.trim().to_ascii_lowercase();
-    if let Some(i) = s.find("://") {
-        s = s[i + 3..].to_string();
-    }
-    if let Some(i) = s.find(['/', '?', '#', ':']) {
-        s.truncate(i);
-    }
-    let s = s.trim_matches('.').to_string();
-    let valid = s.contains('.')
-        && s.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        });
-    valid.then_some(s)
+fn set_domain_lists(ui: &MainWindow, cfg: &Config) {
+    set_hosts(ui, cfg);
+    set_excluded_domains(ui, cfg);
+}
+
+/// The list a domain sheet edits: 1 Custom exclusions, 2 Selected hosts.
+fn domain_list(cfg: &mut Config, sheet: i32) -> &mut Vec<String> {
+    if sheet == 1 { &mut cfg.custom_excluded_domains } else { &mut cfg.selected_hosts }
+}
+
+/// Remote tools inside levi's compatibility list; the rest of that list is
+/// game platforms and launchers.
+const REMOTE_TOOL_DOMAINS: &[&str] = &[
+    "ultraviewer.net",
+    "uvnc.com",
+    "ultraviewer.com",
+    "teamviewer.com",
+    "teamviewer.de",
+    "tvv.su",
+    "anydesk.com",
+    "anydesk.net",
+    "adsk.me",
+    "rustdesk.com",
+    "rdp.rs",
+    "parsec.app",
+    "parsecgaming.com",
+    "splashtop.com",
+];
+
+/// The suggestions the Selected hosts sheet imports: "game", "remote" or "all".
+fn suggested_domains(kind: &str) -> Vec<&'static str> {
+    levi::UNIFIED_COMPAT_DOMAINS
+        .iter()
+        .copied()
+        .filter(|d| match kind {
+            "remote" => REMOTE_TOOL_DOMAINS.contains(d),
+            "game" => !REMOTE_TOOL_DOMAINS.contains(d),
+            _ => true,
+        })
+        .collect()
 }
 
 fn transport_profile_index(profile: TransportProfile) -> i32 {
@@ -1363,11 +1416,10 @@ fn refresh_engine_stats(ui: &MainWindow) {
     let (_, stabilized, rsts) = engine::get_telemetry();
     ui.set_stats_stabilized(i32::try_from(stabilized).unwrap_or(i32::MAX));
     ui.set_stats_rst_silenced(i32::try_from(rsts).unwrap_or(i32::MAX));
-    let passed = levi::STATS_BYPASSED.load(std::sync::atomic::Ordering::Relaxed);
-    ui.set_stats_passed_through(i32::try_from(passed).unwrap_or(i32::MAX));
+    ui.set_stats_untouched(i32::try_from(levi::total_untouched()).unwrap_or(i32::MAX));
 }
 
-/// The engine reads the scope, host list and Game Shield settings when it
+/// The engine reads the scope, host list and Compatibility Mode settings when it
 /// starts, so restart it to apply a change made while it is running.
 fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
     if !ui.get_engine_active() {

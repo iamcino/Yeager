@@ -3,6 +3,7 @@ import "../../../assets/fonts/BeVietnamPro-SemiBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Lang } from "lang.slint";
+import { DomainListSheet } from "domain_list_sheet.slint";
 import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, PowerButton, ScrollBar } from "widgets.slint";
 export { Theme } from "theme.slint";
 export { Lang } from "lang.slint";
@@ -232,9 +233,13 @@ export component MainWindow inherits Window {
     in-out property <int> transport-profile: 0; // 0 Auto, 1 Fast, 2 Hardened, 3 Observe
     in property <int> stats-stabilized: 0;
     in property <int> stats-rst-silenced: 0;
-    in property <int> stats-passed-through: 0;
-    in property <bool> game-protection: true;
+    in property <bool> game-protection: true; // Compatibility Mode
     in property <[string]> excluded-domains;
+    in property <int> stats-untouched: 0;
+    // The domain list sheet: 0 hidden, 1 Custom exclusions, 2 Selected hosts.
+    in-out property <int> domain-sheet: 0;
+    in property <string> domain-error;
+    in property <string> domain-highlight;
     in property <string> congestion: "cubic";
     in-out property <int> congestion-sel: 2; // index into congestion options
     in property <bool> tcp-enabled: true;
@@ -275,11 +280,12 @@ export component MainWindow inherits Window {
     callback toggle-engine(bool);
     callback set-scope(int);
     callback set-transport-profile(int);
-    callback add-host(string);
-    callback remove-host(int);
     callback set-game-protection(bool);
-    callback add-excluded-domain(string);
-    callback remove-excluded-domain(int);
+    // Domain list sheet; `int` is the sheet (1 exclusions, 2 selected hosts).
+    callback domain-add(int, string);
+    callback domain-remove(int, string);
+    callback domain-import(string);
+    callback domain-sheet-closed();
     callback set-congestion(int);
     callback apply-congestion();
     callback reset-tcp();
@@ -517,9 +523,15 @@ export component MainWindow inherits Window {
                                     }
                                     RowSeparator { }
                                     ValueRow {
-                                        title: "Game Shield";
-                                        value: root.game-protection ? Lang.t("Bật", "On") : Lang.t("Tắt", "Off");
-                                        value-color: root.game-protection && root.engine-active ? #34c759 : Theme.label2;
+                                        title: Lang.t("Chế độ tương thích", "Compatibility");
+                                        value: root.game-protection ? Lang.t("Bật", "Active") : Lang.t("Tắt", "Off");
+                                        pill: root.game-protection;
+                                        clicked => { root.page = 2; }
+                                    }
+                                    RowSeparator { }
+                                    ValueRow {
+                                        title: Lang.t("Kết nối được giữ nguyên", "Untouched");
+                                        value: Lang.t(root.stats-untouched + " kết nối", root.stats-untouched + " connections");
                                         clicked => { root.page = 2; }
                                     }
                                     RowSeparator { }
@@ -680,17 +692,48 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 GroupBox {
+                                    title: Lang.t("Chế độ tương thích", "Compatibility Mode");
+                                    ToggleRow {
+                                        title: Lang.t("Giữ nguyên kết nối của ứng dụng phổ biến", "Leave popular apps untouched");
+                                        subtitle: Lang.t("Game, launcher và công cụ điều khiển từ xa (UltraViewer, TeamViewer, AnyDesk, Steam, Riot…) đi thẳng, tránh lỗi đăng nhập và lỗi lấy ID", "Games, launchers and remote tools (UltraViewer, TeamViewer, AnyDesk, Steam, Riot…) go straight through, avoiding sign-in and ID errors");
+                                        checked: root.game-protection;
+                                        toggled(v) => { root.set-game-protection(v); }
+                                    }
+                                    RowSeparator { }
+                                    Row {
+                                        title: Lang.t("Tên miền loại trừ tùy chỉnh", "Custom exclusions");
+                                        subtitle: root.excluded-domains.length == 0
+                                            ? Lang.t("Chưa có tên miền nào", "No domains yet")
+                                            : Lang.t(root.excluded-domains.length + " tên miền, luôn giữ nguyên", root.excluded-domains.length + " domains, always left untouched");
+                                        PillButton {
+                                            text: Lang.t("Quản lý", "Manage");
+                                            clicked => { root.domain-sheet = 1; }
+                                        }
+                                    }
+                                }
+                                GroupBox {
                                     title: Lang.t("Phạm vi áp dụng", "Scope");
                                     Row {
                                         title: Lang.t("Áp dụng cho", "Apply to");
                                         subtitle: root.scope == 0
                                             ? Lang.t("Mọi kết nối đi qua engine", "Every connection goes through the engine")
-                                            : Lang.t("Chỉ các tên miền trong danh sách bên dưới", "Only the domains in the list below");
+                                            : Lang.t("Chỉ các tên miền trong danh sách được xử lý", "Only the domains in the target list");
                                         Segmented {
                                             width: 240px;
                                             options: [Lang.t("Toàn bộ", "All"), Lang.t("Theo tên miền", "By domain")];
                                             current: root.scope;
                                             selected(i) => { root.set-scope(i); }
+                                        }
+                                    }
+                                    if root.scope == 1: VerticalLayout {
+                                        RowSeparator { }
+                                        Row {
+                                            title: Lang.t("Danh sách tên miền được xử lý", "Target domain list");
+                                            subtitle: Lang.t(root.hosts.length + " tên miền", root.hosts.length + " domains");
+                                            PillButton {
+                                                text: Lang.t("Quản lý", "Manage");
+                                                clicked => { root.domain-sheet = 2; }
+                                            }
                                         }
                                     }
                                 }
@@ -737,48 +780,6 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 GroupBox {
-                                    title: "Game Shield";
-                                    ToggleRow {
-                                        title: Lang.t("Để nguyên kết nối game", "Leave game connections untouched");
-                                        subtitle: Lang.t("Không chạm vào kết nối của game và launcher (Ubisoft, Riot, Steam, Battle.net…) để tránh lỗi đăng nhập và anti-cheat", "Game and launcher connections (Ubisoft, Riot, Steam, Battle.net…) pass as they are, avoiding login and anti-cheat errors");
-                                        checked: root.game-protection;
-                                        toggled(v) => { root.set-game-protection(v); }
-                                    }
-                                }
-                                GroupBox {
-                                    title: Lang.t("Tên miền để nguyên", "Excluded domains") + " (" + root.excluded-domains.length + ")";
-                                    Row {
-                                        title: Lang.t("Thêm tên miền", "Add a domain");
-                                        subtitle: Lang.t("Engine luôn để nguyên các tên miền này, kể cả tên miền con", "The engine always leaves these alone, subdomains included");
-                                        excluded-input := TextField {
-                                            width: 200px;
-                                            placeholder: Lang.t("game-của-bạn.com", "your-game.com");
-                                            accepted(t) => {
-                                                root.add-excluded-domain(t);
-                                                self.text = "";
-                                            }
-                                        }
-                                        PillButton {
-                                            text: Lang.t("Thêm", "Add");
-                                            primary: true;
-                                            clicked => {
-                                                root.add-excluded-domain(excluded-input.text);
-                                                excluded-input.text = "";
-                                            }
-                                        }
-                                    }
-                                    for domain[i] in root.excluded-domains: VerticalLayout {
-                                        RowSeparator { }
-                                        Row {
-                                            title: domain;
-                                            PillButton {
-                                                text: Lang.t("Xoá", "Remove");
-                                                clicked => { root.remove-excluded-domain(i); }
-                                            }
-                                        }
-                                    }
-                                }
-                                GroupBox {
                                     title: Lang.t("Hoạt động", "Activity");
                                     Row {
                                         title: Lang.t("Kết nối đã được ổn định", "Connections stabilised");
@@ -793,7 +794,6 @@ export component MainWindow inherits Window {
                                     RowSeparator { }
                                     Row {
                                         title: Lang.t("Lần ngắt kết nối bất thường đã chặn", "Abnormal resets blocked");
-                                        subtitle: Lang.t("Gói ngắt kết nối bất thường do mạng chèn vào trước khi máy chủ kịp trả lời", "Abnormal resets injected before the server can answer");
                                         Text {
                                             text: root.stats-rst-silenced;
                                             color: Theme.label2;
@@ -804,47 +804,14 @@ export component MainWindow inherits Window {
                                     }
                                     RowSeparator { }
                                     Row {
-                                        title: Lang.t("Kết nối được để nguyên", "Connections left untouched");
-                                        subtitle: Lang.t("Game, launcher, DNS mã hóa và tên miền để nguyên", "Games, launchers, encrypted DNS and excluded domains");
+                                        title: Lang.t("Kết nối được giữ nguyên", "Connections left untouched");
+                                        subtitle: Lang.t("DNS mã hóa, chế độ tương thích, tên miền loại trừ và kết nối không có tên máy chủ (SNI)", "Encrypted DNS, Compatibility Mode, custom exclusions and connections without a server name (SNI)");
                                         Text {
-                                            text: root.stats-passed-through;
+                                            text: root.stats-untouched;
                                             color: Theme.label2;
                                             font-size: Theme.fs-body;
                                             font-weight: 500;
                                             vertical-alignment: center;
-                                        }
-                                    }
-                                }
-                                GroupBox {
-                                    title: Lang.t("Danh sách tên miền", "Domain list") + " (" + root.hosts.length + ")";
-                                    Row {
-                                        title: Lang.t("Thêm tên miền", "Add a domain");
-                                        subtitle: Lang.t("Ví dụ: discord.com. Áp dụng cả tên miền con.", "For example discord.com. Subdomains are included.");
-                                        host-input := TextField {
-                                            width: 200px;
-                                            placeholder: Lang.t("tên-miền.com", "domain.com");
-                                            accepted(t) => {
-                                                root.add-host(t);
-                                                self.text = "";
-                                            }
-                                        }
-                                        PillButton {
-                                            text: Lang.t("Thêm", "Add");
-                                            primary: true;
-                                            clicked => {
-                                                root.add-host(host-input.text);
-                                                host-input.text = "";
-                                            }
-                                        }
-                                    }
-                                    for host[i] in root.hosts: VerticalLayout {
-                                        RowSeparator { }
-                                        Row {
-                                            title: host;
-                                            PillButton {
-                                                text: Lang.t("Xoá", "Remove");
-                                                clicked => { root.remove-host(i); }
-                                            }
                                         }
                                     }
                                 }
@@ -1122,6 +1089,29 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+            }
+        }
+
+        // Domain list sheet, over the whole window.
+        if root.domain-sheet != 0: DomainListSheet {
+            width: parent.width;
+            height: parent.height;
+            title: root.domain-sheet == 1
+                ? Lang.t("Tên miền loại trừ tùy chỉnh", "Custom Excluded Domains")
+                : Lang.t("Danh sách tên miền được xử lý", "Target Domain List");
+            description: root.domain-sheet == 1
+                ? Lang.t("Các tên miền này được giữ nguyên, không áp dụng hồ sơ ổn định kết nối. Áp dụng cả tên miền con.", "These domains are left untouched; no connection profile is applied. Subdomains are included.")
+                : Lang.t("Yeager chỉ áp dụng hồ sơ ổn định kết nối cho các tên miền trong danh sách này. Áp dụng cả tên miền con.", "Yeager applies its connection profile only to the domains in this list. Subdomains are included.");
+            domains: root.domain-sheet == 1 ? root.excluded-domains : root.hosts;
+            show-import-button: root.domain-sheet == 2 && root.scope == 1;
+            error: root.domain-error;
+            highlight: root.domain-highlight;
+            add-domain(t) => { root.domain-add(root.domain-sheet, t); }
+            remove-domain(d) => { root.domain-remove(root.domain-sheet, d); }
+            import-suggested(k) => { root.domain-import(k); }
+            close => {
+                root.domain-sheet-closed();
+                root.domain-sheet = 0;
             }
         }
 

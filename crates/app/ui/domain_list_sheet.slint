@@ -1,0 +1,257 @@
+// A sheet over the whole window for editing one domain list. Used for both
+// Custom exclusions and Selected hosts, so the two lists look and behave the
+// same: Enter adds, Delete removes the selected row, Esc closes.
+
+import { Theme } from "theme.slint";
+import { Lang } from "lang.slint";
+import { PillButton, TextField, ScrollBar } from "widgets.slint";
+
+component DomainItem {
+    in property <string> domain;
+    in property <bool> highlighted;
+    callback remove();
+
+    height: 36px;
+    accessible-role: list-item;
+    accessible-label: root.domain;
+
+    Rectangle {
+        border-radius: Theme.r-control;
+        background: root.highlighted ? Theme.accent.with-alpha(0.18)
+            : fs.has-focus ? Theme.sidebar-sel
+            : ta.has-hover ? Theme.sidebar-sel.with-alpha(0.5) : transparent;
+        border-width: fs.has-focus ? 1px : 0px;
+        border-color: Theme.accent;
+    }
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Delete || e.text == Key.Backspace) {
+                root.remove();
+                return accept;
+            }
+            reject
+        }
+    }
+    ta := TouchArea {
+        clicked => { fs.focus(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 4px;
+        spacing: 8px;
+        Text {
+            text: root.domain;
+            color: Theme.label;
+            font-size: Theme.fs-body;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: Theme.r-control;
+                background: x-ta.has-hover ? Theme.group-alt : transparent;
+                Text {
+                    text: "✕";
+                    color: Theme.label2;
+                    font-size: Theme.fs-sub;
+                }
+                x-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.remove(); }
+                }
+            }
+        }
+    }
+}
+
+export component DomainListSheet {
+    in property <string> title;
+    in property <string> description;
+    in property <[string]> domains;
+    in property <bool> show-import-button;
+    // Set by Rust after an add: why the input was refused ("" when it was
+    // accepted) and which entry to highlight (the new one, or the existing
+    // one when the input was a duplicate).
+    in property <string> error;
+    in property <string> highlight;
+
+    callback add-domain(string);
+    callback remove-domain(string);
+    callback import-suggested(string); // "game" | "remote" | "all"
+    callback close();
+
+    init => { input.focus-input(); }
+
+    Rectangle { background: #00000080; }
+    // Swallows clicks so nothing behind the sheet reacts.
+    TouchArea { }
+
+    keys := FocusScope {
+        width: root.width;
+        height: root.height;
+        // Captured before the text field so Esc closes even while typing.
+        capture-key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close();
+                return accept;
+            }
+            reject
+        }
+
+        card := Rectangle {
+            width: min(480px, root.width - 48px);
+            height: min(560px, root.height - 48px);
+            background: Theme.group;
+            border-radius: Theme.r-group;
+            border-width: 1px;
+            border-color: Theme.separator;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000040;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.title;
+                        font-size: Theme.fs-title;
+                        font-weight: 700;
+                        color: Theme.label;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: Lang.t(root.domains.length + " tên miền", root.domains.length + " domains");
+                        font-size: Theme.fs-sub;
+                        color: Theme.label2;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: root.description;
+                    font-size: Theme.fs-sub;
+                    color: Theme.label2;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    input := TextField {
+                        placeholder: Lang.t("vi-du.com hoặc *.vi-du.com", "example.com or *.example.com");
+                        accepted(t) => {
+                            root.add-domain(t);
+                            if (root.error == "") {
+                                self.text = "";
+                            }
+                        }
+                    }
+                    PillButton {
+                        text: Lang.t("Thêm", "Add");
+                        primary: true;
+                        clicked => {
+                            root.add-domain(input.text);
+                            if (root.error == "") {
+                                input.text = "";
+                            }
+                            input.focus-input();
+                        }
+                    }
+                }
+                // Collapsed while there is nothing to say.
+                Text {
+                    text: root.error;
+                    height: root.error == "" ? 0px : self.preferred-height;
+                    visible: root.error != "";
+                    font-size: Theme.fs-sub;
+                    color: #ff3b30;
+                    wrap: word-wrap;
+                }
+
+                if root.show-import-button: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: Lang.t("Nhập danh sách gợi ý", "Import suggestions");
+                        font-size: Theme.fs-body;
+                        color: Theme.label;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    PillButton {
+                        text: Lang.t("Game", "Games");
+                        clicked => { root.import-suggested("game"); }
+                    }
+                    PillButton {
+                        text: Lang.t("Điều khiển từ xa", "Remote tools");
+                        clicked => { root.import-suggested("remote"); }
+                    }
+                    PillButton {
+                        text: Lang.t("Tất cả", "All");
+                        clicked => { root.import-suggested("all"); }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    min-height: 120px;
+                    background: Theme.group-alt.with-alpha(0.5);
+                    border-radius: Theme.r-control;
+                    border-width: 1px;
+                    border-color: Theme.separator;
+                    clip: true;
+
+                    if root.domains.length == 0: Text {
+                        text: Lang.t("Chưa có tên miền nào", "No domains yet");
+                        font-size: Theme.fs-body;
+                        color: Theme.label2;
+                    }
+                    list := Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        content-width: self.width;
+                        VerticalLayout {
+                            padding: 4px;
+                            alignment: start;
+                            for domain in root.domains: DomainItem {
+                                domain: domain;
+                                highlighted: domain == root.highlight;
+                                remove => { root.remove-domain(domain); }
+                            }
+                        }
+                    }
+                    ScrollBar {
+                        x: parent.width - self.width - 2px;
+                        y: 4px;
+                        height: parent.height - 8px;
+                        viewport-y <=> list.content-y;
+                        viewport-height: list.content-height;
+                        visible-height: list.height;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: Lang.t("Enter để thêm · Delete xoá dòng đang chọn · Esc để đóng", "Enter adds · Delete removes the selected row · Esc closes");
+                        font-size: Theme.fs-sub;
+                        color: Theme.label2;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    PillButton {
+                        text: Lang.t("Xong", "Done");
+                        primary: true;
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -334,6 +334,8 @@ export component TextField {
     in-out property <string> text;
     callback accepted(string);
 
+    public function focus-input() { input.focus(); }
+
     height: 32px;
     min-width: 120px;
     horizontal-stretch: 1;
@@ -368,6 +370,8 @@ export component ValueRow {
     in property <string> subtitle;
     in property <string> value;
     in property <color> value-color: Theme.label2;
+    // Shows the value as a small green pill (e.g. "On" for a mode that is on).
+    in property <bool> pill: false;
     callback clicked();
 
     Rectangle {
@@ -378,8 +382,27 @@ export component ValueRow {
         Row {
             title: root.title;
             subtitle: root.subtitle;
+            if root.pill: VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    background: #34c75926;
+                    border-radius: 10px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 3px;
+                        padding-bottom: 3px;
+                        Text {
+                            text: root.value;
+                            color: #34c759;
+                            font-size: Theme.fs-sub;
+                            font-weight: 600;
+                        }
+                    }
+                }
+            }
             // Long values are cut with "…" rather than pushed past the edge.
-            Text {
+            if !root.pill: Text {
                 text: root.value;
                 color: root.value-color;
                 font-size: Theme.fs-body;
