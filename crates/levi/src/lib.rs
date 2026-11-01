@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,37 @@ static RECV_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 static WORKER_POOL: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 static TASK_SENDER: Mutex<Option<SyncSender<ResilienceTask>>> = Mutex::new(None);
 static CURRENT_HANDLE: Mutex<Option<(Arc<WinDivertApi>, SafeHandle)>> = Mutex::new(None);
+
+#[derive(Clone, Default)]
+struct RuntimePolicy {
+    is_hostlist: bool,
+    compat_mode: bool,
+    target_hosts: HashSet<String>,
+    custom_excluded: Vec<String>,
+}
+
+static POLICY_GENERATION: AtomicUsize = AtomicUsize::new(0);
+static RUNTIME_POLICY: RwLock<Option<Arc<RuntimePolicy>>> = RwLock::new(None);
+
+/// Hot-reloads the domain lists and Compatibility Mode flag at runtime without restarting
+/// the WinDivert driver or interrupting active connections.
+/// Uses an atomic generation counter + `RwLock<Option<Arc<RuntimePolicy>>>` so the capture thread
+/// only takes a brief read lock and performs an O(1) `Arc::clone` when the generation changes.
+pub fn update_lists(selected_hosts: &[String], custom_excluded: &[String], compat_mode: bool) {
+    let mut guard = RUNTIME_POLICY.write().unwrap();
+    let is_hostlist = guard.as_ref().map(|p| p.is_hostlist).unwrap_or(false);
+    *guard = Some(Arc::new(RuntimePolicy {
+        is_hostlist,
+        compat_mode,
+        target_hosts: selected_hosts.iter().map(|h| h.trim().to_lowercase()).collect(),
+        custom_excluded: custom_excluded
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect(),
+    }));
+    POLICY_GENERATION.fetch_add(1, Ordering::Release);
+}
 
 pub static STATS_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_STABILIZED: AtomicUsize = AtomicUsize::new(0);
@@ -60,6 +91,60 @@ pub const BUILTIN_DOH_DOMAINS: &[&str] = &[
     "one.one.one.one",
     "dns.adguard-dns.com",
     "dns.adguard.com",
+];
+
+/// Remote Desktop and remote support domains in the compatibility list.
+pub const REMOTE_TOOL_DOMAINS: &[&str] = &[
+    "ultraviewer.net",
+    "uvnc.com",
+    "ultraviewer.com",
+    "teamviewer.com",
+    "teamviewer.de",
+    "tvv.su",
+    "anydesk.com",
+    "anydesk.net",
+    "adsk.me",
+    "rustdesk.com",
+    "rdp.rs",
+    "parsec.app",
+    "parsecgaming.com",
+    "splashtop.com",
+];
+
+/// Game platforms and launcher domains in the compatibility list.
+pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
+    "ubi.com",
+    "ubisoft.com",
+    "ubisoftconnect.com",
+    "uplay.com",
+    "ubi.li",
+    "riotgames.com",
+    "pvp.net",
+    "leagueoflegends.com",
+    "valgame.net",
+    "battle.net",
+    "blizzard.com",
+    "ea.com",
+    "origin.com",
+    "epicgames.com",
+    "unrealengine.com",
+    "steamcontent.com",
+    "steampowered.com",
+    "steamcommunity.com",
+    "steamstatic.com",
+    "xboxlive.com",
+    "playfabapi.com",
+];
+
+/// Single-label Subject CN identifiers passed by remote tools in `SslStream.AuthenticateAsClient`
+/// (e.g. UltraViewer's `RemoteControl20.dll` passes `"ultraviewer"` as the TLS SNI).
+pub const BUILTIN_COMPAT_SINGLE_LABELS: &[&str] = &[
+    "ultraviewer",
+    "teamviewer",
+    "anydesk",
+    "rustdesk",
+    "parsec",
+    "splashtop",
 ];
 
 /// Unified compatibility list: Remote Desktop tools, game platforms, and launcher services
@@ -114,12 +199,55 @@ pub enum PassThroughReason {
     Compat,
     /// User-defined custom excluded domain.
     Custom,
-    /// TLS ClientHello without SNI (direct-IP or proprietary handshake fallback).
+    /// TLS ClientHello where SNI is missing, empty, or not a valid public FQDN
+    /// (e.g. direct-IP, single-label certificate CN like `"ultraviewer"`, `localhost`, or IP literal).
     NoSni,
+}
+
+/// Checks whether an extracted SNI string is a valid public FQDN (contains at least one dot,
+/// has valid DNS labels of length 1..=63 with alphanumeric/hyphen characters, has alphabetic
+/// characters in the final TLD label, and is not an IPv4/IPv6 literal or single-label CN).
+///
+/// Note on special characters & IDN:
+/// - Hostnames containing `_` (e.g. `_service._tcp.example.com` or internal SMB names) intentionally
+///   return `false` and fall back to [`PassThroughReason::NoSni`] (raw pass-through for safety).
+/// - IDN Punycode labels (`xn--...`, e.g. `xn--bcher-kva.example.com` or `example.xn--fiqs8s`)
+///   consist of ASCII alphanumeric characters and internal hyphens with alphabetic TLDs, so they are accepted.
+/// - Zero heap allocation: operates strictly on borrowed byte/str iterators.
+#[inline]
+pub fn is_valid_fqdn_sni(sni: &str) -> bool {
+    if sni.is_empty() || sni.len() > 253 || !sni.contains('.') || sni.contains(':') {
+        return false;
+    }
+
+    // Explicit IP literal rejection (IPv4 all-digits/dots or parseable IpAddr)
+    if sni.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || sni.parse::<std::net::IpAddr>().is_ok()
+    {
+        return false;
+    }
+
+    // Validate each DNS label (1..=63 chars, alphanumeric or '-', not starting/ending with '-')
+    // and ensure the final TLD label contains at least one ASCII letter (RFC 1123 / RFC 6066).
+    let mut last_label_has_alpha = false;
+    for label in sni.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+        last_label_has_alpha = label.bytes().any(|b| b.is_ascii_alphabetic());
+    }
+
+    last_label_has_alpha
 }
 
 /// Evaluates whether an outbound TLS connection should pass through raw without packet mutation.
 /// Centralized evaluation function used identically by the driver hot path and unit tests.
+/// Zero heap allocation: operates directly on borrowed `&str` slices via case-insensitive comparisons.
 #[inline]
 pub fn evaluate_pass_through(
     sni: Option<&str>,
@@ -127,20 +255,32 @@ pub fn evaluate_pass_through(
     custom_excluded: &[String],
 ) -> Option<PassThroughReason> {
     let s = match sni {
-        Some(s) if !s.trim().is_empty() => s.trim().to_lowercase(),
-        _ => return Some(PassThroughReason::NoSni),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Some(PassThroughReason::NoSni);
+            }
+            trimmed
+        }
+        None => return Some(PassThroughReason::NoSni),
     };
 
-    if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+    if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(s, target)) {
         return Some(PassThroughReason::Doh);
     }
 
-    if compat_mode && UNIFIED_COMPAT_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+    if compat_mode && is_builtin_compat(s) {
         return Some(PassThroughReason::Compat);
     }
 
-    if custom_excluded.iter().any(|target| matches_host(&s, target)) {
+    if custom_excluded.iter().any(|target| matches_host(s, target)) {
         return Some(PassThroughReason::Custom);
+    }
+
+    // Fallback for non-FQDN SNI values (e.g. single-label certificate CN like "ultraviewer"
+    // or IPv4/IPv6 address literals passed to SslStream.AuthenticateAsClient):
+    if !is_valid_fqdn_sni(s) {
+        return Some(PassThroughReason::NoSni);
     }
 
     None
@@ -152,10 +292,12 @@ pub fn is_builtin_doh(domain: &str) -> bool {
     BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(domain, target))
 }
 
-/// Checks whether a domain belongs to the unified compatibility pass-through list.
+/// Checks whether a domain belongs to the unified compatibility pass-through list
+/// (including single-label certificate CNs like `"ultraviewer"`).
 #[inline]
 pub fn is_builtin_compat(domain: &str) -> bool {
     UNIFIED_COMPAT_DOMAINS.iter().any(|target| matches_host(domain, target))
+        || BUILTIN_COMPAT_SINGLE_LABELS.iter().any(|target| domain.eq_ignore_ascii_case(target))
 }
 
 /// Backwards-compatibility alias for v1.1.0 callers.
@@ -349,19 +491,28 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
         *h_guard = Some((Arc::clone(&api), handle));
     }
 
-    let is_hostlist = cfg.scope == Scope::HostList;
-    let target_hosts: HashSet<String> = cfg
-        .selected_hosts
-        .iter()
-        .map(|h| h.trim().to_lowercase())
-        .collect();
-    let compat_mode = cfg.compatibility_mode_enabled;
-    let custom_excluded: Vec<String> = cfg
-        .custom_excluded_domains
-        .iter()
-        .map(|h| h.trim().to_lowercase())
-        .filter(|h| !h.is_empty())
-        .collect();
+    let initial_policy = Arc::new(RuntimePolicy {
+        is_hostlist: cfg.scope == Scope::HostList,
+        compat_mode: cfg.compatibility_mode_enabled,
+        target_hosts: cfg
+            .selected_hosts
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect(),
+        custom_excluded: cfg
+            .custom_excluded_domains
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect(),
+    });
+
+    {
+        let mut pol_guard = RUNTIME_POLICY.write().unwrap();
+        *pol_guard = Some(Arc::clone(&initial_policy));
+    }
+    let mut local_gen = POLICY_GENERATION.fetch_add(1, Ordering::Release).wrapping_add(1);
+    let mut active_policy = initial_policy;
 
     RUNNING.store(true, Ordering::SeqCst);
 
@@ -496,8 +647,19 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
 
                 if tls::is_client_hello(parsed.payload) {
                     STATS_HANDSHAKES.fetch_add(1, Ordering::Relaxed);
-                    // Register handshake for state-aware RST silencer tracking
-                    handshake_tracker.record_client_hello(parsed.dst_ip, parsed.src_port);
+
+                    // Zero-contention check for hot-reloaded domain lists & compatibility mode:
+                    // Fast path is a single Acquire load; slow path (on UI config save) takes a brief
+                    // RwLock read guard and performs an O(1) Arc pointer clone (zero collection cloning).
+                    let cur_gen = POLICY_GENERATION.load(Ordering::Acquire);
+                    if cur_gen != local_gen {
+                        if let Ok(guard) = RUNTIME_POLICY.read() {
+                            if let Some(ref pol) = *guard {
+                                active_policy = Arc::clone(pol);
+                            }
+                        }
+                        local_gen = cur_gen;
+                    }
 
                     // Observe Mode: Monitor & Telemetry only, zero packet mutation
                     if ACTIVE_PROFILE.load(Ordering::Relaxed) == 3 {
@@ -509,7 +671,11 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     let sni_opt = info.as_ref().and_then(|inf| inf.sni);
 
                     // Centralized Pass-Through Evaluation (DoH, Compatibility Mode, Custom, No-SNI Fallback):
-                    if let Some(reason) = evaluate_pass_through(sni_opt, compat_mode, &custom_excluded) {
+                    if let Some(reason) = evaluate_pass_through(
+                        sni_opt,
+                        active_policy.compat_mode,
+                        &active_policy.custom_excluded,
+                    ) {
                         match reason {
                             PassThroughReason::Doh => {
                                 STATS_DOH_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
@@ -531,10 +697,9 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     }
 
                     // Scope::HostList check: if not in pass-through, only stabilize if target matches
-                    if is_hostlist {
-                        let is_target = sni_opt.map_or(false, |s| {
-                            let s_lower = s.to_lowercase();
-                            target_hosts.iter().any(|target| matches_host(&s_lower, target))
+                    if active_policy.is_hostlist {
+                        let is_target = sni_opt.is_some_and(|s| {
+                            active_policy.target_hosts.iter().any(|target| matches_host(s, target))
                         });
                         if !is_target {
                             let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
@@ -542,6 +707,8 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                         }
                     }
 
+                    // Register handshake for state-aware RST silencer tracking ONLY when stabilizing
+                    handshake_tracker.record_client_hello(parsed.dst_ip, parsed.src_port);
                     STATS_STABILIZED.fetch_add(1, Ordering::Relaxed);
 
                         // Proven resilient TLS transport stabilization strategy:
@@ -643,9 +810,10 @@ pub fn matches_host(domain: &str, target: &str) -> bool {
     if domain.eq_ignore_ascii_case(target) {
         return true;
     }
-    if domain.len() > target.len() && domain.ends_with(target) {
+    if domain.len() > target.len() {
         let prefix_len = domain.len() - target.len();
-        return domain.as_bytes()[prefix_len - 1] == b'.';
+        return domain.as_bytes()[prefix_len - 1] == b'.'
+            && domain[prefix_len..].eq_ignore_ascii_case(target);
     }
     false
 }
@@ -687,7 +855,10 @@ mod tests {
     fn test_evaluate_pass_through_comprehensive() {
         let custom: Vec<String> = vec!["internal-company.net".to_string(), "my-custom-proxy.org".to_string()];
 
-        // F1 & F4 & F5: Remote tools and Game launchers with compat_mode = true
+        // F1 & F4 & F5 (T1, T3, T8, T9): Remote tools and Game launchers with compat_mode = true
+        assert_eq!(evaluate_pass_through(Some("ultraviewer"), true, &custom), Some(PassThroughReason::Compat)); // T1
+        assert_eq!(evaluate_pass_through(Some("teamviewer"), true, &custom), Some(PassThroughReason::Compat));  // T3
+        assert_eq!(evaluate_pass_through(Some("ultraviewer.net"), true, &custom), Some(PassThroughReason::Compat)); // T8
         assert_eq!(evaluate_pass_through(Some("connect.ultraviewer.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("rdp.ultraviewer.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("server.uvnc.com"), true, &custom), Some(PassThroughReason::Compat));
@@ -696,16 +867,38 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("relay.rustdesk.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("kessel.parsec.app"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("relay.splashtop.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), true, &custom), Some(PassThroughReason::Compat)); // T9
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Compat));
 
-        // F2: Direct IP connections or ClientHellos without SNI
+        // F2 (T2, T4, T5, T6, T7, T12, T13): Direct IP, empty SNI, single-label, or invalid FQDN
         assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
-        assert_eq!(evaluate_pass_through(Some(""), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some(""), true, &custom), Some(PassThroughReason::NoSni));               // T12
         assert_eq!(evaluate_pass_through(Some("   "), true, &custom), Some(PassThroughReason::NoSni));
         assert_eq!(evaluate_pass_through(None, false, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("ultraviewer"), false, &custom), Some(PassThroughReason::NoSni));   // T2
+        assert_eq!(evaluate_pass_through(Some("unknown-service"), true, &custom), Some(PassThroughReason::NoSni)); // T4
+        assert_eq!(evaluate_pass_through(Some("localhost"), true, &custom), Some(PassThroughReason::NoSni));      // T5
+        assert_eq!(evaluate_pass_through(Some("localhost"), false, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("42.96.32.170"), true, &custom), Some(PassThroughReason::NoSni));   // T6
+        assert_eq!(evaluate_pass_through(Some("51.222.43.134"), false, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("2001:db8::1"), true, &custom), Some(PassThroughReason::NoSni));    // T7
+        assert_eq!(evaluate_pass_through(Some("example.com."), true, &custom), Some(PassThroughReason::NoSni));   // T13
+        assert_eq!(evaluate_pass_through(Some(".example.com"), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("bad..domain.com"), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("-bad.domain.com"), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("host.123"), true, &custom), Some(PassThroughReason::NoSni));
+
+        // Underscore hostnames (_service._tcp.example.com) intentionally fall back to NoSni pass-through
+        assert_eq!(evaluate_pass_through(Some("_service._tcp.example.com"), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("internal_host.local"), true, &custom), Some(PassThroughReason::NoSni));
+
+        // Punycode IDN domains (xn--...) and mixed-case FQDNs are accepted as valid FQDNs
+        assert_eq!(evaluate_pass_through(Some("xn--bcher-kva.example.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("example.xn--fiqs8s"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("Connect.UltraViewer.NET"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("Sub.Internal-Company.NET"), false, &custom), Some(PassThroughReason::Custom));
 
         // F6: DoH resolvers ALWAYS pass-through, even when compat_mode = false!
         assert_eq!(evaluate_pass_through(Some("cloudflare-dns.com"), false, &custom), Some(PassThroughReason::Doh));
@@ -753,5 +946,75 @@ mod tests {
         assert!(!is_builtin_bypass("google.com"));
         assert!(!is_builtin_bypass("youtube.com"));
         assert!(!is_builtin_bypass("notubi.com"));
+    }
+
+    #[test]
+    fn test_concurrent_update_lists_and_hot_path_reads() {
+        // Initialize runtime policy
+        update_lists(
+            &["discord.com".to_string()],
+            &["alpha.internal.net".to_string()],
+            true,
+        );
+
+        let writer = std::thread::spawn(|| {
+            for i in 0..500 {
+                let compat = i % 2 == 0;
+                let custom = if compat {
+                    vec!["alpha.internal.net".to_string()]
+                } else {
+                    vec!["beta.internal.net".to_string()]
+                };
+                let selected = vec![format!("host-{i}.example.com")];
+                update_lists(&selected, &custom, compat);
+            }
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            readers.push(std::thread::spawn(|| {
+                let mut local_gen = 0usize;
+                let mut active = Arc::new(RuntimePolicy::default());
+                for _ in 0..2000 {
+                    let cur_gen = POLICY_GENERATION.load(Ordering::Acquire);
+                    if cur_gen != local_gen {
+                        if let Ok(guard) = RUNTIME_POLICY.read() {
+                            if let Some(ref pol) = *guard {
+                                active = Arc::clone(pol);
+                            }
+                        }
+                        local_gen = cur_gen;
+                    }
+                    // Verify atomic snapshot consistency: when compat_mode is true, alpha.internal.net
+                    // is in custom_excluded; when false, beta.internal.net is in custom_excluded.
+                    if !active.custom_excluded.is_empty() {
+                        if active.compat_mode {
+                            assert_eq!(
+                                evaluate_pass_through(Some("alpha.internal.net"), active.compat_mode, &active.custom_excluded),
+                                Some(PassThroughReason::Custom)
+                            );
+                            assert_eq!(
+                                evaluate_pass_through(Some("ultraviewer"), active.compat_mode, &active.custom_excluded),
+                                Some(PassThroughReason::Compat)
+                            );
+                        } else {
+                            assert_eq!(
+                                evaluate_pass_through(Some("beta.internal.net"), active.compat_mode, &active.custom_excluded),
+                                Some(PassThroughReason::Custom)
+                            );
+                            assert_eq!(
+                                evaluate_pass_through(Some("ultraviewer"), active.compat_mode, &active.custom_excluded),
+                                Some(PassThroughReason::NoSni)
+                            );
+                        }
+                    }
+                }
+            }));
+        }
+
+        writer.join().expect("Writer thread should not panic");
+        for r in readers {
+            r.join().expect("Reader thread should not panic");
+        }
     }
 }
