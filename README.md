@@ -30,6 +30,7 @@
 - [Uninstalling](#uninstalling)
 - [Building from source](#building-from-source)
 - [FAQ](#faq)
+- [Security & VirusTotal Inspection](#security--virustotal-inspection)
 - [Disclaimer](#disclaimer)
 - [License and third-party software](#license-and-third-party-software)
 
@@ -305,6 +306,8 @@ system-level operations in Windows.
 Yeager loads the WinDivert network driver and runs a local DNS resolver,
 which some security products watch closely. Allow `yeager.exe` in your
 antivirus and firewall. Yeager never uses hidden PowerShell or fake packets.
+Current scan result and how to verify the binary yourself:
+[Security & VirusTotal Inspection](#security--virustotal-inspection).
 
 **Will it slow down my games?**
 No noticeable effect on general traffic, but if you prefer, use the
@@ -313,6 +316,47 @@ No noticeable effect on general traffic, but if you prefer, use the
 **Something stopped working. How do I undo everything?**
 Turn Yeager off, or press **Restore Windows defaults** on the TCP page.
 Quitting the app also restores TCP and DNS settings.
+
+## Security & VirusTotal Inspection
+
+Yeager runs at the system level (Administrator privileges + the WinDivert network driver), so we publish binary inspection results instead of leaving users to guess.
+
+**VirusTotal report — v1.1.2** (analyzed 2026-11-01):
+[SHA-256 eef2d28…f0864a](https://www.virustotal.com/gui/file/eef2d283e4e7a4d702f67324021c5cc51ce9baa622ce9a789a01f15f36f0864a)
+— **1/70** detection, only `Trapmine` with `Malicious.moderate.ml.score` (a statistical ML score, not a known-signature verdict). **0/69 remaining vendors** reported malicious indicators.
+
+### Why the false positive
+
+- **Unsigned binary:** no commercial code-signing certificate yet, so some ML/heuristic engines mark fresh binaries as unverified.
+- **`obfuscated` tag:** from `.rsrc` entropy 7.92, normal for Rust embedding 9 multi-resolution PNG icons + a manifest. DetectItEasy reports no packer/protector; the source contains zero obfuscation or packing.
+- Mobile engines reporting `Unable to process file type` simply do not parse Windows x64 PE.
+
+### Network behavior (all IOCs)
+
+| Endpoint | Purpose |
+|---|---|
+| `1.1.1.1` / `1.0.0.1` | DNS-over-HTTPS (Hange) |
+| `github.com/iamcino/Yeager/releases/latest` | Update check |
+| `speed.cloudflare.com` | Latency probe (Erwin) |
+| `www.ssl.com` | Root CA fetch via TLS AIA during chain validation |
+
+*(All seven IPs in the Relations tab belong to three known autonomous systems: AS13335 Cloudflare — DNS `1.1.1.1`/`1.0.0.1` and CDN for `speed.cloudflare.com`; AS36459 GitHub; AS14618 AWS — related cloud infrastructure. None is a third-party endpoint or C2.)*
+
+No C2, no telemetry, no exfiltration in the source. *(The 1/92 flag on IP `1.1.1.1` is Cloudflare Anycast's own reputation, unrelated to this binary.)*
+
+### Verify it yourself
+
+Do not trust — check:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\yeager.exe
+```
+Compare against the hash in the link above, or build from source:
+```bash
+cargo build --release
+```
+
+> Results bind to the v1.1.2 SHA-256 at analysis time. VT may re-analyze and change counts; each release updates its hash + link.
 
 ## Disclaimer
 
