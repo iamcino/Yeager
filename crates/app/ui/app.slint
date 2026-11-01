@@ -512,7 +512,7 @@ export component MainWindow inherits Window {
                                     RowSeparator { }
                                     ValueRow {
                                         title: Lang.t("Phạm vi", "Scope");
-                                        value: root.scope == 0 ? Lang.t("Toàn bộ", "All") : Lang.t(root.hosts.length + " tên miền", root.hosts.length + " domains");
+                                        value: root.scope == 0 ? Lang.t("Toàn bộ", "All") : Lang.t(root.hosts.length + " tên miền", root.hosts.length + (root.hosts.length == 1 ? " domain" : " domains"));
                                         clicked => { root.page = 2; }
                                     }
                                     RowSeparator { }
@@ -704,7 +704,7 @@ export component MainWindow inherits Window {
                                         title: Lang.t("Tên miền loại trừ tùy chỉnh", "Custom exclusions");
                                         subtitle: root.excluded-domains.length == 0
                                             ? Lang.t("Chưa có tên miền nào", "No domains yet")
-                                            : Lang.t(root.excluded-domains.length + " tên miền, luôn giữ nguyên", root.excluded-domains.length + " domains, always left untouched");
+                                            : Lang.t(root.excluded-domains.length + " tên miền, luôn giữ nguyên", root.excluded-domains.length + (root.excluded-domains.length == 1 ? " domain" : " domains") + ", always left untouched");
                                         PillButton {
                                             text: Lang.t("Quản lý", "Manage");
                                             clicked => { root.domain-sheet = 1; }
@@ -729,7 +729,7 @@ export component MainWindow inherits Window {
                                         RowSeparator { }
                                         Row {
                                             title: Lang.t("Danh sách tên miền được xử lý", "Target domain list");
-                                            subtitle: Lang.t(root.hosts.length + " tên miền", root.hosts.length + " domains");
+                                            subtitle: Lang.t(root.hosts.length + " tên miền", root.hosts.length + (root.hosts.length == 1 ? " domain" : " domains"));
                                             PillButton {
                                                 text: Lang.t("Quản lý", "Manage");
                                                 clicked => { root.domain-sheet = 2; }
