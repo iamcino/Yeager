@@ -301,14 +301,13 @@ fn main() -> Result<(), slint::PlatformError> {
             cfg.borrow_mut().compatibility_mode_enabled = on;
             config::save(&cfg.borrow());
             ui.set_game_protection(on);
-            restart_engine_if_active(&ui, &cfg.borrow());
+            apply_lists(&cfg.borrow());
         });
     }
     // --- Domain list sheet (Custom exclusions / Selected hosts) ---
-    // Edits change `cfg` and the UI at once; the file is written 500 ms after
-    // the last edit, and right away when the sheet closes. The engine reads
-    // the lists when it starts, so it is restarted once on close, not on
-    // every keystroke.
+    // Edits change `cfg`, the UI and the running engine at once (hot reload,
+    // open connections are kept); the file is written 500 ms after the last
+    // edit, and right away when the sheet closes.
     let domain_save = Rc::new(slint::Timer::default());
     let domains_changed = Rc::new(Cell::new(false));
     let schedule_domain_save = {
@@ -348,6 +347,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             ui.set_domain_error("".into());
             set_domain_lists(&ui, &cfg.borrow());
+            apply_lists(&cfg.borrow());
             schedule();
         });
     }
@@ -369,6 +369,7 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_domain_error("".into());
             ui.set_domain_highlight("".into());
             set_domain_lists(&ui, &cfg.borrow());
+            apply_lists(&cfg.borrow());
             schedule();
         });
     }
@@ -383,6 +384,7 @@ fn main() -> Result<(), slint::PlatformError> {
             // Imports are saved at once (no debounce).
             timer.stop();
             config::save(&cfg.borrow());
+            apply_lists(&cfg.borrow());
             changed.set(true);
             ui.set_domain_highlight("".into());
             ui.set_domain_error("".into());
@@ -402,7 +404,6 @@ fn main() -> Result<(), slint::PlatformError> {
             if changed.replace(false) {
                 timer.stop();
                 config::save(&cfg.borrow());
-                restart_engine_if_active(&ui, &cfg.borrow());
             }
         });
     }
@@ -1376,36 +1377,13 @@ fn domain_list(cfg: &mut Config, sheet: i32) -> &mut Vec<String> {
     if sheet == 1 { &mut cfg.custom_excluded_domains } else { &mut cfg.selected_hosts }
 }
 
-/// Remote tools inside levi's compatibility list; the rest of that list is
-/// game platforms and launchers.
-const REMOTE_TOOL_DOMAINS: &[&str] = &[
-    "ultraviewer.net",
-    "uvnc.com",
-    "ultraviewer.com",
-    "teamviewer.com",
-    "teamviewer.de",
-    "tvv.su",
-    "anydesk.com",
-    "anydesk.net",
-    "adsk.me",
-    "rustdesk.com",
-    "rdp.rs",
-    "parsec.app",
-    "parsecgaming.com",
-    "splashtop.com",
-];
-
 /// The suggestions the Selected hosts sheet imports: "game", "remote" or "all".
 fn suggested_domains(kind: &str) -> Vec<&'static str> {
-    levi::UNIFIED_COMPAT_DOMAINS
-        .iter()
-        .copied()
-        .filter(|d| match kind {
-            "remote" => REMOTE_TOOL_DOMAINS.contains(d),
-            "game" => !REMOTE_TOOL_DOMAINS.contains(d),
-            _ => true,
-        })
-        .collect()
+    match kind {
+        "remote" => levi::REMOTE_TOOL_DOMAINS.to_vec(),
+        "game" => levi::GAME_PLATFORM_DOMAINS.to_vec(),
+        _ => levi::UNIFIED_COMPAT_DOMAINS.to_vec(),
+    }
 }
 
 fn transport_profile_index(profile: TransportProfile) -> i32 {
@@ -1419,8 +1397,15 @@ fn refresh_engine_stats(ui: &MainWindow) {
     ui.set_stats_untouched(i32::try_from(levi::total_untouched()).unwrap_or(i32::MAX));
 }
 
-/// The engine reads the scope, host list and Compatibility Mode settings when it
-/// starts, so restart it to apply a change made while it is running.
+/// Hands the domain lists and the Compatibility Mode switch to the engine.
+/// A running engine applies them to new connections without a restart and
+/// keeps the open ones; a stopped engine reads them again when it starts.
+fn apply_lists(cfg: &Config) {
+    levi::update_lists(&cfg.selected_hosts, &cfg.custom_excluded_domains, cfg.compatibility_mode_enabled);
+}
+
+/// The engine reads the scope and transport profile when it starts, so
+/// restart it to apply a change made while it is running.
 fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
     if !ui.get_engine_active() {
         return;
