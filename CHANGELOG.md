@@ -8,8 +8,16 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-01
+
 ### Fixed
+- UltraViewer gets its ID right away again when it connects over port 443. Connections whose server name is not a full domain (a single word such as "ultraviewer", "localhost" or a bare IP address) are now always left untouched.
 - The installer and release notes now state the real requirement, Windows 11 or Windows Server 2022 (x64). Earlier notes said Windows 10 1809, but Yeager's DNS over HTTPS relies on Windows features that only exist on Windows 11.
+
+### Changed
+- **New logo:** an ascending wing that fades from blue to white, on the app, the installer, the taskbar and the tray. In the sidebar it follows the accent color you pick on the Appearance page, and while Yeager is on the tray icon lights up in that color too.
+- Turning Compatibility Mode on or off and editing the domain lists now take effect immediately without restarting the engine, so open connections (games, remote sessions, downloads) are not dropped.
+- The "Games" and "Remote tools" import buttons use the engine's own lists, so new remote tools are never imported as games.
 
 ## [1.1.1] - 2026-11-01
 
@@ -181,6 +189,7 @@ First public release.
 ### Fixed
 - "Restore Windows defaults" on the TCP page.
 
+[1.1.2]: https://github.com/iamcino/Yeager/releases/tag/v1.1.2
 [1.1.1]: https://github.com/iamcino/Yeager/releases/tag/v1.1.1
 [1.1.0]: https://github.com/iamcino/Yeager/releases/tag/v1.1.0
 [1.0.9]: https://github.com/iamcino/Yeager/releases/tag/v1.0.9
