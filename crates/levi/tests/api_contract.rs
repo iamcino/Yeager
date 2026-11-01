@@ -84,7 +84,7 @@ fn test_api_contract_lifecycle() {
 
         // Test scope change restart
         cfg.scope = Scope::HostList;
-        cfg.hosts = vec!["example.com".into(), "discord.com".into()];
+        cfg.selected_hosts = vec!["example.com".into(), "discord.com".into()];
         levi::stop();
         assert!(!levi::is_running());
 

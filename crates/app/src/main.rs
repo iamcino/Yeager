@@ -106,7 +106,7 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &Config) {
     ui.set_doh_provider(provider_index(cfg));
     ui.set_doh_http3(cfg.doh_http3);
     set_hosts(ui, cfg);
-    ui.set_game_protection(cfg.game_protection_enabled);
+    ui.set_game_protection(cfg.compatibility_mode_enabled);
     set_excluded_domains(ui, cfg);
     ui.set_transport_profile(transport_profile_index(cfg.transport_profile));
     ui.set_connect_on_launch(cfg.connect_on_launch);
@@ -301,11 +301,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 return;
             };
-            if cfg.borrow().hosts.contains(&host) {
+            if cfg.borrow().selected_hosts.contains(&host) {
                 ui.set_log(t!("{host} đã có trong danh sách.", "{host} is already in the list.").into());
                 return;
             }
-            cfg.borrow_mut().hosts.push(host.clone());
+            cfg.borrow_mut().selected_hosts.push(host.clone());
             config::save(&cfg.borrow());
             set_hosts(&ui, &cfg.borrow());
             ui.set_log(t!("Đã thêm {host}.", "Added {host}.").into());
@@ -318,10 +318,10 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_remove_host(move |i| {
             let Some(ui) = w.upgrade() else { return };
             let i = i as usize;
-            if i >= cfg.borrow().hosts.len() {
+            if i >= cfg.borrow().selected_hosts.len() {
                 return;
             }
-            let host = cfg.borrow_mut().hosts.remove(i);
+            let host = cfg.borrow_mut().selected_hosts.remove(i);
             config::save(&cfg.borrow());
             set_hosts(&ui, &cfg.borrow());
             ui.set_log(t!("Đã xoá {host}.", "Removed {host}.").into());
@@ -335,7 +335,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let cfg = cfg.clone();
         ui.on_set_game_protection(move |on| {
             let Some(ui) = w.upgrade() else { return };
-            cfg.borrow_mut().game_protection_enabled = on;
+            cfg.borrow_mut().compatibility_mode_enabled = on;
             config::save(&cfg.borrow());
             ui.set_game_protection(on);
             restart_engine_if_active(&ui, &cfg.borrow());
@@ -1325,7 +1325,7 @@ fn provider_label(provider: Option<String>) -> String {
 }
 
 fn set_hosts(ui: &MainWindow, cfg: &Config) {
-    let hosts: Vec<SharedString> = cfg.hosts.iter().map(SharedString::from).collect();
+    let hosts: Vec<SharedString> = cfg.selected_hosts.iter().map(SharedString::from).collect();
     ui.set_hosts(ModelRc::new(VecModel::from(hosts)));
 }
 

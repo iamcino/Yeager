@@ -817,6 +817,7 @@ name = "common"
 version = "1.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

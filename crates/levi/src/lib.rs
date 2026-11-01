@@ -32,11 +32,27 @@ static CURRENT_HANDLE: Mutex<Option<(Arc<WinDivertApi>, SafeHandle)>> = Mutex::n
 pub static STATS_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_STABILIZED: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_DROPPED_RSTS: AtomicUsize = AtomicUsize::new(0);
+
+// v1.1.1 Untouched / Pass-Through Telemetry
+pub static STATS_DOH_UNTOUCHED: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_COMPAT_UNTOUCHED: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_CUSTOM_UNTOUCHED: AtomicUsize = AtomicUsize::new(0);
+pub static STATS_NO_SNI_UNTOUCHED: AtomicUsize = AtomicUsize::new(0);
+
+// Backwards compatibility aliases for existing UI/API
 pub static STATS_BYPASSED: AtomicUsize = AtomicUsize::new(0);
 pub static STATS_GAME_PROTECTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Computes the total number of untouched connections across all categories.
+pub fn total_untouched() -> usize {
+    STATS_DOH_UNTOUCHED.load(Ordering::Relaxed)
+        + STATS_COMPAT_UNTOUCHED.load(Ordering::Relaxed)
+        + STATS_CUSTOM_UNTOUCHED.load(Ordering::Relaxed)
+        + STATS_NO_SNI_UNTOUCHED.load(Ordering::Relaxed)
+}
+
 /// Encrypted DNS Resolvers (DoH) that must ALWAYS pass through raw without mutation,
-/// ensuring reliable DNS queries regardless of whether Game Shield is enabled.
+/// ensuring reliable DNS queries regardless of whether Compatibility Mode is enabled.
 pub const BUILTIN_DOH_DOMAINS: &[&str] = &[
     "cloudflare-dns.com",
     "dns.google",
@@ -46,44 +62,89 @@ pub const BUILTIN_DOH_DOMAINS: &[&str] = &[
     "dns.adguard.com",
 ];
 
-/// Gaming ecosystems, launchers, anti-cheat gateways, and sensitive game APIs
-/// that pass through raw when Game Shield (`game_protection_enabled`) is active.
-pub const BUILTIN_GAME_DOMAINS: &[&str] = &[
-    // Ubisoft Connect & Services
+/// Unified compatibility list: Remote Desktop tools, game platforms, and launcher services
+/// that pass through raw without mutation when Compatibility Mode is enabled.
+pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
+    // Remote tools
+    "ultraviewer.net",
+    "uvnc.com",
+    "ultraviewer.com",
+    "teamviewer.com",
+    "teamviewer.de",
+    "tvv.su",
+    "anydesk.com",
+    "anydesk.net",
+    "adsk.me",
+    "rustdesk.com",
+    "rdp.rs",
+    "parsec.app",
+    "parsecgaming.com",
+    "splashtop.com",
+
+    // Game platforms & Launchers
     "ubi.com",
     "ubisoft.com",
     "ubisoftconnect.com",
     "uplay.com",
     "ubi.li",
-
-    // Riot Games (Vanguard / LoL / Valorant)
     "riotgames.com",
     "pvp.net",
     "leagueoflegends.com",
     "valgame.net",
-
-    // Blizzard / Battle.net
     "battle.net",
     "blizzard.com",
-
-    // Electronic Arts / Origin
     "ea.com",
     "origin.com",
-
-    // Epic Games & Unreal Engine
     "epicgames.com",
     "unrealengine.com",
-
-    // Valve / Steam
+    "steamcontent.com",
     "steampowered.com",
     "steamcommunity.com",
-    "steamcontent.com",
     "steamstatic.com",
-
-    // Microsoft Gaming / Xbox / PlayFab
     "xboxlive.com",
     "playfabapi.com",
 ];
+
+/// Reason why an outbound TLS connection was passed through raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassThroughReason {
+    /// Built-in Encrypted DNS Resolver (always-on).
+    Doh,
+    /// Built-in Compatibility Mode (remote tools, game launchers).
+    Compat,
+    /// User-defined custom excluded domain.
+    Custom,
+    /// TLS ClientHello without SNI (direct-IP or proprietary handshake fallback).
+    NoSni,
+}
+
+/// Evaluates whether an outbound TLS connection should pass through raw without packet mutation.
+/// Centralized evaluation function used identically by the driver hot path and unit tests.
+#[inline]
+pub fn evaluate_pass_through(
+    sni: Option<&str>,
+    compat_mode: bool,
+    custom_excluded: &[String],
+) -> Option<PassThroughReason> {
+    let s = match sni {
+        Some(s) if !s.trim().is_empty() => s.trim().to_lowercase(),
+        _ => return Some(PassThroughReason::NoSni),
+    };
+
+    if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+        return Some(PassThroughReason::Doh);
+    }
+
+    if compat_mode && UNIFIED_COMPAT_DOMAINS.iter().any(|target| matches_host(&s, target)) {
+        return Some(PassThroughReason::Compat);
+    }
+
+    if custom_excluded.iter().any(|target| matches_host(&s, target)) {
+        return Some(PassThroughReason::Custom);
+    }
+
+    None
+}
 
 /// Checks whether a domain is a built-in encrypted DNS resolver (always pass-through).
 #[inline]
@@ -91,27 +152,28 @@ pub fn is_builtin_doh(domain: &str) -> bool {
     BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(domain, target))
 }
 
-/// Checks whether a domain belongs to the built-in game and anti-cheat pass-through list.
+/// Checks whether a domain belongs to the unified compatibility pass-through list.
+#[inline]
+pub fn is_builtin_compat(domain: &str) -> bool {
+    UNIFIED_COMPAT_DOMAINS.iter().any(|target| matches_host(domain, target))
+}
+
+/// Backwards-compatibility alias for v1.1.0 callers.
 #[inline]
 pub fn is_builtin_game(domain: &str) -> bool {
-    BUILTIN_GAME_DOMAINS.iter().any(|target| matches_host(domain, target))
+    is_builtin_compat(domain)
 }
 
-/// Checks whether a domain is in either DoH or Game built-in pass-through list.
+/// Backwards-compatibility alias for v1.1.0 callers.
 #[inline]
 pub fn is_builtin_bypass(domain: &str) -> bool {
-    is_builtin_doh(domain) || is_builtin_game(domain)
+    is_builtin_doh(domain) || is_builtin_compat(domain)
 }
 
-/// Evaluates whether an SNI connection should pass through raw without packet mutation.
-/// 1. Built-in DoH resolvers: ALWAYS pass-through raw (never fragmented).
-/// 2. Built-in Game & Anti-Cheat: pass-through if game_protection is active.
-/// 3. User-defined custom excluded domains: always pass-through.
+/// Backwards-compatibility helper for v1.1.0 callers.
 #[inline]
-pub fn should_pass_through(sni: &str, game_protection: bool, custom_excluded: &[String]) -> bool {
-    is_builtin_doh(sni)
-        || (game_protection && is_builtin_game(sni))
-        || custom_excluded.iter().any(|b| matches_host(sni, b))
+pub fn should_pass_through(sni: &str, compat_mode: bool, custom_excluded: &[String]) -> bool {
+    evaluate_pass_through(Some(sni), compat_mode, custom_excluded).is_some()
 }
 
 /// Transport Layer Resilience & Stabilization Profiles.
@@ -289,11 +351,11 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
 
     let is_hostlist = cfg.scope == Scope::HostList;
     let target_hosts: HashSet<String> = cfg
-        .hosts
+        .selected_hosts
         .iter()
         .map(|h| h.trim().to_lowercase())
         .collect();
-    let game_protection = cfg.game_protection_enabled;
+    let compat_mode = cfg.compatibility_mode_enabled;
     let custom_excluded: Vec<String> = cfg
         .custom_excluded_domains
         .iter()
@@ -444,33 +506,43 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     }
 
                     let info = tls::parse_client_hello(parsed.payload);
-                    let mut should_stabilize = !is_hostlist;
+                    let sni_opt = info.as_ref().and_then(|inf| inf.sni);
 
-                    if let Some(ref inf) = info {
-                        if let Some(sni) = inf.sni {
-                            let s = sni.to_lowercase();
-                            let is_bypassed = should_pass_through(&s, game_protection, &custom_excluded);
-
-                            if is_bypassed {
-                                should_stabilize = false;
-                                STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
-                                if game_protection && is_builtin_game(&s) {
-                                    STATS_GAME_PROTECTED.fetch_add(1, Ordering::Relaxed);
-                                }
-                            } else if is_hostlist {
-                                should_stabilize = target_hosts.iter().any(|target| {
-                                    matches_host(&s, target)
-                                });
+                    // Centralized Pass-Through Evaluation (DoH, Compatibility Mode, Custom, No-SNI Fallback):
+                    if let Some(reason) = evaluate_pass_through(sni_opt, compat_mode, &custom_excluded) {
+                        match reason {
+                            PassThroughReason::Doh => {
+                                STATS_DOH_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
                             }
-                        } else if is_hostlist {
-                            should_stabilize = false;
+                            PassThroughReason::Compat => {
+                                STATS_COMPAT_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
+                                STATS_GAME_PROTECTED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            PassThroughReason::Custom => {
+                                STATS_CUSTOM_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            PassThroughReason::NoSni => {
+                                STATS_NO_SNI_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                    } else if is_hostlist {
-                        should_stabilize = false;
+                        STATS_BYPASSED.fetch_add(1, Ordering::Relaxed);
+                        let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
+                        continue;
                     }
 
-                    if should_stabilize {
-                        STATS_STABILIZED.fetch_add(1, Ordering::Relaxed);
+                    // Scope::HostList check: if not in pass-through, only stabilize if target matches
+                    if is_hostlist {
+                        let is_target = sni_opt.map_or(false, |s| {
+                            let s_lower = s.to_lowercase();
+                            target_hosts.iter().any(|target| matches_host(&s_lower, target))
+                        });
+                        if !is_target {
+                            let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
+                            continue;
+                        }
+                    }
+
+                    STATS_STABILIZED.fetch_add(1, Ordering::Relaxed);
 
                         // Proven resilient TLS transport stabilization strategy:
                         // 3-way multi-split (TLS Record header + midpoint SNI split).
@@ -516,7 +588,6 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                         continue;
                     }
                 }
-            }
 
             // Normal pass-through for non-ClientHello or non-target hosts
             let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
@@ -613,53 +684,74 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_pass_through_comprehensive() {
+        let custom: Vec<String> = vec!["internal-company.net".to_string(), "my-custom-proxy.org".to_string()];
+
+        // F1 & F4 & F5: Remote tools and Game launchers with compat_mode = true
+        assert_eq!(evaluate_pass_through(Some("connect.ultraviewer.net"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("rdp.ultraviewer.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("server.uvnc.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("master.teamviewer.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("relay.anydesk.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("relay.rustdesk.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("kessel.parsec.app"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("relay.splashtop.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Compat));
+
+        // F2: Direct IP connections or ClientHellos without SNI
+        assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some(""), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(Some("   "), true, &custom), Some(PassThroughReason::NoSni));
+        assert_eq!(evaluate_pass_through(None, false, &custom), Some(PassThroughReason::NoSni));
+
+        // F6: DoH resolvers ALWAYS pass-through, even when compat_mode = false!
+        assert_eq!(evaluate_pass_through(Some("cloudflare-dns.com"), false, &custom), Some(PassThroughReason::Doh));
+        assert_eq!(evaluate_pass_through(Some("dns.google"), false, &custom), Some(PassThroughReason::Doh));
+        assert_eq!(evaluate_pass_through(Some("dns.quad9.net"), false, &custom), Some(PassThroughReason::Doh));
+        assert_eq!(evaluate_pass_through(Some("dns.adguard-dns.com"), false, &custom), Some(PassThroughReason::Doh));
+
+        // F3: When compat_mode = false, game/remote domains are NOT passed through!
+        assert_eq!(evaluate_pass_through(Some("connect.ultraviewer.net"), false, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), false, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), false, &custom), None);
+
+        // Custom excluded domains pass through regardless of compat_mode
+        assert_eq!(evaluate_pass_through(Some("internal-company.net"), false, &custom), Some(PassThroughReason::Custom));
+        assert_eq!(evaluate_pass_through(Some("sub.internal-company.net"), false, &custom), Some(PassThroughReason::Custom));
+
+        // F7: Standard websites that should be stabilized (None = not passed through)
+        assert_eq!(evaluate_pass_through(Some("google.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("facebook.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("discord.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("youtube.com"), true, &custom), None);
+    }
+
+    #[test]
     fn test_is_builtin_bypass_domains() {
-        // DoH resolvers: MUST match is_builtin_doh and is_builtin_bypass, but NOT is_builtin_game
+        // DoH resolvers: MUST match is_builtin_doh and is_builtin_bypass, but NOT is_builtin_compat
         assert!(is_builtin_doh("cloudflare-dns.com"));
         assert!(is_builtin_doh("dns.google"));
         assert!(is_builtin_doh("dns.adguard-dns.com"));
-        assert!(!is_builtin_game("cloudflare-dns.com"));
+        assert!(!is_builtin_compat("cloudflare-dns.com"));
         assert!(is_builtin_bypass("cloudflare-dns.com"));
 
-        // Game ecosystems & sensitive WAF endpoints: MUST match is_builtin_game and is_builtin_bypass, but NOT is_builtin_doh
-        assert!(is_builtin_game("public-ubiservices.ubi.com"));
-        assert!(is_builtin_game("connect.ubisoft.com"));
-        assert!(is_builtin_game("uplaypc-s-ubisoft.cdn.ubi.com"));
-        assert!(is_builtin_game("auth.riotgames.com"));
-        assert!(is_builtin_game("client.battle.net"));
-        assert!(is_builtin_game("origin.com"));
-        assert!(is_builtin_game("epicgames.com"));
-        assert!(is_builtin_game("steamcontent.com"));
-        assert!(is_builtin_game("playfabapi.com"));
-        assert!(!is_builtin_doh("public-ubiservices.ubi.com"));
-        assert!(is_builtin_bypass("public-ubiservices.ubi.com"));
+        // Compat ecosystems & sensitive WAF endpoints: MUST match is_builtin_compat and is_builtin_bypass, but NOT is_builtin_doh
+        assert!(is_builtin_compat("public-ubiservices.ubi.com"));
+        assert!(is_builtin_compat("connect.ubisoft.com"));
+        assert!(is_builtin_compat("connect.ultraviewer.net"));
+        assert!(is_builtin_compat("master.teamviewer.com"));
+        assert!(is_builtin_compat("relay.anydesk.com"));
+        assert!(is_builtin_compat("relay.rustdesk.com"));
+        assert!(!is_builtin_doh("connect.ultraviewer.net"));
+        assert!(is_builtin_bypass("connect.ultraviewer.net"));
 
         // Target domains that should be stabilized (MUST NOT match either)
         assert!(!is_builtin_bypass("discord.com"));
         assert!(!is_builtin_bypass("google.com"));
         assert!(!is_builtin_bypass("youtube.com"));
         assert!(!is_builtin_bypass("notubi.com"));
-    }
-
-    #[test]
-    fn test_doh_always_bypassed_even_if_game_protection_disabled() {
-        let game_protection = false;
-        let custom_excluded: Vec<String> = vec!["mygame.com".to_string()];
-
-        // DoH MUST remain bypassed even with game_protection = false!
-        assert!(should_pass_through("cloudflare-dns.com", game_protection, &custom_excluded));
-        assert!(should_pass_through("dns.google", game_protection, &custom_excluded));
-
-        // Game domains MUST NOT be bypassed when game_protection = false
-        assert!(!should_pass_through("public-ubiservices.ubi.com", game_protection, &custom_excluded));
-        assert!(!should_pass_through("auth.riotgames.com", game_protection, &custom_excluded));
-
-        // Custom excluded domain MUST still be bypassed
-        assert!(should_pass_through("mygame.com", game_protection, &custom_excluded));
-        assert!(should_pass_through("sub.mygame.com", game_protection, &custom_excluded));
-
-        // When game_protection = true, game domains MUST be bypassed
-        assert!(should_pass_through("public-ubiservices.ubi.com", true, &custom_excluded));
-        assert!(should_pass_through("auth.riotgames.com", true, &custom_excluded));
     }
 }
