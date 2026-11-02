@@ -1,4 +1,4 @@
-//! On Windows targets, embeds the application icon, an admin manifest and version info
+//! On Windows targets, embeds the application icon, an asInvoker manifest and version info
 //! into `levi.exe`. `embed-resource` picks the resource compiler for the toolchain:
 //! `windres` for `*-gnu`, `rc.exe`/`llvm-rc` for `*-msvc`.
 
@@ -16,6 +16,7 @@ fn main() {
     // Version info follows the workspace version in Cargo.toml.
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     let version_commas = format!("{},0", version.replace('.', ","));
+    let version_4part = format!("{},0", version.replace('.', ",")).replace(',', ".");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={icon}");
@@ -28,7 +29,7 @@ fn main() {
 "<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">"
 "<trustInfo xmlns=""urn:schemas-microsoft-com:asm.v3"">"
 "<security><requestedPrivileges>"
-"<requestedExecutionLevel level=""requireAdministrator"" uiAccess=""false""/>"
+"<requestedExecutionLevel level=""asInvoker"" uiAccess=""false""/>"
 "</requestedPrivileges></security></trustInfo>"
 "<compatibility xmlns=""urn:schemas-microsoft-com:compatibility.v1"">"
 "<application>"
@@ -51,8 +52,8 @@ BLOCK "000004b0"
 VALUE "FileDescription", "Levi - High-Performance Native Transport Resilience Engine\0"
 VALUE "ProductName", "Yeager\0"
 VALUE "OriginalFilename", "levi.exe\0"
-VALUE "ProductVersion", "{version}\0"
-VALUE "FileVersion", "{version}\0"
+VALUE "ProductVersion", "{version_4part}\0"
+VALUE "FileVersion", "{version_4part}\0"
 VALUE "CompanyName", "Cino\0"
 VALUE "LegalCopyright", "Copyright (c) 2026 Cino. Licensed under MIT.\0"
 }}
