@@ -322,7 +322,7 @@ Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator 
 
 ### Kết quả quét bản phát hành
 
-Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa hash SHA-256, link phân tích và số vendor tại thời điểm quét. Số liệu bind theo asset đã ký của release, không dùng bản local.
+Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa hash SHA-256, link phân tích và số vendor tại thời điểm quét cho các file thực thi (`.exe`). Bản portable `.zip` chứa file `yeager.exe` đã ký giống hệt và được kiểm chứng toàn vẹn qua `SHA256SUMS.txt`. Số liệu bind theo asset đã ký của release, không dùng bản local.
 
 ### Vì sao có cảnh báo giả
 

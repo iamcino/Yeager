@@ -42,9 +42,11 @@ if ($thumbprint -ne $pinned) {
     throw "Signed by thumbprint $thumbprint, but expected pinned thumbprint $pinned"
 }
 
-# In local/testing environments without root trust, UnknownError / NotTrusted is expected for self-signed
-if ($sig.Status -notin @('Valid', 'UnknownError', 'NotTrusted')) {
-    throw "Unexpected signature status on '${Path}': $($sig.Status) $($sig.StatusMessage)"
+# Self-signed certificates without root trust store installation return NotTrusted.
+# Commercial certificates return Valid. Any other status (NotSigned, HashMismatch, UnknownError, etc.) must fail.
+$allowedStatus = @('Valid', 'NotTrusted')
+if ($sig.Status -notin $allowedStatus) {
+    throw "Unexpected signature status on '${Path}': $($sig.Status) ($($sig.StatusMessage))"
 }
 if (-not $sig.TimeStamperCertificate) {
     throw "$Path is signed but has NO timestamp authority attached!"

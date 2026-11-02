@@ -323,7 +323,7 @@ Yeager runs at the system level (Administrator privileges + the WinDivert networ
 
 ### Release scan results
 
-Each GitHub release attaches `virustotal-v<version>.json` with the SHA-256, analysis link and vendor counts at scan time. Figures bind to the release's signed assets, never local builds.
+Each GitHub release attaches `virustotal-v<version>.json` with the SHA-256, analysis link and vendor counts at scan time for executable binaries (`.exe`). The portable `.zip` contains the identical signed `yeager.exe` and is verified against `SHA256SUMS.txt`. Figures bind to the release's signed assets, never local builds.
 
 ### Why the false positive
 

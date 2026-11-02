@@ -9,7 +9,7 @@
   #define AppVersion "1.1.2"
 #endif
 #ifndef NumericVersion
-  #define NumericVersion "1.1.2.0"
+  #define NumericVersion "0.0.0.0"
 #endif
 #define AppPublisher "Cino"
 #define AppURL "https://github.com/iamcino/Yeager"
