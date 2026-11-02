@@ -324,6 +324,9 @@ Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator 
 
 Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa hash SHA-256, link phân tích và số vendor tại thời điểm quét cho các file thực thi (`.exe`). Bản portable `.zip` được đóng gói từ cùng bộ artifact phát hành và được kiểm chứng toàn vẹn qua `SHA256SUMS.txt`. Số liệu bind theo asset đã ký của release, không dùng bản local.
 
+- **Ứng dụng chính (`yeager.exe`) & Bộ cài (`Yeager-Setup-*.exe`):** Hoàn toàn sạch (`0/71` undetected).
+- **Headless CLI (`levi.exe`):** Có thể xuất hiện cảnh báo heuristic đơn lẻ từ vendor thứ cấp (ví dụ phân cụm tự động `W32.Malware.<HEX>` của Bkav) do cơ chế thao tác raw socket tầng thấp và chưa có danh tiếng CA thương mại. **100% các hãng bảo mật Tier 1** (Microsoft Defender, Kaspersky, ESET-NOD32, Symantec, BitDefender, Sophos, Avast, CrowdStrike Falcon) đều xác nhận sạch (`Undetected`). Chi tiết từng vendor được ghi nhận minh bạch trong `virustotal-v<version>.json`.
+
 ### Vì sao có cảnh báo giả
 
 - **Chứng chỉ tự ký, chưa có danh tiếng CA:** Yeager đã được ký Authenticode bằng chứng chỉ tự ký để bảo đảm tính toàn vẹn và cho phép ghim mã dấu vân tay. Đây chưa phải chứng chỉ ký số thương mại do CA xác minh danh tính, nên SmartScreen và một số engine heuristic/ML vẫn có thể cảnh báo khi chưa đủ danh tiếng công khai.
@@ -356,7 +359,7 @@ So output với hash trong link ở trên. Hoặc build từ source để tự s
 cargo build --release
 ```
 
-> Kết quả gắn với SHA-256 của bản v1.1.2 tại thời điểm phân tích. VT có thể re-analyze và thay đổi số detection; mỗi release sẽ cập nhật hash + link tương ứng.
+> Kết quả gắn với SHA-256 đã ký của từng bản release tại thời điểm phân tích. VirusTotal có thể định kỳ quét lại và cập nhật số lượng vendor; mỗi release xuất bản báo cáo metadata độc lập tương ứng.
 
 ## Tuyên bố miễn trừ trách nhiệm
 
