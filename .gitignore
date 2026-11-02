@@ -23,6 +23,8 @@ tools/local-*
 
 
 # Local internal documentation & private agent handoffs (local only)
+GEMINI.md
+AGENTS.md
 note_for_agent.md
 docs/cross-platform-architecture.md
 
