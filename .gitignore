@@ -26,3 +26,5 @@ tools/local-*
 note_for_agent.md
 docs/cross-platform-architecture.md
 
+docs/specs/
+docs/internal/
