@@ -30,31 +30,46 @@ if ($ExpectedThumbprint -and $ExpectedThumbprint.ToUpperInvariant() -ne $pinned)
 }
 
 $sig = Get-AuthenticodeSignature -FilePath $Path
+
+function Show-Diagnostic {
+    $signerThumb = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '<none>' }
+    $tsaSubject = if ($sig.TimeStamperCertificate) { $sig.TimeStamperCertificate.Subject } else { '<none>' }
+    Write-Host "Authenticode Verification Diagnostic:" -ForegroundColor Red
+    Write-Host "  File       : $Path" -ForegroundColor Red
+    Write-Host "  Status     : $($sig.Status)" -ForegroundColor Red
+    Write-Host "  Message    : $($sig.StatusMessage)" -ForegroundColor Red
+    Write-Host "  Thumbprint : $signerThumb" -ForegroundColor Red
+    Write-Host "  Timestamp  : $tsaSubject" -ForegroundColor Red
+}
+
 if ($sig.Status -in @('NotSigned', 'HashMismatch', 'NotSupportedFileFormat', 'Incompatible')) {
+    Show-Diagnostic
     throw "Invalid signature on '${Path}': $($sig.Status) $($sig.StatusMessage)"
 }
 if (-not $sig.SignerCertificate) {
+    Show-Diagnostic
     throw "No signer certificate found on $Path"
 }
 
 $thumbprint = $sig.SignerCertificate.Thumbprint.ToUpperInvariant()
 if ($thumbprint -ne $pinned) {
+    Show-Diagnostic
     throw "Signed by thumbprint $thumbprint, but expected pinned thumbprint $pinned"
 }
 
-# Self-signed certificates without root trust store installation return NotTrusted.
-# Commercial certificates return Valid. Any other status (NotSigned, HashMismatch, UnknownError, etc.) must fail.
-$allowedStatus = @('Valid', 'NotTrusted')
-if ($sig.Status -notin $allowedStatus) {
-    Write-Host "Authenticode Verification Diagnostic Failure:" -ForegroundColor Red
-    Write-Host "  File       : $Path" -ForegroundColor Red
-    Write-Host "  Status     : $($sig.Status)" -ForegroundColor Red
-    Write-Host "  Message    : $($sig.StatusMessage)" -ForegroundColor Red
-    Write-Host "  Thumbprint : $($sig.SignerCertificate.Thumbprint)" -ForegroundColor Red
-    Write-Host "  Timestamp  : $($sig.TimeStamperCertificate.Subject)" -ForegroundColor Red
+# Authenticode verification policy:
+# 1. Commercial CA certificates return Valid.
+# 2. Self-signed certificates return UnknownError (WinVerifyTrust CERT_E_UNTRUSTEDROOT) or NotTrusted.
+# Narrow exception: UnknownError is ONLY allowed if StatusMessage confirms an untrusted root certificate chain,
+# and thumbprint strictly matches pinned cert and timestamp is verified. Any hash mismatch or unknown failure fails hard.
+$isUntrustedRootChain = ($sig.Status -eq 'UnknownError' -and $sig.StatusMessage -like '*root certificate which is not trusted*')
+
+if ($sig.Status -ne 'Valid' -and $sig.Status -ne 'NotTrusted' -and -not $isUntrustedRootChain) {
+    Show-Diagnostic
     throw "Unexpected signature status on '${Path}': $($sig.Status) ($($sig.StatusMessage))"
 }
 if (-not $sig.TimeStamperCertificate) {
+    Show-Diagnostic
     throw "$Path is signed but has NO timestamp authority attached!"
 }
 

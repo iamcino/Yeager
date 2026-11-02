@@ -238,6 +238,7 @@ jobs:
             dist/Yeager-Setup-*.exe
             dist/Yeager-*-portable-x64.zip
             dist/yeager.exe
+            dist/levi.exe
             dist/SHA256SUMS.txt
             dist/RELEASE_NOTES.md
 
@@ -249,10 +250,13 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Yeager ${{ steps.version.outputs.version }}
           body_path: dist/RELEASE_NOTES.md
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          make_latest: ${{ !contains(steps.version.outputs.version, '-') }}
           files: |
             dist/Yeager-Setup-${{ steps.version.outputs.version }}.exe
             dist/Yeager-${{ steps.version.outputs.version }}-portable-x64.zip
             dist/yeager.exe
+            dist/levi.exe
             dist/SHA256SUMS.txt
             docs/signing/Yeager-codesign.cer
             dist/*-signature.json
