@@ -41,7 +41,17 @@ jobs:
             }
             $relVersion = $tagVersion
           }
-          $numericVersion = ($relVersion -replace '-.*$', '')
+          # Extract clean numeric version for Inno Setup (e.g. 1.1.3-rc1 -> 1.1.3 -> 1.1.3.0)
+          $baseNumeric = ($relVersion -replace '-.*$', '')
+          if ($baseNumeric -match '^\d+\.\d+\.\d+$') {
+            $numericVersion = "$baseNumeric.0"
+          } elseif ($baseNumeric -match '^\d+\.\d+$') {
+            $numericVersion = "$baseNumeric.0.0"
+          } elseif ($baseNumeric -match '^\d+\.\d+\.\d+\.\d+$') {
+            $numericVersion = $baseNumeric
+          } else {
+            $numericVersion = "0.0.0.0"
+          }
           "version=$relVersion" >> $env:GITHUB_OUTPUT
           "numeric_version=$numericVersion" >> $env:GITHUB_OUTPUT
 
@@ -59,7 +69,7 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
-          $isOfficial = $env:GITHUB_REPOSITORY -eq 'iamcino/Yeager'
+          $isOfficial = ($env:GITHUB_REPOSITORY -and $env:GITHUB_REPOSITORY.Trim().ToLowerInvariant() -eq 'iamcino/yeager')
           if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
             if ($isOfficial) {
               throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"
@@ -108,7 +118,10 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          iscc /DAppVersion=${{ steps.version.outputs.version }} /DNumericVersion=${{ steps.version.outputs.numeric_version }} installer\setup.iss
+          $appVer = '${{ steps.version.outputs.version }}'
+          $numVer = '${{ steps.version.outputs.numeric_version }}'
+          Write-Host "Compiling Inno Setup: AppVersion=$appVer, NumericVersion=$numVer"
+          iscc installer\setup.iss "/DAppVersion=$appVer" "/DNumericVersion=$numVer"
 
       - name: Sign installer with Authenticode
         shell: pwsh
@@ -117,7 +130,7 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
-          $isOfficial = $env:GITHUB_REPOSITORY -eq 'iamcino/Yeager'
+          $isOfficial = ($env:GITHUB_REPOSITORY -and $env:GITHUB_REPOSITORY.Trim().ToLowerInvariant() -eq 'iamcino/yeager')
           if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
             if ($isOfficial) {
               throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"

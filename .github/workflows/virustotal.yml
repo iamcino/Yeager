@@ -45,6 +45,8 @@ jobs:
 
           KEY = os.environ["VT_API_KEY"]
           TAG = os.environ["RELEASE_TAG"]
+          DEADLINE_SECONDS = 1200.0  # 20 minutes total job deadline
+          start_time = time.time()
           _last = 0.0
 
           def throttle():
@@ -75,12 +77,31 @@ jobs:
               return json.load(urllib.request.urlopen(r))
 
           OUT = {}
+          pending_analyses = []
+
+          # Scope: binary executables (.exe)
           for f in sorted(glob.glob("dl/*.exe")):
               sha = subprocess.check_output(["sha256sum", f]).split()[0].decode()
               link = f"https://www.virustotal.com/gui/file/{sha}"
               fname = os.path.basename(f)
+
+              if time.time() - start_time >= DEADLINE_SECONDS:
+                  OUT[fname] = {
+                      "sha256": sha,
+                      "link": link,
+                      "status": "pending",
+                      "note": "Deadline exceeded before file submission"
+                  }
+                  continue
+
               try:
                   aid = api("POST", "/files", raw=open(f, "rb").read())["data"]["id"]
+                  OUT[fname] = {
+                      "sha256": sha,
+                      "link": link,
+                      "status": "pending"
+                  }
+                  pending_analyses.append((fname, sha, aid))
               except Exception as e:
                   OUT[fname] = {
                       "sha256": sha,
@@ -88,37 +109,50 @@ jobs:
                       "status": "submit_failed",
                       "error": str(e)
                   }
-                  continue
 
-              status = "pending"
-              stats = None
-              last_analysis_date = None
-              for _ in range(20):  # cap ~15 phut
+          # Polling loop bounded strictly by overall 20-minute job deadline
+          while pending_analyses and (time.time() - start_time < DEADLINE_SECONDS):
+              still_pending = []
+              for fname, sha, aid in pending_analyses:
+                  if time.time() - start_time >= DEADLINE_SECONDS:
+                      still_pending.append((fname, sha, aid))
+                      continue
+
                   try:
                       d = api("GET", f"/analyses/{aid}")["data"]["attributes"]
+                      status = d.get("status")
                   except Exception:
+                      still_pending.append((fname, sha, aid))
                       continue
-                  if d.get("status") == "completed":
+
+                  if status == "completed":
+                      stats = None
+                      last_analysis_date = None
                       try:
                           finfo = api("GET", f"/files/{sha}")["data"]["attributes"]
                           stats = finfo.get("last_analysis_stats")
                           epoch = finfo.get("last_analysis_date")
                           if epoch:
                               last_analysis_date = iso_utc(epoch)
-                          status = "completed"
                       except Exception:
                           pass
-                      break
 
-              item = {"sha256": sha, "link": link, "status": status}
-              if last_analysis_date:
-                  item["last_analysis_date"] = last_analysis_date
-              if stats:
-                  item["stats"] = stats
-              OUT[fname] = item
+                      OUT[fname]["status"] = "completed"
+                      if last_analysis_date:
+                          OUT[fname]["last_analysis_date"] = last_analysis_date
+                      if stats:
+                          OUT[fname]["stats"] = stats
+                  else:
+                      still_pending.append((fname, sha, aid))
+
+              if len(still_pending) == len(pending_analyses):
+                  time.sleep(5)
+              pending_analyses = still_pending
 
           payload = {
               "version": TAG,
+              "scope": "executable_binaries",
+              "scope_note": "Only executable binaries (.exe) are submitted for VirusTotal analysis; portable .zip contains identical bit-for-bit yeager.exe and is verified via SHA256SUMS.txt.",
               "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
               "results": OUT
           }
