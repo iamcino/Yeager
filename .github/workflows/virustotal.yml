@@ -1,22 +1,49 @@
 name: VirusTotal reference
 
 on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to scan
+        required: false
 
 permissions:
   contents: write
 
 jobs:
   scan:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
       VT_API_KEY: ${{ secrets.VT_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --json tagName --jq .tagName)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
       - name: Download signed assets + checksums
+        if: steps.rel.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -24,6 +51,7 @@ jobs:
 
       - name: Verify integrity then scan
         id: scan
+        if: steps.rel.outputs.tag != ''
         run: |
           set +e
           if [ -z "$VT_API_KEY" ]; then
