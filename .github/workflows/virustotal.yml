@@ -35,54 +35,133 @@ jobs:
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Download signed assets + checksums
         if: steps.rel.outputs.tag != ''
         run: |
-          gh release download "${{ steps.rel.outputs.tag }}" -p '*.exe' -p 'SHA256SUMS.txt' -D dl
+          gh release download "${{ steps.rel.outputs.tag }}" -D dl
         env: { GH_TOKEN: ${{ github.token }} }
+
       - name: Verify integrity then scan
+        id: scan
         if: steps.rel.outputs.tag != ''
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+          RELEASE_TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set +e
-          [ -z "$VT_API_KEY" ] && { echo '{"status":"skipped","reason":"no VT_API_KEY"}' > vt.json; exit 0; }
-          # cross-check hash trước khi tin bất kỳ con số nào
-          ( cd dl && sha256sum -c SHA256SUMS.txt ) || { echo '{"status":"integrity_mismatch"}' > vt.json; exit 0; }
-          python3 - <<'PY'
-          import json,os,time,urllib.request,subprocess,glob
-          KEY=os.environ["VT_API_KEY"]; OUT={}
-          def api(m,u,data=None,raw=None):
-              r=urllib.request.Request(f"https://www.virustotal.com/api/v3{u}",method=m,
-                  headers={"x-apikey":KEY},data=data if raw is None else raw)
-              if raw: r.add_header("Content-Type","application/octet-stream")
-              return json.load(urllib.request.urlopen(r))
-          for f in sorted(glob.glob("dl/*.exe")):
-              sha=subprocess.check_output(["sha256sum",f]).split()[0].decode()
-              link=f"https://www.virustotal.com/gui/file/{sha}"
-              try:
-                  aid=api("POST","/files",raw=open(f,"rb").read())["data"]["id"]
-              except Exception as e:
-                  OUT[os.path.basename(f)]={"sha256":sha,"link":link,"status":"submit_failed","error":str(e)}; continue
-              status="pending"; stats=None
-              for _ in range(20):                      # cap ~15 phút, sleep 45s -> ~1.3 req/phút
-                  time.sleep(45)
-                  try: d=api("GET",f"/analyses/{aid}")["data"]["attributes"]
-                  except Exception: continue
-                  if d.get("status")=="completed":
-                      try: stats=api("GET",f"/files/{sha}")["data"]["last_analysis_stats"]; status="completed"
-                      except Exception: pass
-                      break
-              OUT[os.path.basename(f)]={"sha256":sha,"link":link,"status":status,"stats":stats}
-          json.dump({"version":"${{ steps.rel.outputs.tag }}","results":OUT},open("vt.json","w"),indent=2)
-          PY
-          cat vt.json >> "$GITHUB_STEP_SUMMARY"
-      - name: Attach reference asset to release
-        if: steps.rel.outputs.tag != ''
-        run: |
-          STATUS=$(jq -r '.status // empty' vt.json 2>/dev/null || true)
-          if [ "$STATUS" = "skipped" ] || [ "$STATUS" = "integrity_mismatch" ]; then
-            echo "Skip uploading asset due to status: $STATUS"
+          if [ -z "$VT_API_KEY" ]; then
+            echo '{"status":"skipped","reason":"no VT_API_KEY"}' > vt.json
+            echo "should_upload=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Cross-check toàn bộ hash trước khi gửi bất kỳ file nào lên VT
+          ( cd dl && sha256sum -c SHA256SUMS.txt )
+          if [ $? -ne 0 ]; then
+            echo '{"status":"integrity_mismatch"}' > vt.json
+            echo "should_upload=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import os, glob, json, time, datetime, subprocess, urllib.request
+
+          KEY = os.environ["VT_API_KEY"]
+          TAG = os.environ["RELEASE_TAG"]
+          _last = 0.0
+
+          def throttle():
+              global _last
+              wait = 45.0 - (time.time() - _last)
+              if wait > 0:
+                  time.sleep(wait)
+              _last = time.time()
+
+          def api(m, u, data=None, raw=None):
+              throttle()
+              r = urllib.request.Request(
+                  f"https://www.virustotal.com/api/v3{u}",
+                  method=m,
+                  headers={"x-apikey": KEY},
+                  data=data if raw is None else raw
+              )
+              if raw:
+                  r.add_header("Content-Type", "application/octet-stream")
+              return json.load(urllib.request.urlopen(r))
+
+          OUT = {}
+          for f in sorted(glob.glob("dl/*.exe")):
+              sha = subprocess.check_output(["sha256sum", f]).split()[0].decode()
+              link = f"https://www.virustotal.com/gui/file/{sha}"
+              fname = os.path.basename(f)
+              try:
+                  aid = api("POST", "/files", raw=open(f, "rb").read())["data"]["id"]
+              except Exception as e:
+                  OUT[fname] = {
+                      "sha256": sha,
+                      "link": link,
+                      "status": "submit_failed",
+                      "error": str(e)
+                  }
+                  continue
+
+              status = "pending"
+              stats = None
+              last_analysis_date = None
+              for _ in range(20):  # cap ~15 phút
+                  try:
+                      d = api("GET", f"/analyses/{aid}")["data"]["attributes"]
+                  except Exception:
+                      continue
+                  if d.get("status") == "completed":
+                      try:
+                          finfo = api("GET", f"/files/{sha}")["data"]["attributes"]
+                          stats = finfo.get("last_analysis_stats")
+                          epoch = finfo.get("last_analysis_date")
+                          if epoch:
+                              last_analysis_date = datetime.datetime.fromtimestamp(
+                                  epoch, datetime.timezone.utc
+                              ).isoformat()
+                          status = "completed"
+                      except Exception:
+                          pass
+                      break
+
+              item = {"sha256": sha, "link": link, "status": status}
+              if last_analysis_date:
+                  item["last_analysis_date"] = last_analysis_date
+              if stats:
+                  item["stats"] = stats
+              OUT[fname] = item
+
+          payload = {
+              "version": TAG,
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "results": OUT
+          }
+          with open("vt.json", "w", encoding="utf-8") as fp:
+              json.dump(payload, fp, indent=2)
+          PY
+
+          cat vt.json >> "$GITHUB_STEP_SUMMARY"
+
+          # Quyết định upload: chỉ upload khi có ít nhất 1 file completed hoặc pending
+          SHOULD_UPLOAD=$(python3 -c '
+          import json
+          try:
+              data = json.load(open("vt.json"))
+              results = data.get("results", {})
+              valid = any(v.get("status") in ("completed", "pending") for v in results.values())
+              print("true" if valid else "false")
+          except Exception:
+              print("false")
+          ')
+          echo "should_upload=$SHOULD_UPLOAD" >> "$GITHUB_OUTPUT"
+
+      - name: Attach reference asset to release
+        if: steps.scan.outputs.should_upload == 'true'
+        run: |
           cp vt.json "virustotal-${{ steps.rel.outputs.tag }}.json"
           gh release upload "${{ steps.rel.outputs.tag }}" \
             "virustotal-${{ steps.rel.outputs.tag }}.json" --clobber
