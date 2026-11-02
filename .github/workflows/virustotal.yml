@@ -5,12 +5,11 @@ on:
 permissions:
   contents: write                   # upload asset lên release
 concurrency:
-  group: vt-${{ github.event.release.tag_name }}
+  group: vt-${{ github.event.release.tag_name || github.ref }}
   cancel-in-progress: false
 jobs:
   scan:
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name }}
       VT_API_KEY: ${{ secrets.VT_API_KEY }}
