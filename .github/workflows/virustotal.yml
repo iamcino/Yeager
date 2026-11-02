@@ -89,8 +89,8 @@ jobs:
                   OUT[fname] = {
                       "sha256": sha,
                       "link": link,
-                      "status": "pending",
-                      "note": "Deadline exceeded before file submission"
+                      "status": "not_submitted",
+                      "reason": "deadline_exceeded"
                   }
                   continue
 
@@ -152,7 +152,7 @@ jobs:
           payload = {
               "version": TAG,
               "scope": "executable_binaries",
-              "scope_note": "Only executable binaries (.exe) are submitted for VirusTotal analysis; portable .zip contains identical bit-for-bit yeager.exe and is verified via SHA256SUMS.txt.",
+              "scope_note": "Only executable binaries (.exe) are submitted for VirusTotal analysis; portable .zip is packaged from the release artifacts and integrity-verified via SHA256SUMS.txt.",
               "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
               "results": OUT
           }

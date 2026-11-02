@@ -46,6 +46,12 @@ if ($thumbprint -ne $pinned) {
 # Commercial certificates return Valid. Any other status (NotSigned, HashMismatch, UnknownError, etc.) must fail.
 $allowedStatus = @('Valid', 'NotTrusted')
 if ($sig.Status -notin $allowedStatus) {
+    Write-Host "Authenticode Verification Diagnostic Failure:" -ForegroundColor Red
+    Write-Host "  File       : $Path" -ForegroundColor Red
+    Write-Host "  Status     : $($sig.Status)" -ForegroundColor Red
+    Write-Host "  Message    : $($sig.StatusMessage)" -ForegroundColor Red
+    Write-Host "  Thumbprint : $($sig.SignerCertificate.Thumbprint)" -ForegroundColor Red
+    Write-Host "  Timestamp  : $($sig.TimeStamperCertificate.Subject)" -ForegroundColor Red
     throw "Unexpected signature status on '${Path}': $($sig.Status) ($($sig.StatusMessage))"
 }
 if (-not $sig.TimeStamperCertificate) {
