@@ -29,6 +29,11 @@ docs/cross-platform-architecture.md
 docs/specs/
 docs/internal/
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
 # Code Signing Private Key Materials (NEVER COMMIT)
 .signing/
 *.pfx
