@@ -39,12 +39,12 @@ def iso_utc(ts):
         return None
 
 
-def extract_analysis_entry(sha, link, finfo):
+def extract_analysis_entry(sha, finfo):
     stats = finfo.get("last_analysis_stats") or {}
     epoch = finfo.get("last_analysis_date")
     entry = {
         "sha256": sha,
-        "link": link,
+        "link": f"https://www.virustotal.com/gui/file/{sha}",
         "status": "completed",
     }
     if epoch:
@@ -121,7 +121,7 @@ def main():
         # Fast path: Check if file is already analyzed on VirusTotal
         try:
             finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
-            out[fname] = extract_analysis_entry(sha, link, finfo)
+            out[fname] = extract_analysis_entry(sha, finfo)
             print(f"File {fname} already analyzed on VirusTotal: {out[fname].get('stats')}")
             continue
         except urllib.error.HTTPError as e:
@@ -182,7 +182,7 @@ def main():
             if status == "completed":
                 try:
                     finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
-                    out[fname] = extract_analysis_entry(sha, link, finfo)
+                    out[fname] = extract_analysis_entry(sha, finfo)
                 except Exception as e:
                     out[fname]["status"] = "completed"
                     out[fname]["error"] = str(e)
