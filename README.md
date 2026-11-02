@@ -321,13 +321,14 @@ Quitting the app also restores TCP and DNS settings.
 
 Yeager runs at the system level (Administrator privileges + the WinDivert network driver), so we publish binary inspection results instead of leaving users to guess.
 
-**VirusTotal report — v1.1.2** (analyzed 2026-11-01):
-[SHA-256 eef2d28…f0864a](https://www.virustotal.com/gui/file/eef2d283e4e7a4d702f67324021c5cc51ce9baa622ce9a789a01f15f36f0864a)
-— **1/70** detection, only `Trapmine` with `Malicious.moderate.ml.score` (a statistical ML score, not a known-signature verdict). **0/69 remaining vendors** reported malicious indicators.
+### Release scan results
+
+Each GitHub release attaches `virustotal-<version>.json` with the SHA-256, analysis link and vendor counts at scan time. Figures bind to the release's signed assets, never local builds.
 
 ### Why the false positive
 
-- **Unsigned binary:** no commercial code-signing certificate yet, so some ML/heuristic engines mark fresh binaries as unverified.
+- **Self-signed certificate, no CA-backed reputation:** Yeager releases are Authenticode-signed with a self-signed certificate for integrity verification and publisher pinning. This is not a commercial OV/EV code-signing certificate, so SmartScreen and some heuristic/ML engines may still flag the binary until public reputation is established.
+- **Signature verification:** Compare the signing certificate thumbprint (`0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`) with the public value pinned in `docs/signing/Yeager-codesign.cer`. You do not need to install the certificate to verify integrity.
 - **`obfuscated` tag:** from `.rsrc` entropy 7.92, normal for Rust embedding 9 multi-resolution PNG icons + a manifest. DetectItEasy reports no packer/protector; the source contains zero obfuscation or packing.
 - Mobile engines reporting `Unable to process file type` simply do not parse Windows x64 PE.
 
