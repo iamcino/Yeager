@@ -8,6 +8,17 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-03
+
+### Thêm
+- **Ký số Authenticode:** Toàn bộ các file thực thi phân phối (`yeager.exe`, `levi.exe`, và `Yeager-Setup-1.1.3.exe`) đã được ký số Authenticode với mã thumbprint cố định `0E9C6BBE35AC13E58F951C446F2B524FA7297DCA` kèm dấu thời gian RFC 3161 DigiCert.
+- **Cải tiến Levi CLI:** `levi.exe` được nhúng đầy đủ metadata PE Windows: thông tin phiên bản (`VERSIONINFO`), biểu tượng ứng dụng chính thức, và manifest quyền `asInvoker` giúp thực thi mượt mà trong cả console thông thường lẫn quyền Administrator.
+- **Báo cáo tham chiếu VirusTotal tự động:** Sidecar workflow độc lập tự động đối soát toàn vẹn SHA-256 sau phát hành và xuất bản tệp `virustotal-v1.1.3.json` minh bạch chi tiết từng vendor AV.
+- **Mã kiểm tra toàn vẹn SHA-256 chuẩn hóa:** Tệp `SHA256SUMS.txt` định dạng POSIX LF chuẩn GNU coreutils để người dùng dễ dàng kiểm tra tính toàn vẹn của gói cài đặt và tệp nén di động.
+
+### Thay đổi
+- Nâng cấp quy trình đóng gói installer với Inno Setup 7 và chuẩn hóa thông tin phiên bản nhị phân 4 phần (`1.1.3.0`).
+
 ## [1.1.2] - 2026-11-01
 
 ### Sửa lỗi

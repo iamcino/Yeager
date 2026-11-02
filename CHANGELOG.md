@@ -8,6 +8,17 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-03
+
+### Added
+- **Authenticode Code Signing:** All distributed executables (`yeager.exe`, `levi.exe`, and `Yeager-Setup-1.1.3.exe`) are now digitally signed with Authenticode signatures pinned to thumbprint `0E9C6BBE35AC13E58F951C446F2B524FA7297DCA` and RFC 3161 timestamps via DigiCert.
+- **Standalone Levi CLI Enhancements:** `levi.exe` now embeds complete Windows PE metadata: application version info (`VERSIONINFO`), official application icon, and `asInvoker` UAC manifest for seamless execution in standard and elevated consoles alike.
+- **VirusTotal Reference Sidecar:** Automated decoupled post-release verification scanning with structured JSON reporting (`virustotal-v1.1.3.json`) detailing engine verdicts and transparent analysis stats.
+- **POSIX LF Checksum Manifest:** Official release assets are strictly verifiable via standardized POSIX LF `SHA256SUMS.txt`.
+
+### Changed
+- Modernized installer packaging built with Inno Setup 7 and normalized numeric PE file versioning (`1.1.3.0`).
+
 ## [1.1.2] - 2026-11-01
 
 ### Fixed
