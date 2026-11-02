@@ -1,0 +1,89 @@
+name: VirusTotal reference
+on:
+  workflow_run:
+    workflows: ["Release"]          # khớp name: của release.yml
+    types: [completed]
+permissions:
+  contents: write                   # upload asset lên release
+concurrency:
+  group: vt-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+jobs:
+  scan:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release
+        id: rel
+        env: { GH_TOKEN: ${{ github.token }} }
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          if [ -z "$TAG" ]; then
+            # tag push -> head_branch null; resolve newest release by date
+            REL=$(gh api "repos/${{ github.repository }}/releases?per_page=100" \
+                  --jq 'sort_by(.created_at) | last')
+            TAG=$(printf '%s' "$REL" | jq -r .tag_name)
+            CREATED=$(printf '%s' "$REL" | jq -r .created_at)
+            # guard: release phải vừa publish (<=30p) để không quét nhầm bản thủ công/cũ
+            NOW=$(date -u +%s); THEN=$(date -u -d "$CREATED" +%s)
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ] || [ $((NOW-THEN)) -gt 1800 ]; then
+              echo "no recent release to scan"; exit 0
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Download signed assets + checksums
+        if: steps.rel.outputs.tag != ''
+        run: |
+          gh release download "${{ steps.rel.outputs.tag }}" -p '*.exe' -p 'SHA256SUMS.txt' -D dl
+        env: { GH_TOKEN: ${{ github.token }} }
+      - name: Verify integrity then scan
+        if: steps.rel.outputs.tag != ''
+        run: |
+          set +e
+          [ -z "$VT_API_KEY" ] && { echo '{"status":"skipped","reason":"no VT_API_KEY"}' > vt.json; exit 0; }
+          # cross-check hash trước khi tin bất kỳ con số nào
+          ( cd dl && sha256sum -c SHA256SUMS.txt ) || { echo '{"status":"integrity_mismatch"}' > vt.json; exit 0; }
+          python3 - <<'PY'
+          import json,os,time,urllib.request,subprocess,glob
+          KEY=os.environ["VT_API_KEY"]; OUT={}
+          def api(m,u,data=None,raw=None):
+              r=urllib.request.Request(f"https://www.virustotal.com/api/v3{u}",method=m,
+                  headers={"x-apikey":KEY},data=data if raw is None else raw)
+              if raw: r.add_header("Content-Type","application/octet-stream")
+              return json.load(urllib.request.urlopen(r))
+          for f in sorted(glob.glob("dl/*.exe")):
+              sha=subprocess.check_output(["sha256sum",f]).split()[0].decode()
+              link=f"https://www.virustotal.com/gui/file/{sha}"
+              try:
+                  aid=api("POST","/files",raw=open(f,"rb").read())["data"]["id"]
+              except Exception as e:
+                  OUT[os.path.basename(f)]={"sha256":sha,"link":link,"status":"submit_failed","error":str(e)}; continue
+              status="pending"; stats=None
+              for _ in range(20):                      # cap ~15 phút, sleep 45s -> ~1.3 req/phút
+                  time.sleep(45)
+                  try: d=api("GET",f"/analyses/{aid}")["data"]["attributes"]
+                  except Exception: continue
+                  if d.get("status")=="completed":
+                      try: stats=api("GET",f"/files/{sha}")["data"]["last_analysis_stats"]; status="completed"
+                      except Exception: pass
+                      break
+              OUT[os.path.basename(f)]={"sha256":sha,"link":link,"status":status,"stats":stats}
+          json.dump({"version":"${{ steps.rel.outputs.tag }}","results":OUT},open("vt.json","w"),indent=2)
+          PY
+          cat vt.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach reference asset to release
+        if: steps.rel.outputs.tag != ''
+        run: |
+          STATUS=$(jq -r '.status // empty' vt.json 2>/dev/null || true)
+          if [ "$STATUS" = "skipped" ] || [ "$STATUS" = "integrity_mismatch" ]; then
+            echo "Skip uploading asset due to status: $STATUS"
+            exit 0
+          fi
+          cp vt.json "virustotal-${{ steps.rel.outputs.tag }}.json"
+          gh release upload "${{ steps.rel.outputs.tag }}" \
+            "virustotal-${{ steps.rel.outputs.tag }}.json" --clobber
+        env: { GH_TOKEN: ${{ github.token }} }

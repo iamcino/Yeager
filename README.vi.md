@@ -320,13 +320,14 @@ cũng trả lại thiết lập TCP và DNS.
 
 Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator và nạp driver mạng WinDivert), nên chúng tôi công khai kết quả phân tích nhị phân thay vì để người dùng tự suy đoán.
 
-**Báo cáo VirusTotal — v1.1.2** (phân tích 2026-11-01):
-[SHA-256 eef2d28…f0864a](https://www.virustotal.com/gui/file/eef2d283e4e7a4d702f67324021c5cc51ce9baa622ce9a789a01f15f36f0864a)
-— **1/70** hãng ghi nhận, duy nhất `Trapmine` với nhãn `Malicious.moderate.ml.score` (điểm thống kê từ mô hình học máy, không phải nhận diện theo chữ ký độc hại). **0/69** — không vendor nào trong 69 vendor còn lại ghi nhận dấu hiệu độc hại.
+### Kết quả quét bản phát hành
+
+Mỗi GitHub release đính kèm `virustotal-<version>.json` chứa hash SHA-256, link phân tích và số vendor tại thời điểm quét. Số liệu bind theo asset đã ký của release, không dùng bản local.
 
 ### Vì sao có cảnh báo giả
 
-- **Chưa ký số thương mại:** binary chưa gắn Code Signing Certificate, nên một số engine heuristic/ML xếp vào nhóm "chưa xác thực".
+- **Chứng chỉ tự ký, chưa có danh tiếng CA:** Yeager đã được ký Authenticode bằng chứng chỉ tự ký để bảo đảm tính toàn vẹn và cho phép ghim mã dấu vân tay. Đây chưa phải chứng chỉ ký số thương mại do CA xác minh danh tính, nên SmartScreen và một số engine heuristic/ML vẫn có thể cảnh báo khi chưa đủ danh tiếng công khai.
+- **Tự kiểm chứng chữ ký:** So sánh dấu vân tay chứng chỉ ký (`0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`) với giá trị công khai trong `docs/signing/Yeager-codesign.cer`. Không cần cài chứng chỉ vào máy nếu bạn chỉ muốn xác minh tính toàn vẹn.
 - **Nhãn `obfuscated`:** do entropy section `.rsrc` = 7.92, hệ quả chuẩn của Rust khi nhúng 9 icon PNG đa phân giải + manifest. DetectItEasy không phát hiện packer/protector nào; mã nguồn không chứa bước làm rối hay đóng gói.
 - Vài engine di động báo `Unable to process file type` vì chúng không phân tích PE x64.
 

@@ -28,3 +28,10 @@ docs/cross-platform-architecture.md
 
 docs/specs/
 docs/internal/
+
+# Code Signing Private Key Materials (NEVER COMMIT)
+.signing/
+*.pfx
+*.p12
+*.key
+*.pvk
