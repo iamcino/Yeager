@@ -11,7 +11,9 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
+import uuid
 
 KEY = os.environ.get("VT_API_KEY", "")
 TAG = os.environ.get("RELEASE_TAG", "")
@@ -37,17 +39,28 @@ def iso_utc(ts):
         return None
 
 
-def api(m, u, data=None, raw=None):
+def api_request(method, endpoint, headers=None, body=None):
     throttle()
-    r = urllib.request.Request(
-        f"https://www.virustotal.com/api/v3{u}",
-        method=m,
-        headers={"x-apikey": KEY},
-        data=data if raw is None else raw,
-    )
-    if raw:
-        r.add_header("Content-Type", "application/octet-stream")
-    return json.load(urllib.request.urlopen(r))
+    url = f"https://www.virustotal.com/api/v3{endpoint}"
+    req_headers = {"x-apikey": KEY}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+    with urllib.request.urlopen(req) as resp:
+        return json.load(resp)
+
+
+def build_multipart(filename, file_bytes):
+    boundary = f"----VTBoundary{uuid.uuid4().hex}"
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = header + file_bytes + footer
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
 
 
 def main():
@@ -74,14 +87,55 @@ def main():
             }
             continue
 
+        # Fast path: Check if file is already analyzed on VirusTotal
         try:
-            aid = api("POST", "/files", raw=open(f, "rb").read())["data"]["id"]
+            finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
+            stats = finfo.get("last_analysis_stats")
+            epoch = finfo.get("last_analysis_date")
+            last_date = iso_utc(epoch) if epoch else None
+            out[fname] = {
+                "sha256": sha,
+                "link": link,
+                "status": "completed",
+            }
+            if last_date:
+                out[fname]["last_analysis_date"] = last_date
+            if stats:
+                out[fname]["stats"] = stats
+            print(f"File {fname} already analyzed on VirusTotal: {stats}")
+            continue
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                # Other HTTP errors (e.g. 429 quota or 401 auth)
+                out[fname] = {
+                    "sha256": sha,
+                    "link": link,
+                    "status": "submit_failed",
+                    "error": f"HTTP {e.code}: {e.reason}",
+                }
+                continue
+        except Exception as e:
+            out[fname] = {
+                "sha256": sha,
+                "link": link,
+                "status": "submit_failed",
+                "error": str(e),
+            }
+            continue
+
+        # File not found on VT (404) -> Submit via multipart/form-data
+        try:
+            file_bytes = open(f, "rb").read()
+            body, ctype = build_multipart(fname, file_bytes)
+            res = api_request("POST", "/files", headers={"Content-Type": ctype}, body=body)
+            aid = res["data"]["id"]
             out[fname] = {
                 "sha256": sha,
                 "link": link,
                 "status": "pending",
             }
             pending_analyses.append((fname, sha, aid))
+            print(f"Submitted {fname} to VirusTotal (analysis ID: {aid})")
         except Exception as e:
             out[fname] = {
                 "sha256": sha,
@@ -99,7 +153,7 @@ def main():
                 continue
 
             try:
-                d = api("GET", f"/analyses/{aid}")["data"]["attributes"]
+                d = api_request("GET", f"/analyses/{aid}")["data"]["attributes"]
                 status = d.get("status")
             except Exception:
                 still_pending.append((fname, sha, aid))
@@ -109,7 +163,7 @@ def main():
                 stats = None
                 last_analysis_date = None
                 try:
-                    finfo = api("GET", f"/files/{sha}")["data"]["attributes"]
+                    finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
                     stats = finfo.get("last_analysis_stats")
                     epoch = finfo.get("last_analysis_date")
                     if epoch:
@@ -122,6 +176,7 @@ def main():
                     out[fname]["last_analysis_date"] = last_analysis_date
                 if stats:
                     out[fname]["stats"] = stats
+                print(f"Analysis completed for {fname}: {stats}")
             else:
                 still_pending.append((fname, sha, aid))
 
