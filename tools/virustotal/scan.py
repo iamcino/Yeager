@@ -39,6 +39,37 @@ def iso_utc(ts):
         return None
 
 
+def extract_analysis_entry(sha, link, finfo):
+    stats = finfo.get("last_analysis_stats") or {}
+    epoch = finfo.get("last_analysis_date")
+    entry = {
+        "sha256": sha,
+        "link": link,
+        "status": "completed",
+    }
+    if epoch:
+        entry["last_analysis_date"] = iso_utc(epoch)
+    if stats:
+        entry["stats"] = stats
+
+    positives = stats.get("malicious", 0) + stats.get("suspicious", 0)
+    if positives > 0:
+        flagged = []
+        for eng, r in finfo.get("last_analysis_results", {}).items():
+            if r.get("category") in ("malicious", "suspicious"):
+                flagged.append({
+                    "engine": eng,
+                    "category": r.get("category"),
+                    "result": r.get("result"),
+                    "method": r.get("method"),
+                    "engine_version": r.get("engine_version"),
+                    "engine_update": r.get("engine_update"),
+                })
+        flagged.sort(key=lambda x: x["engine"])
+        entry["flagged_engines"] = flagged
+    return entry
+
+
 def api_request(method, endpoint, headers=None, body=None):
     throttle()
     url = f"https://www.virustotal.com/api/v3{endpoint}"
@@ -90,19 +121,8 @@ def main():
         # Fast path: Check if file is already analyzed on VirusTotal
         try:
             finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
-            stats = finfo.get("last_analysis_stats")
-            epoch = finfo.get("last_analysis_date")
-            last_date = iso_utc(epoch) if epoch else None
-            out[fname] = {
-                "sha256": sha,
-                "link": link,
-                "status": "completed",
-            }
-            if last_date:
-                out[fname]["last_analysis_date"] = last_date
-            if stats:
-                out[fname]["stats"] = stats
-            print(f"File {fname} already analyzed on VirusTotal: {stats}")
+            out[fname] = extract_analysis_entry(sha, link, finfo)
+            print(f"File {fname} already analyzed on VirusTotal: {out[fname].get('stats')}")
             continue
         except urllib.error.HTTPError as e:
             if e.code != 404:
@@ -160,23 +180,13 @@ def main():
                 continue
 
             if status == "completed":
-                stats = None
-                last_analysis_date = None
                 try:
                     finfo = api_request("GET", f"/files/{sha}")["data"]["attributes"]
-                    stats = finfo.get("last_analysis_stats")
-                    epoch = finfo.get("last_analysis_date")
-                    if epoch:
-                        last_analysis_date = iso_utc(epoch)
-                except Exception:
-                    pass
-
-                out[fname]["status"] = "completed"
-                if last_analysis_date:
-                    out[fname]["last_analysis_date"] = last_analysis_date
-                if stats:
-                    out[fname]["stats"] = stats
-                print(f"Analysis completed for {fname}: {stats}")
+                    out[fname] = extract_analysis_entry(sha, link, finfo)
+                except Exception as e:
+                    out[fname]["status"] = "completed"
+                    out[fname]["error"] = str(e)
+                print(f"Analysis completed for {fname}: {out[fname].get('stats')}")
             else:
                 still_pending.append((fname, sha, aid))
 
