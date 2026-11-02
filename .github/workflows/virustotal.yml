@@ -1,15 +1,18 @@
 name: VirusTotal reference
+
 on:
   release:
     types: [published]
+
 permissions:
-  contents: write                   # upload asset lên release
-concurrency:
-  group: vt-${{ github.event.release.tag_name || github.ref }}
-  cancel-in-progress: false
+  contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    concurrency:
+      group: vt-${{ github.event.release.tag_name || github.ref }}
+      cancel-in-progress: false
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name }}
       VT_API_KEY: ${{ secrets.VT_API_KEY }}
@@ -18,7 +21,7 @@ jobs:
 
       - name: Download signed assets + checksums
         run: |
-          gh release download "${{ env.RELEASE_TAG }}" -D dl
+          gh release download "$RELEASE_TAG" -D dl
         env: { GH_TOKEN: ${{ github.token }} }
 
       - name: Verify integrity then scan
@@ -177,7 +180,7 @@ jobs:
       - name: Attach reference asset to release
         if: steps.scan.outputs.should_upload == 'true'
         run: |
-          cp vt.json "virustotal-${{ env.RELEASE_TAG }}.json"
-          gh release upload "${{ env.RELEASE_TAG }}" \
-            "virustotal-${{ env.RELEASE_TAG }}.json" --clobber
+          cp vt.json "virustotal-${RELEASE_TAG}.json"
+          gh release upload "$RELEASE_TAG" \
+            "virustotal-${RELEASE_TAG}.json" --clobber
         env: { GH_TOKEN: ${{ github.token }} }
