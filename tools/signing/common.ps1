@@ -39,6 +39,8 @@ $script:DefaultTimestampUrls = @(
 )
 
 function Get-SignTool {
+    $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
     $roots = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'),
         (Join-Path $env:ProgramFiles 'Windows Kits\10\bin')
@@ -47,7 +49,9 @@ function Get-SignTool {
         if (-not (Test-Path $root)) { continue }
         $tool = Get-ChildItem -Path $root -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Directory.Name -eq 'x64' } |
-            Sort-Object { [version]($_.Directory.Parent.Name -replace '[^0-9.]', '') } -Descending |
+            Sort-Object {
+                try { [version]($_.Directory.Parent.Name -replace '[^0-9.]', '') } catch { [version]'0.0.0.0' }
+            } -Descending |
             Select-Object -First 1
         if ($tool) { return $tool.FullName }
     }
