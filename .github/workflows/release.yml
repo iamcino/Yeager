@@ -52,18 +52,20 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
-          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            Write-Warning "Code signing secrets (CODESIGN_PFX_BASE64 / CODESIGN_PFX_PASSWORD) are not set. Skipping binary signing."
+          if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
+            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork/unmanaged). Skipping Authenticode signing."
             exit 0
           }
-          $pfxPath = "$env:RUNNER_TEMP\release-cert.pfx"
+          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
+            throw "Official repository requires code signing, but CODESIGN_PFX_BASE64 or CODESIGN_PFX_PASSWORD is missing! Failing release."
+          }
+          $pfxPath = "$env:RUNNER_TEMP/release-cert.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
           try {
-            $expectedThumbprint = if ($env:CODESIGN_EXPECTED_THUMBPRINT) { $env:CODESIGN_EXPECTED_THUMBPRINT } else { (./tools/signing/common.ps1; Get-PinnedThumbprint) }
-            ./tools/signing/sign.ps1 -Path "dist/yeager.exe" -PfxPath $pfxPath -ExpectedThumbprint $expectedThumbprint
+            ./tools/signing/sign.ps1 -Path "dist/yeager.exe" -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
             ./tools/signing/verify.ps1 -Path "dist/yeager.exe" -JsonPath "dist/yeager-signature.json"
             if (Test-Path "dist/levi.exe") {
-              ./tools/signing/sign.ps1 -Path "dist/levi.exe" -PfxPath $pfxPath -ExpectedThumbprint $expectedThumbprint
+              ./tools/signing/sign.ps1 -Path "dist/levi.exe" -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
               ./tools/signing/verify.ps1 -Path "dist/levi.exe" -JsonPath "dist/levi-signature.json"
             }
           } finally {
@@ -86,22 +88,25 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
-          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            Write-Warning "Code signing secrets are not set. Skipping installer signing."
+          if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
+            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured. Skipping installer signing."
             exit 0
+          }
+          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
+            throw "Official repository requires code signing, but CODESIGN_PFX_BASE64 or CODESIGN_PFX_PASSWORD is missing!"
           }
           $v = '${{ steps.version.outputs.version }}'
           $installerPath = "dist/Yeager-Setup-$v.exe"
-          if (Test-Path $installerPath) {
-            $pfxPath = "$env:RUNNER_TEMP\release-cert.pfx"
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
-            try {
-              $expectedThumbprint = if ($env:CODESIGN_EXPECTED_THUMBPRINT) { $env:CODESIGN_EXPECTED_THUMBPRINT } else { (./tools/signing/common.ps1; Get-PinnedThumbprint) }
-              ./tools/signing/sign.ps1 -Path $installerPath -PfxPath $pfxPath -ExpectedThumbprint $expectedThumbprint
-              ./tools/signing/verify.ps1 -Path $installerPath -JsonPath "dist/Yeager-Setup-$v-signature.json"
-            } finally {
-              if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
-            }
+          if (-not (Test-Path $installerPath)) {
+            throw "Installer not found at $installerPath!"
+          }
+          $pfxPath = "$env:RUNNER_TEMP/release-cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
+          try {
+            ./tools/signing/sign.ps1 -Path $installerPath -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
+            ./tools/signing/verify.ps1 -Path $installerPath -JsonPath "dist/Yeager-Setup-$v-signature.json"
+          } finally {
+            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
           }
 
       - name: Portable zip and checksums
@@ -116,9 +121,10 @@ jobs:
           Compress-Archive -Path "$stage\*" -DestinationPath "dist\Yeager-$v-portable-x64.zip" -Force
           # yeager.exe on its own is what the in-app updater downloads; it
           # checks it against this list.
-          Get-ChildItem dist/Yeager-Setup-$v.exe, dist\Yeager-$v-portable-x64.zip, dist/yeager.exe |
-            ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
-            Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          $hashLines = Get-ChildItem dist/Yeager-Setup-$v.exe, dist\Yeager-$v-portable-x64.zip, dist/yeager.exe |
+            ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
+          # Force LF line endings for Linux sha256sum compatibility
+          [IO.File]::WriteAllText("dist/SHA256SUMS.txt", ($hashLines -join "`n") + "`n")
 
       - name: Release notes
         shell: pwsh
