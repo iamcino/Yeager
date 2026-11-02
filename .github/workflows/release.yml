@@ -31,12 +31,19 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+          $cargoVersion = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'yeager' | Select-Object -ExpandProperty version
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME does not match the Cargo version $version"
+          $relVersion = $cargoVersion
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($tagVersion -ne $cargoVersion -and -not $tagVersion.StartsWith("$cargoVersion-")) {
+              throw "Tag $env:GITHUB_REF_NAME does not match Cargo version $cargoVersion"
+            }
+            $relVersion = $tagVersion
           }
-          "version=$version" >> $env:GITHUB_OUTPUT
+          $numericVersion = ($relVersion -replace '-.*$', '')
+          "version=$relVersion" >> $env:GITHUB_OUTPUT
+          "numeric_version=$numericVersion" >> $env:GITHUB_OUTPUT
 
       - name: Test
         run: cargo test --locked --workspace --exclude levi
@@ -52,12 +59,20 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
+          $isOfficial = $env:GITHUB_REPOSITORY -eq 'iamcino/Yeager'
           if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
-            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork/unmanaged). Skipping Authenticode signing."
+            if ($isOfficial) {
+              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"
+            }
+            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork). Skipping Authenticode signing."
             exit 0
           }
           if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            throw "Official repository requires code signing, but CODESIGN_PFX_BASE64 or CODESIGN_PFX_PASSWORD is missing! Failing release."
+            if ($isOfficial) {
+              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_PFX_BASE64 and CODESIGN_PFX_PASSWORD secrets!"
+            }
+            Write-Warning "Code signing secrets not configured (fork). Skipping Authenticode signing."
+            exit 0
           }
           $pfxPath = "$env:RUNNER_TEMP/release-cert.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
@@ -72,14 +87,28 @@ jobs:
             if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
           }
 
-      - name: Installer
+      - name: Install Inno Setup
         shell: pwsh
         run: |
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
             choco install innosetup -y --no-progress
-            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6;${env:ProgramFiles(x86)}\Inno Setup 7;${env:ProgramFiles}\Inno Setup 6;${env:ProgramFiles}\Inno Setup 7"
+            $innoPath = "${env:ProgramFiles(x86)}\Inno Setup 6"
+            if (-not (Test-Path $innoPath)) {
+              $innoPath = "${env:ProgramFiles}\Inno Setup 6"
+            }
+            if (-not (Test-Path $innoPath)) {
+              $innoCandidate = Get-ChildItem -Path "${env:ProgramFiles(x86)}","${env:ProgramFiles}" -Filter "Inno Setup*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($innoCandidate) { $innoPath = $innoCandidate.FullName }
+            }
+            if ($innoPath -and (Test-Path $innoPath)) {
+              "$innoPath" >> $env:GITHUB_PATH
+            }
           }
-          iscc /DAppVersion=${{ steps.version.outputs.version }} installer\setup.iss
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          iscc /DAppVersion=${{ steps.version.outputs.version }} /DNumericVersion=${{ steps.version.outputs.numeric_version }} installer\setup.iss
 
       - name: Sign installer with Authenticode
         shell: pwsh
@@ -88,12 +117,20 @@ jobs:
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
           CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
         run: |
+          $isOfficial = $env:GITHUB_REPOSITORY -eq 'iamcino/Yeager'
           if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
-            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured. Skipping installer signing."
+            if ($isOfficial) {
+              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"
+            }
+            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork). Skipping installer signing."
             exit 0
           }
           if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            throw "Official repository requires code signing, but CODESIGN_PFX_BASE64 or CODESIGN_PFX_PASSWORD is missing!"
+            if ($isOfficial) {
+              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_PFX_BASE64 and CODESIGN_PFX_PASSWORD secrets!"
+            }
+            Write-Warning "Code signing secrets not configured (fork). Skipping installer signing."
+            exit 0
           }
           $v = '${{ steps.version.outputs.version }}'
           $installerPath = "dist/Yeager-Setup-$v.exe"
@@ -121,8 +158,18 @@ jobs:
           Compress-Archive -Path "$stage\*" -DestinationPath "dist\Yeager-$v-portable-x64.zip" -Force
           # yeager.exe on its own is what the in-app updater downloads; it
           # checks it against this list.
-          $hashLines = Get-ChildItem dist/Yeager-Setup-$v.exe, dist\Yeager-$v-portable-x64.zip, dist/yeager.exe |
-            ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
+          $files = @(
+            "dist/Yeager-Setup-$v.exe",
+            "dist/Yeager-$v-portable-x64.zip",
+            "dist/yeager.exe"
+          )
+          if (Test-Path "dist/levi.exe") {
+            $files += "dist/levi.exe"
+          }
+          $hashLines = $files | Where-Object { Test-Path $_ } | ForEach-Object {
+            $item = Get-Item $_
+            "$((Get-FileHash $item -Algorithm SHA256).Hash.ToLowerInvariant())  $($item.Name)"
+          }
           # Force LF line endings for Linux sha256sum compatibility
           [IO.File]::WriteAllText("dist/SHA256SUMS.txt", ($hashLines -join "`n") + "`n")
 

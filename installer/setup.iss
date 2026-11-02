@@ -8,6 +8,9 @@
 #ifndef AppVersion
   #define AppVersion "1.1.2"
 #endif
+#ifndef NumericVersion
+  #define NumericVersion "1.1.2.0"
+#endif
 #define AppPublisher "Cino"
 #define AppURL "https://github.com/iamcino/Yeager"
 #define AppExeName "yeager.exe"
@@ -21,7 +24,7 @@ AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}/issues
 AppUpdatesURL={#AppURL}/releases
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#NumericVersion}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes

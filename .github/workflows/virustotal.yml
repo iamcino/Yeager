@@ -1,53 +1,29 @@
 name: VirusTotal reference
 on:
-  workflow_run:
-    workflows: ["Release"]          # khớp name: của release.yml
-    types: [completed]
+  release:
+    types: [published]
 permissions:
   contents: write                   # upload asset lên release
 concurrency:
-  group: vt-${{ github.event.workflow_run.id }}
+  group: vt-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 jobs:
   scan:
-    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     continue-on-error: true
     env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
       VT_API_KEY: ${{ secrets.VT_API_KEY }}
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve release
-        id: rel
-        env: { GH_TOKEN: ${{ github.token }} }
-        run: |
-          TAG="${{ github.event.workflow_run.head_branch }}"
-          if [ -z "$TAG" ]; then
-            # tag push -> head_branch null; resolve newest release by date
-            REL=$(gh api "repos/${{ github.repository }}/releases?per_page=100" \
-                  --jq 'sort_by(.created_at) | last')
-            TAG=$(printf '%s' "$REL" | jq -r .tag_name)
-            CREATED=$(printf '%s' "$REL" | jq -r .created_at)
-            # guard: release phải vừa publish (<=30p) để không quét nhầm bản thủ công/cũ
-            NOW=$(date -u +%s); THEN=$(date -u -d "$CREATED" +%s)
-            if [ -z "$TAG" ] || [ "$TAG" = "null" ] || [ $((NOW-THEN)) -gt 1800 ]; then
-              echo "no recent release to scan"; exit 0
-            fi
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Download signed assets + checksums
-        if: steps.rel.outputs.tag != ''
         run: |
-          gh release download "${{ steps.rel.outputs.tag }}" -D dl
+          gh release download "${{ env.RELEASE_TAG }}" -D dl
         env: { GH_TOKEN: ${{ github.token }} }
 
       - name: Verify integrity then scan
         id: scan
-        if: steps.rel.outputs.tag != ''
-        env:
-          VT_API_KEY: ${{ secrets.VT_API_KEY }}
-          RELEASE_TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set +e
           if [ -z "$VT_API_KEY" ]; then
@@ -56,7 +32,7 @@ jobs:
             exit 0
           fi
 
-          # Cross-check toàn bộ hash trước khi gửi bất kỳ file nào lên VT
+          # Cross-check toan bo hash truoc khi gui bat ky file nao len VT
           ( cd dl && sha256sum -c SHA256SUMS.txt )
           if [ $? -ne 0 ]; then
             echo '{"status":"integrity_mismatch"}' > vt.json
@@ -77,6 +53,14 @@ jobs:
               if wait > 0:
                   time.sleep(wait)
               _last = time.time()
+
+          def iso_utc(ts):
+              if not ts:
+                  return None
+              try:
+                  return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+              except Exception:
+                  return None
 
           def api(m, u, data=None, raw=None):
               throttle()
@@ -109,7 +93,7 @@ jobs:
               status = "pending"
               stats = None
               last_analysis_date = None
-              for _ in range(20):  # cap ~15 phút
+              for _ in range(20):  # cap ~15 phut
                   try:
                       d = api("GET", f"/analyses/{aid}")["data"]["attributes"]
                   except Exception:
@@ -120,9 +104,7 @@ jobs:
                           stats = finfo.get("last_analysis_stats")
                           epoch = finfo.get("last_analysis_date")
                           if epoch:
-                              last_analysis_date = datetime.datetime.fromtimestamp(
-                                  epoch, datetime.timezone.utc
-                              ).isoformat()
+                              last_analysis_date = iso_utc(epoch)
                           status = "completed"
                       except Exception:
                           pass
@@ -137,7 +119,7 @@ jobs:
 
           payload = {
               "version": TAG,
-              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
               "results": OUT
           }
           with open("vt.json", "w", encoding="utf-8") as fp:
@@ -146,7 +128,7 @@ jobs:
 
           cat vt.json >> "$GITHUB_STEP_SUMMARY"
 
-          # Quyết định upload: chỉ upload khi có ít nhất 1 file completed hoặc pending
+          # Quyet dinh upload: chi upload khi co it nhat 1 file completed hoac pending
           SHOULD_UPLOAD=$(python3 -c '
           import json
           try:
@@ -162,7 +144,7 @@ jobs:
       - name: Attach reference asset to release
         if: steps.scan.outputs.should_upload == 'true'
         run: |
-          cp vt.json "virustotal-${{ steps.rel.outputs.tag }}.json"
-          gh release upload "${{ steps.rel.outputs.tag }}" \
-            "virustotal-${{ steps.rel.outputs.tag }}.json" --clobber
+          cp vt.json "virustotal-${{ env.RELEASE_TAG }}.json"
+          gh release upload "${{ env.RELEASE_TAG }}" \
+            "virustotal-${{ env.RELEASE_TAG }}.json" --clobber
         env: { GH_TOKEN: ${{ github.token }} }
