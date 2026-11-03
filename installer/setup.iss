@@ -6,7 +6,7 @@
 
 #define AppName "Yeager"
 #ifndef AppVersion
-  #define AppVersion "1.1.2"
+  #define AppVersion "1.2.0"
 #endif
 #ifndef NumericVersion
   #define NumericVersion "0.0.0.0"
@@ -46,6 +46,9 @@ CloseApplications=force
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+OnlyOnNewerWindows=Yeager requires Windows 11 or Windows Server 2022+ (build 20348 or newer).%n%nDetected Windows build does not meet the minimum requirement.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"

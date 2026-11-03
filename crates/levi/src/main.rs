@@ -43,21 +43,58 @@ fn check_supported_os() {
     };
 
     if build > 0 && build < 20348 {
-        eprintln!("[-] Error: Levi requires Windows 11 (64-bit) or Windows Server 2022 (Build 20348+).");
-        eprintln!("[-] Windows 10 reached End of Life (EOL) in October 2025 and is not supported for security reasons.");
-        eprintln!("[-] Please upgrade to Windows 11 to run Levi safely.");
+        eprintln!("[-] Error: Levi requires Windows 11 or Windows Server 2022+ (build 20348 or newer).");
+        eprintln!("[-] Detected build: {build}.");
+        eprintln!("[-] Levi and Yeager rely on Windows 11 native DoH and network architecture.");
+        eprintln!("[-] Windows 10 is not supported.");
         std::process::exit(1);
     }
 }
 
+fn print_help() {
+    println!("Yeager - Levi Connection Resilience & TLS Stabilization Engine (CLI)");
+    println!("Usage: levi.exe [OPTIONS]");
+    println!();
+    println!("Options:");
+    println!("  --all                   Intercept all outbound HTTPS (Port 443)");
+    println!("  --hosts <domain,...>    Target specific domains (comma-separated)");
+    println!("  --profile <name>        Resilience profile: auto, fast, hardened, observe");
+    println!("  --help, -h              Print this help message and exit");
+    println!("  --version, -V           Print version information and exit");
+    println!("  --license               Print license information and exit");
+}
+
+fn print_license() {
+    println!("Yeager / Levi Engine");
+    println!("Copyright (C) 2026 Cino");
+    println!("Licensed under the MIT License.");
+    println!("See https://github.com/iamcino/Yeager/blob/master/LICENSE for details.");
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Harmless informational commands run freely without requiring OS gate
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("levi {} (Yeager connection resilience engine)", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--license") {
+        print_license();
+        return;
+    }
+
     #[cfg(windows)]
     check_supported_os();
+
     println!("Yeager - Levi Connection Resilience & TLS Stabilization Engine (CLI)");
     println!("Platform: Windows 11 x64 | Engine: WinDivert Native");
     println!("--------------------------------------------------");
 
-    let args: Vec<String> = std::env::args().collect();
     let mut cfg = Config::default();
 
     let profile = if let Some(idx) = args.iter().position(|a| a == "--profile") {

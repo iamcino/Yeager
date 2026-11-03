@@ -600,15 +600,23 @@ pub fn get_windows_build() -> u32 {
 }
 
 /// Displays an informative error dialog and blocks execution if running on unsupported Windows (e.g. Windows 10).
-pub fn show_unsupported_os_dialog() {
+pub fn show_unsupported_os_dialog(build: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let title = wide("Yeager - Unsupported Windows Version");
-    let msg = wide(
-        "Yeager requires Windows 11 (64-bit) or Windows Server 2022 (Build 20348+).\n\n\
-        Windows 10 reached End of Life (EOL) in October 2025 and is not supported \
-        for security and architectural reasons (kernel driver safety and native DoH).\n\n\
-        Please upgrade to Windows 11 to run Yeager safely."
-    );
+    let msg = wide(&format!(
+        "Yeager requires Windows 11 or Windows Server 2022+ (build 20348 or newer).
+
+\
+        Detected build: {build}.
+
+\
+        Yeager's native DNS-over-HTTPS (DoH) engine and transport architecture require Windows 11.
+\
+        Windows 10 is not supported.
+
+\
+        Any previous network or TCP settings have been safely restored to Windows defaults."
+    ));
     unsafe {
         MessageBoxW(std::ptr::null_mut(), msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
     }

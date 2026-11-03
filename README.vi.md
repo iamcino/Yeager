@@ -329,10 +329,7 @@ Yeager hoạt động ở tầng hệ thống (yêu cầu quyền Administrator 
 
 ### Kết quả quét bản phát hành
 
-Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa hash SHA-256, link phân tích và số vendor tại thời điểm quét cho các file thực thi (`.exe`). Bản portable `.zip` được đóng gói từ cùng bộ artifact phát hành và được kiểm chứng toàn vẹn qua `SHA256SUMS.txt`. Số liệu bind theo asset đã ký của release, không dùng bản local.
-
-- **Ứng dụng chính (`yeager.exe`) & Bộ cài (`Yeager-Setup-*.exe`):** Hoàn toàn sạch (`0/71` undetected).
-- **Headless CLI (`levi.exe`):** Có thể xuất hiện cảnh báo heuristic đơn lẻ từ vendor thứ cấp (ví dụ phân cụm tự động `W32.Malware.<HEX>` của Bkav) do cơ chế thao tác raw socket tầng thấp và chưa có danh tiếng CA thương mại. **100% các hãng bảo mật Tier 1** (Microsoft Defender, Kaspersky, ESET-NOD32, Symantec, BitDefender, Sophos, Avast, CrowdStrike Falcon) đều xác nhận sạch (`Undetected`). Chi tiết từng vendor được ghi nhận minh bạch trong `virustotal-v<version>.json`.
+Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa SHA-256, liên kết phân tích và thống kê vendor tại thời điểm quét. Số liệu bind theo asset đã ký của release, không dùng bản local.
 
 ### Vì sao có cảnh báo giả
 
