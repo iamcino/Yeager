@@ -562,3 +562,54 @@ pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {
         }
     });
 }
+
+/// Queries the Windows build number (e.g. 22000 for Win11 RTM, 22631 for Win11 23H2, 19045 for Win10 22H2).
+/// Returns 0 if unable to query.
+pub fn get_windows_build() -> u32 {
+    #[repr(C)]
+    struct OsVersionInfoExW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
+        w_service_pack_major: u16,
+        w_service_pack_minor: u16,
+        w_suite_mask: u16,
+        w_product_type: u8,
+        w_reserved: u8,
+    }
+    type RtlGetVersionFn = unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32;
+
+    unsafe {
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if !ntdll.is_null() {
+            let proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(ntdll, c"RtlGetVersion".as_ptr().cast());
+            if let Some(func) = proc {
+                let rtl_get_version: RtlGetVersionFn = std::mem::transmute(func);
+                let mut info: OsVersionInfoExW = std::mem::zeroed();
+                info.dw_os_version_info_size = std::mem::size_of::<OsVersionInfoExW>() as u32;
+                if rtl_get_version(&mut info) == 0 {
+                    return info.dw_build_number;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Displays an informative error dialog and blocks execution if running on unsupported Windows (e.g. Windows 10).
+pub fn show_unsupported_os_dialog() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let title = wide("Yeager - Unsupported Windows Version");
+    let msg = wide(
+        "Yeager requires Windows 11 (64-bit) or Windows Server 2022 (Build 20348+).\n\n\
+        Windows 10 reached End of Life (EOL) in October 2025 and is not supported \
+        for security and architectural reasons (kernel driver safety and native DoH).\n\n\
+        Please upgrade to Windows 11 to run Yeager safely."
+    );
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
