@@ -122,14 +122,6 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &Config) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    #[cfg(windows)]
-    {
-        let build = platform::get_windows_build();
-        if build > 0 && build < 20348 {
-            platform::show_unsupported_os_dialog();
-            return Ok(());
-        }
-    }
     // Run by the uninstaller after it has closed the app: put back what Yeager
     // changed in Windows (TCP, DNS, the logon task) and exit without a window.
     if std::env::args().any(|a| a == "--cleanup") {
@@ -138,6 +130,22 @@ fn main() -> Result<(), slint::PlatformError> {
         hange::clean_up_leftovers();
         let _ = erwin::set_launch_at_login(false, &Default::default());
         return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let build = platform::get_windows_build();
+        if build > 0 && build < 20348 {
+            // Safety: if the user upgraded to a version requiring Win11 while having
+            // active configurations or backups from a previous Yeager run, restore them cleanly.
+            let _ = erwin::restore();
+            let _ = erwin::latency::restore();
+            hange::clean_up_leftovers();
+            let _ = erwin::set_launch_at_login(false, &Default::default());
+
+            platform::show_unsupported_os_dialog(build);
+            return Ok(());
+        }
     }
 
     // Started by an update: the previous exe is on its way out.

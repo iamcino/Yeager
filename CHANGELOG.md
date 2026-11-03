@@ -8,6 +8,16 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
+### Changed
+- **BREAKING: Enforce Windows 11 / Windows Server 2022+ minimum requirement:**
+  - Yeager's DNS-over-HTTPS engine (Hange) and Levi connection engine inherently rely on Windows 11 native DoH APIs (`DNS_INTERFACE_SETTINGS3` / `SetInterfaceDnsSettings`).
+  - Added strict pre-flight OS compatibility checks in both GUI (`yeager.exe`) and CLI (`levi.exe`) rejecting Windows builds older than 20348 (Windows 10).
+  - Harmless CLI queries (`--help`, `--version`, `--license`) continue to operate freely regardless of OS version.
+  - Runtime OS check automatically restores any lingering network, TCP, or DNS configurations to system defaults before exit.
+  - Modernized installer packaging with strict `MinVersion=10.0.20348` preventing installation attempts on Windows 10.
+
 ## [1.1.3] - 2026-11-03
 
 ### Added

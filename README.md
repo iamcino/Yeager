@@ -330,10 +330,7 @@ Yeager runs at the system level (Administrator privileges + the WinDivert networ
 
 ### Release scan results
 
-Each GitHub release attaches `virustotal-v<version>.json` with the SHA-256, analysis link and vendor counts at scan time for executable binaries (`.exe`). The portable `.zip` is packaged from the release artifacts and integrity-verified via `SHA256SUMS.txt`. Figures bind to the release's signed assets, never local builds.
-
-- **Main application (`yeager.exe`) & Installer (`Yeager-Setup-*.exe`):** Completely clean (`0/71` undetected).
-- **Headless CLI (`levi.exe`):** May show an isolated heuristic clustering flag from secondary regional engines (e.g. Bkav `W32.Malware.<HEX>`) due to low-level raw socket operations and lack of commercial CA reputation. **100% of Tier 1 AVs** (Microsoft Defender, Kaspersky, ESET-NOD32, Symantec, BitDefender, Sophos, Avast, CrowdStrike Falcon) verify it as clean (`Undetected`). All engine verdicts are detailed in `virustotal-v<version>.json`.
+Each GitHub release attaches `virustotal-v<version>.json` containing the SHA-256, analysis link and vendor statistics at scan time. Figures bind to the release's signed assets, never local builds.
 
 ### Why the false positive
 
