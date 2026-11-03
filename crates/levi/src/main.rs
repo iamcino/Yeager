@@ -3,7 +3,56 @@
 use common::{Config, Scope};
 use std::io::{self, Write};
 
+#[cfg(windows)]
+fn check_supported_os() {
+    #[repr(C)]
+    struct OsVersionInfoExW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
+        w_service_pack_major: u16,
+        w_service_pack_minor: u16,
+        w_suite_mask: u16,
+        w_product_type: u8,
+        w_reserved: u8,
+    }
+    type RtlGetVersionFn = unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32;
+
+    let build = unsafe {
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if !ntdll.is_null() {
+            let proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(ntdll, c"RtlGetVersion".as_ptr().cast());
+            if let Some(func) = proc {
+                let rtl_get_version: RtlGetVersionFn = std::mem::transmute(func);
+                let mut info: OsVersionInfoExW = std::mem::zeroed();
+                info.dw_os_version_info_size = std::mem::size_of::<OsVersionInfoExW>() as u32;
+                if rtl_get_version(&mut info) == 0 {
+                    info.dw_build_number
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
+    if build > 0 && build < 20348 {
+        eprintln!("[-] Error: Levi requires Windows 11 (64-bit) or Windows Server 2022 (Build 20348+).");
+        eprintln!("[-] Windows 10 reached End of Life (EOL) in October 2025 and is not supported for security reasons.");
+        eprintln!("[-] Please upgrade to Windows 11 to run Levi safely.");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    check_supported_os();
     println!("Yeager - Levi Connection Resilience & TLS Stabilization Engine (CLI)");
     println!("Platform: Windows 11 x64 | Engine: WinDivert Native");
     println!("--------------------------------------------------");

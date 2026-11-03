@@ -178,11 +178,15 @@ và hoàn tác mọi thay đổi hệ thống mà nó tạo ra.
 
 ## Yêu cầu hệ thống
 
-- Windows 11, 64-bit. (DNS over HTTPS tích hợp của Windows, thứ Yeager dựa vào,
-  chỉ có trên Windows 11.)
-- Quyền quản trị (thay đổi thiết lập TCP, DNS và nạp driver đều cần quyền này;
-  ứng dụng hỏi một lần khi khởi động).
-- BBRv2 cần Windows 11 22H2 trở lên. Với bản cũ hơn, hãy dùng CUBIC hoặc CTCP.
+- **Windows 11 (64-bit)** hoặc **Windows Server 2022** (Build 22000+ / 20348+).
+- **Quyền Administrator** (cần thiết để điều chỉnh TCP/DNS và nạp driver mạng WinDivert; ứng dụng yêu cầu cấp quyền khi khởi động).
+- **Điều khiển tắc nghẽn BBRv2** yêu cầu Windows 11 22H2 trở lên (tự động chuyển về CUBIC hoặc CTCP trên các bản cũ hơn).
+
+> [!IMPORTANT]
+> **Vì sao Yeager KHÔNG hỗ trợ Windows 10 (Chính sách Bảo mật & Kiến trúc):**
+> 1. **Ranh giới an toàn của hệ điều hành đã khai tử (EOL):** Windows 10 đã chính thức hết hạn hỗ trợ (End of Life) vào tháng 10/2025 và không còn nhận các bản vá bảo mật từ Microsoft. Yeager chạy với quyền Administrator và nạp driver WinDivert ở tầng Kernel; việc vận hành phần mềm can thiệp gói tin tầng thấp trên một hệ điều hành không còn được vá lỗi sẽ phơi nhiễm người dùng trước các nguy cơ leo thang đặc quyền (Privilege Escalation).
+> 2. **Kiến trúc DoH Native thay vì gánh nặng kỹ thuật:** Yeager tích hợp trực tiếp vào API `DNS_INTERFACE_SETTINGS3` native của Windows 11 (`dnsapi.dll`) để kích hoạt DNS over HTTPS tầng hệ thống với độ trễ tối thiểu. Hỗ trợ Windows 10 sẽ buộc dự án phải nhúng thêm client DoH bên thứ ba, làm phình to kích thước file, gia tăng bề mặt tấn công (attack surface) và nợ kỹ thuật.
+> 3. **Ưu tiên chất lượng và tương lai:** Chúng tôi lựa chọn đầu tư 100% nguồn lực để tối ưu hóa hiệu năng và bảo mật trên nền tảng hiện đại, thay vì chắp vá tính tương thích ngược cho một hệ điều hành đã bị khai tử. Yeager sẽ **không** cung cấp hỗ trợ ngược cho Windows 10.
 
 ## Cài đặt
 
@@ -311,6 +315,9 @@ Kết quả quét hiện tại và cách tự kiểm chứng binary:
 **Có làm chậm game không?**
 Không ảnh hưởng đáng kể tới lưu lượng thông thường. Nếu muốn, hãy dùng phạm vi
 *Theo tên miền* để engine chỉ áp dụng cho những trang bạn chọn.
+
+**Yeager có hỗ trợ Windows 10 không?**
+Không. Windows 10 đã bị Microsoft khai tử vào tháng 10/2025 và thiếu API DNS-over-HTTPS native. Việc chạy driver mạng kernel với quyền Admin trên một hệ điều hành không còn nhận bản vá bảo mật tiềm ẩn rủi ro rất lớn. Cả bộ cài và file thực thi đều có cơ chế kiểm tra chặn ngay từ đầu nếu phát hiện hệ điều hành cũ hơn Windows 11 / Server 2022 (Build 20348+).
 
 **Có gì đó không chạy. Làm sao hoàn tác tất cả?**
 Tắt Yeager, hoặc bấm **Khôi phục mặc định Windows** ở trang TCP. Thoát ứng dụng

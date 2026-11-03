@@ -177,11 +177,15 @@ memory, and undoes every system change it makes.
 
 ## Requirements
 
-- Windows 11, 64-bit. (Windows' built-in DNS over HTTPS, which Yeager relies on,
-  is only available on Windows 11.)
-- Administrator rights (changing TCP and DNS settings and loading the driver
-  require them; the app asks once when it starts).
-- BBRv2 needs Windows 11 22H2 or later. On older builds, use CUBIC or CTCP.
+- **Windows 11 (64-bit)** or **Windows Server 2022** (Build 22000+ / 20348+).
+- **Administrator rights** (changing TCP/DNS settings and loading the network driver require elevation; the app requests elevation once on startup).
+- **BBRv2 congestion control** needs Windows 11 22H2 or later (automatically falls back cleanly to CUBIC or CTCP on earlier builds).
+
+> [!IMPORTANT]
+> **Why Windows 10 is NOT supported (Security & Architecture Policy):**
+> 1. **End-of-Life Security Boundary:** Windows 10 reached official End of Life (EOL) in October 2025 and no longer receives security updates from Microsoft. Because Yeager operates with elevated Administrator privileges and loads a kernel-level network driver (WinDivert), running packet-interception software on an unpatched OS presents an unacceptable privilege escalation hazard.
+> 2. **Native DoH Architecture vs. Technical Debt:** Yeager integrates directly with Windows 11's native `DNS_INTERFACE_SETTINGS3` APIs in `dnsapi.dll` for zero-overhead, system-level DNS-over-HTTPS. Supporting legacy Windows 10 would require embedding a third-party DoH proxy daemon, vastly expanding binary footprint, technical debt, and attack surface.
+> 3. **Focus on Quality:** We prioritize security, native performance, and stability over legacy compatibility. Backward compatibility for Windows 10 will **not** be provided.
 
 ## Installation
 
@@ -312,6 +316,9 @@ Current scan result and how to verify the binary yourself:
 **Will it slow down my games?**
 No noticeable effect on general traffic, but if you prefer, use the
 *Domain list* scope so the engine only touches the sites you choose.
+
+**Will Yeager support Windows 10?**
+No. Windows 10 reached End of Life (EOL) in October 2025 and lacks native DNS-over-HTTPS APIs. Running kernel-level network interception with Administrator privileges on an unpatched, unsupported OS presents an unacceptable security risk. Both the installer and the binaries enforce a strict runtime block for builds prior to Windows 11 / Server 2022 (Build 20348+).
 
 **Something stopped working. How do I undo everything?**
 Turn Yeager off, or press **Restore Windows defaults** on the TCP page.

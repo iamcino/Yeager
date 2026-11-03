@@ -122,6 +122,14 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &Config) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(windows)]
+    {
+        let build = platform::get_windows_build();
+        if build > 0 && build < 20348 {
+            platform::show_unsupported_os_dialog();
+            return Ok(());
+        }
+    }
     // Run by the uninstaller after it has closed the app: put back what Yeager
     // changed in Windows (TCP, DNS, the logon task) and exit without a window.
     if std::env::args().any(|a| a == "--cleanup") {
