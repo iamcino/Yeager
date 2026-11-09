@@ -8,6 +8,17 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-11-09
+
+### Thay đổi
+- **Chứng chỉ ký số mới:** các bản phát hành từ nay được ký bằng chứng chỉ Yeager mới, thumbprint `9131F99C0B198E81FBA0F5818D0637B4A14D4CF1` (`docs/signing/Yeager-codesign.cer`), thay cho `0E9C6BBE35AC13E58F951C446F2B524FA7297DCA` vì khóa riêng của chứng chỉ cũ không còn dùng được. Bản phát hành cũng được đăng trên [GitLab](https://gitlab.com/cino-group/yeager/-/releases).
+- **Bắt buộc Windows 11 / Windows Server 2022 trở lên:**
+  - DNS over HTTPS (Hange) và engine kết nối Levi dựa vào API DoH gốc của Windows 11 (`DNS_INTERFACE_SETTINGS3` / `SetInterfaceDnsSettings`).
+  - Cả ứng dụng (`yeager.exe`) và bản dòng lệnh (`levi.exe`) kiểm tra hệ điều hành ngay khi khởi động và từ chối bản Windows cũ hơn build 20348 (Windows 10).
+  - Các lệnh chỉ đọc của CLI (`--help`, `--version`, `--license`) vẫn chạy được trên mọi phiên bản Windows.
+  - Khi bị từ chối, Yeager tự trả mọi thiết lập mạng, TCP và DNS còn sót về mặc định hệ thống trước khi thoát.
+  - Bộ cài đặt `MinVersion=10.0.20348`, không cho cài trên Windows 10.
+
 ## [1.1.3] - 2026-11-03
 
 ### Thêm

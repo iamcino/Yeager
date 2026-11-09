@@ -19,7 +19,7 @@ Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 ## Development
 
 1. Install the Rust toolchain and a resource compiler (see
-   [Building from source](README.md#building-from-source)).
+   [Build and release](docs/BUILD.md)).
 2. `cargo build` and run `target\debug\yeager.exe` as administrator.
 3. Before opening a pull request:
    - `cargo fmt --all`
@@ -69,7 +69,7 @@ Vấn đề bảo mật vui lòng báo theo [SECURITY.md](SECURITY.md), không m
 ### Phát triển
 
 1. Cài bộ công cụ Rust và trình biên dịch resource (xem
-   [Build từ mã nguồn](README.vi.md#build-từ-mã-nguồn)).
+   [Build và phát hành](docs/BUILD.vi.md)).
 2. `cargo build` rồi chạy `target\debug\yeager.exe` với quyền quản trị.
 3. Trước khi mở pull request:
    - `cargo fmt --all`

@@ -4,399 +4,262 @@
 
 # Yeager
 
-**An easier, more open Internet on Windows — connection engine, TCP tuning and encrypted DNS in one native app.**
+**A smoother, more open Internet on Windows 11, in one switch.**<br>
+A connection engine, TCP tuning and encrypted DNS in a single native app. Not a VPN: your traffic still goes straight to the site, from your own IP.
 
 **English** · [Tiếng Việt](README.vi.md)
 
-[![Version](https://img.shields.io/github/v/release/iamcino/Yeager?label=version&color=0a7aff)](https://github.com/iamcino/Yeager/releases/latest)
+[![Release](https://img.shields.io/gitlab/v/release/cino-group/yeager?label=release&color=0a7aff)](https://gitlab.com/cino-group/yeager/-/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011%20x64-0a7aff)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+### ⬇ Download the installer: [from GitHub](https://github.com/iamcino/Yeager/releases/latest) · [from GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
+
+Releases: [GitHub](https://github.com/iamcino/Yeager/releases) · [GitLab](https://gitlab.com/cino-group/yeager/-/releases) · [What's new](CHANGELOG.md) · [Report a bug](https://github.com/iamcino/Yeager/issues)
+
+<img src="assets/screenshots/home.png" width="460" alt="Yeager home page">
 
 </div>
 
 ---
 
-## Contents
+## Up and running in a minute
 
-- [What is Yeager?](#what-is-yeager)
-  - [Screenshots](#screenshots)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Getting started](#getting-started)
-- [How it works](#how-it-works)
-- [Privacy](#privacy)
-- [Uninstalling](#uninstalling)
-- [Building from source](#building-from-source)
-- [FAQ](#faq)
-- [Security & VirusTotal Inspection](#security--virustotal-inspection)
-- [Disclaimer](#disclaimer)
-- [License and third-party software](#license-and-third-party-software)
+1. **Download** `Yeager-Setup-<version>.exe` [from GitHub](https://github.com/iamcino/Yeager/releases/latest) or [from GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe), run it and accept the administrator prompt.
+2. **Press the power button** on the home page. Yeager turns on encrypted DNS and the connection engine.
+3. **Browse as usual.** Sites that used to stall or reset now load normally.
 
-## What is Yeager?
+That's it. Yeager lives in the notification area (bottom right of the
+taskbar); closing the window keeps it running. If Windows or your antivirus
+shows a warning, see [Windows and antivirus warnings](#windows-and-antivirus-warnings).
 
-Yeager is a small Windows app that keeps websites and online services reachable
-and responsive on networks that interfere with ordinary connections. It combines
-three pieces that each solve one part of the problem:
+> Prefer not to install? The portable zip (`Yeager-<version>-portable-x64.zip`)
+> runs from any folder and updates itself the same way.
 
-| Component | What it does for you |
-|-----------|----------------------|
-| **Levi** — connection engine | Helps HTTPS connections that the local network keeps resetting or stalling get through, so sites and apps load normally. |
-| **Erwin** — TCP tuning | Picks the best Windows TCP congestion-control algorithm for your link, and can measure it for you. |
-| **Hange** — encrypted DNS | Resolves domain names over DNS over HTTPS (HTTP/3 or HTTP/2), so lookups can't be read or tampered with on the way. |
+## Why Yeager
 
-Yeager is **not** a VPN or a proxy. Your traffic goes straight to the site you
-open, from your own IP address, and stays end-to-end encrypted. Nothing is
-routed through third-party servers, and browsers and apps need no proxy
-settings or extra certificates.
-
-Everything is one native Rust binary that sits in the system tray, uses little
-memory, and undoes every system change it makes.
-
-### Screenshots
-
-| Dashboard | Connection Engine (Levi) |
-|:---:|:---:|
-| <img src="assets/screenshots/home.png" width="390" alt="Dashboard"> | <img src="assets/screenshots/engine.png" width="390" alt="Connection Engine"> |
-| **TCP Tuning (Erwin)** | **Encrypted DNS (Hange)** |
-| <img src="assets/screenshots/tcp.png" width="390" alt="TCP Tuning"> | <img src="assets/screenshots/dns.png" width="390" alt="Encrypted DNS"> |
-| **Appearance & Colors** | **General Settings** |
-| <img src="assets/screenshots/appearance.png" width="390" alt="Appearance"> | <img src="assets/screenshots/general.png" width="390" alt="General Settings"> |
+| | |
+|---|---|
+| 🌐 **Sites load again** | Levi, the connection engine, helps HTTPS connections that your network keeps resetting or stalling get through, for every site or only the ones you list. |
+| 🚀 **Not a VPN** | No proxy, no third-party server, no extra certificate. Traffic goes straight to the site from your own IP and stays end-to-end encrypted, so speed and latency stay native. |
+| 🔒 **Private DNS** | Hange resolves names over DNS over HTTPS (HTTP/3 or HTTP/2) with Cloudflare, Google or AdGuard, and never falls back to plain DNS. |
+| ⚡ **Faster TCP** | Erwin measures your link and picks the best Windows congestion control: BBRv2, CUBIC or CTCP. |
+| ↩️ **Fully reversible** | Every TCP and DNS change is saved first and put back when you turn Yeager off, quit, or start it again after a crash. |
+| 🪶 **Light and native** | One Rust binary with the network driver built in. No services, no scripts, no runtimes, little memory. |
+| 🛡️ **Safe updates** | Tells you when a new version is out, always asks first, and checks the download against the release's SHA-256 list. |
 
 ## Features
 
-### Levi — connection engine
+### Levi: connection engine
 
-- **Pure native Rust.** Written entirely in Rust and linked into
-  `yeager.exe`. Turning it on or off from the window or the tray calls native
-  code in the same process: no helper processes, scripts or runtimes.
-- **Self-contained driver.** The signed WinDivert driver (`WinDivert.dll`,
-  `WinDivert64.sys`) is embedded in the binary and unpacked automatically when
-  the engine starts. There is nothing extra to install.
-- **Two scopes.**
-  - *All*: works on every outgoing HTTPS (port 443) connection.
-  - *Domain list*: works only on the domains you list (subdomains included,
-    e.g. `discord.com`, `medium.com`, `steamcommunity.com`); everything else
-    goes straight through at native speed.
-- **Four transport profiles.**
-  - *Auto* (default): picks *Fast*, which adds no delay and works on direct
-    fibre lines as well as inside VPN tunnels such as WireGuard / NetBird.
-  - *Fast*: splits the opening of each connection into three pieces sent in
-    order, so nothing is added to latency; good for games and VPN tunnels.
-  - *Hardened*: sends the pieces out of order with a short, calibrated pause
-    (about 3.4 ms) for networks whose equipment tampers harder with streams.
-  - *Observe*: changes nothing and only counts connections and injected resets,
-    to check safely how the network behaves.
+- **Two scopes.** *All* works on every outgoing HTTPS connection. *Domain list*
+  works only on the domains you add (subdomains included, such as
+  `discord.com` or `medium.com`); everything else goes straight through.
+- **Four profiles.** *Auto* (default) and *Fast* add no delay and suit games,
+  fibre and VPN tunnels such as WireGuard or NetBird. *Hardened* is for
+  networks that interfere harder. *Observe* changes nothing and only counts
+  what the network does, to check it safely.
+- **Resists tampering.** Resets injected by the network before the real server
+  answers are dropped, so the connection stays open for the genuine reply. A
+  real server closing a connection is always let through.
+- **Leaves your local network alone.** Private and local addresses, and IPv6
+  devices on your own /64 such as a NAS or a TV, go straight through at LAN speed.
+- **Built for heavy traffic.** Pages that open 20–30 connections at once,
+  downloads, 4K video and games keep their speed; only the packets that open a
+  connection are inspected.
+- **Antivirus-friendly.** No fake packets or unusual TCP flags, and DNS
+  (port 53 and Yeager's own encrypted DNS) is never touched.
+- **Live counters** on the Engine page: connections handled, stabilised, and
+  injected resets dropped.
 
-  Pick one on the **Engine** page; `levi.exe` takes `--profile auto|fast|hardened`.
-- **No waiting in line.** The packet loop runs at wire speed (under 20 µs per
-  packet) and hands per-connection work to a fixed pool of 4–6 worker threads,
-  so a page that opens 20–30 connections at once still loads instantly and
-  Windows never has to spin up new threads under load.
-- **Built for heavy traffic.** Large driver queues (8192 packets, 32 MB) keep
-  downloads, 4K video and games from dropping packets while connections are
-  being set up.
-- **Resists tampering.** Connection resets injected by the network before the
-  real server answers are dropped at the driver level, so the connection stays
-  open for the genuine reply. Only resets that arrive while a connection is
-  still being opened (about 3.5 s) are dropped; a real server closing an
-  established connection is let through, so no connection is left hanging.
-- **Leaves your local network alone.** Traffic to private and local addresses
-  (192.168.x.x, 10.x.x.x, 172.16–31.x.x, loopback, link-local and IPv6 ULA) and
-  to IPv6 devices on the same /64 network as your PC, such as a NAS or a TV,
-  goes straight through at full LAN speed.
-- **Live counters.** The engine counts connections it has handled, connections
-  it has stabilised and injected resets it has dropped; the Engine page shows
-  them live.
-- **Light on CPU.** Only packets that open a connection are inspected; ACKs
-  and keepalives pass straight through, and the hot path allocates no memory.
-- **Stays out of DNS.** Never touches port 53 or the encrypted DNS connections
-  Yeager itself makes, so name resolution is unaffected.
-- **Antivirus-friendly.** Does not inject fake packets or unusual TCP flags,
-  which security software (e.g. Bitdefender, Kaspersky) often flags.
-- **Clean lifecycle.** Starts and stops in well under two seconds and leaves no
-  process or driver behind. Exposed to the app as `levi::start`,
-  `levi::start_with_profile`, `levi::stop` and `levi::is_running`.
-- **Headless CLI.** A separate `levi.exe` (~486 KB) runs the engine without
-  the UI, for servers or scripts, and prints a summary of the counters when it
-  stops. See [`crates/levi/CLI.md`](crates/levi/CLI.md).
+### Erwin: TCP tuning
 
-### Erwin — TCP tuning
+- Choose **Auto**, **BBRv2**, **CUBIC** or **CTCP**. *Auto* pings Cloudflare and
+  Google when you apply it: a stable link gets CUBIC; loss, jitter or long
+  paths get BBRv2.
+- **Diagnose** measures throughput and latency under load with each algorithm
+  and recommends the fastest, applied with one click.
+- **Restore Windows defaults** puts back your original settings, or Windows'
+  own defaults, at any time.
+- Works on its own, without the engine or DNS.
 
-- Choose the congestion-control algorithm Windows uses: **Auto**, **BBRv2**,
-  **CUBIC** or **CTCP**.
-- **Auto** pings Cloudflare and Google when you apply it: a stable link gets
-  CUBIC; packet loss, jitter or long-distance paths get BBRv2.
-- **Diagnose** measures throughput and latency under load with CUBIC, CTCP and BBRv2
-  and recommends the fastest one, which you can apply with one click.
-- **Fully reversible.** Before its first change Yeager saves your current
-  settings and puts them back when you turn TCP tuning off, quit the app, or
-  start it again after a crash. **Restore Windows defaults** puts back your
-  original settings, or Windows' own defaults (CUBIC, no pacing), and turns
-  low-latency mode off.
-- Works on its own: independent of the engine and of DNS.
+### Hange: encrypted DNS
 
-### Hange — encrypted DNS
-
-- **DNS over HTTPS** with **Cloudflare**, **Google** or **AdGuard** (blocks ads
-  and trackers), or **Automatic**: whichever of Cloudflare and Google answers
-  faster. Each provider shows the transport and latency it gets on your network.
-- **Local DNS.** A resolver on `127.0.0.1:53` / `[::1]:53` with a 4096-entry
-  cache. It tries every server address over both HTTP/3 and HTTP/2 at once and
-  keeps the route that answers fastest, so a slow or broken address or
-  transport never holds lookups up. While you browse, the connection is kept
-  warm so the next lookup answers at once.
-- **Rides out outages.** While a server is unreachable, recently visited sites
-  are answered from the cache, and if the chosen provider stays down for 10
-  seconds another one stands in until it is back (the app says so).
-- **No plaintext fallback.** Each network adapter lists the local resolver
-  first and the provider's servers, with Windows' built-in DoH required, after
-  it. If the local resolver stops, Windows keeps using encrypted DNS.
-- Configured through the Windows IP Helper API, not scripts or raw registry
-  edits, so antivirus behaviour monitors don't mistake it for a DNS hijacker.
-- Trusts the Windows certificate store, so it keeps working with antivirus
-  "encrypted web scan" features.
-- **Check** shows which transport is in use and whether DNS is leaking.
-- Turning it off resets the adapters to the DNS from your router (DHCP);
-  leftovers from a crash are cleaned up on the next launch.
+- **Cloudflare**, **Google**, **AdGuard** (blocks ads and trackers), or
+  **Automatic**, which uses whichever of Cloudflare and Google answers faster.
+- **Local resolver** on `127.0.0.1` and `[::1]` with a 4096-entry cache. It
+  races every server address over HTTP/3 and HTTP/2 and keeps the fastest
+  route warm, so lookups answer at once.
+- **Rides out outages.** Recently visited sites are answered from the cache,
+  and if your provider stays down for 10 seconds another one stands in until
+  it is back.
+- **No plaintext fallback.** If the local resolver stops, Windows' own DoH
+  keeps DNS encrypted.
+- **Check** shows the transport in use and whether DNS is leaking.
 
 ### App
 
-- Vietnamese and English interface, switchable at any time.
-- Light and dark mode, adjustable accent color.
-- Lives in the system tray; closing the window keeps Yeager running.
-- Shows your ISP in the sidebar (from Cloudflare, once at start and again
-  when you run **Diagnose**).
-- **Updates itself** from GitHub Releases when you agree, with the download
-  checked against its SHA-256 checksum.
-- Optional **connect on launch** and **start with Windows** (an elevated
-  logon task, so no UAC prompt every time you sign in).
-- **The engine needs encrypted DNS:** turning the engine on turns DoH on, and
-  turning DoH off stops the engine. DoH and TCP tuning can run on their own.
+- Vietnamese or English interface, light or dark, your choice of accent color.
+- **Connect on launch** and **start with Windows** without a UAC prompt at every sign-in.
+- Shows your ISP in the sidebar.
+- The engine always runs with encrypted DNS: turning the engine on turns DoH
+  on. DoH and TCP tuning can each run on their own.
 
-## Requirements
+| Engine (Levi) | TCP tuning (Erwin) | Encrypted DNS (Hange) |
+|:---:|:---:|:---:|
+| <img src="assets/screenshots/engine.png" width="260" alt="Engine page"> | <img src="assets/screenshots/tcp.png" width="260" alt="TCP page"> | <img src="assets/screenshots/dns.png" width="260" alt="DNS page"> |
 
-- **Windows 11 (64-bit)** or **Windows Server 2022** (Build 22000+ / 20348+).
-- **Administrator rights** (changing TCP/DNS settings and loading the network driver require elevation; the app requests elevation once on startup).
-- **BBRv2 congestion control** needs Windows 11 22H2 or later (automatically falls back cleanly to CUBIC or CTCP on earlier builds).
+## Quick tips
 
-> [!IMPORTANT]
-> **Why Windows 10 is NOT supported (Security & Architecture Policy):**
-> 1. **End-of-Life Security Boundary:** Windows 10 reached official End of Life (EOL) in October 2025 and no longer receives security updates from Microsoft. Because Yeager operates with elevated Administrator privileges and loads a kernel-level network driver (WinDivert), running packet-interception software on an unpatched OS presents an unacceptable privilege escalation hazard.
-> 2. **Native DoH Architecture vs. Technical Debt:** Yeager integrates directly with Windows 11's native `DNS_INTERFACE_SETTINGS3` APIs in `dnsapi.dll` for zero-overhead, system-level DNS-over-HTTPS. Supporting legacy Windows 10 would require embedding a third-party DoH proxy daemon, vastly expanding binary footprint, technical debt, and attack surface.
-> 3. **Focus on Quality:** We prioritize security, native performance, and stability over legacy compatibility. Backward compatibility for Windows 10 will **not** be provided.
+| To… | Do this |
+|---|---|
+| Turn everything on or off | The power button on the home page (click the logo to get there) |
+| Use the engine only for some sites | **Engine** › **Apply to** › *Domain list*, then add the domains |
+| Get the best TCP setting for your link | **TCP** › **Diagnose** › **Apply suggestion** |
+| Confirm DNS is encrypted | **DNS** › **Check** |
+| Undo every TCP change | **TCP** › **Restore Windows defaults** |
+| Check for a new version now | **General** › **Updates** › **Check** |
 
-## Installation
+## System requirements
 
-1. Download `Yeager-Setup-<version>.exe` from the
-   [latest release](https://github.com/iamcino/Yeager/releases/latest).
-2. Run it and accept the administrator prompt.
-3. If your antivirus or firewall asks about `yeager.exe`, allow it. Yeager
-   needs network access for encrypted DNS and the speed test.
+- **Windows 11 x64** (build 22000 or later) or **Windows Server 2022** (build 20348 or later).
+- **Administrator rights**: changing TCP and DNS settings and loading the
+  network driver are system-level operations. The app asks once when it starts.
+- BBRv2 needs Windows 11 22H2 or later; older builds fall back to CUBIC or CTCP.
 
-The portable zip (`Yeager-<version>-portable-x64.zip`) runs without
-installation.
+Windows 10 is not supported and won't be. It no longer gets security updates,
+which matters for software that runs as administrator with a network driver,
+and it lacks the native DNS over HTTPS APIs that Yeager builds on. The
+installer and the app both refuse to run on older Windows.
 
-### Updating
+## Updates
 
-Yeager checks for a new release when it starts and every few hours (turn this
-off under **General → Updates**). A new version shows as **↑ Update to …** in
-the sidebar and the tray menu, and nothing installs until you press
-**Update**. Yeager then downloads the new `yeager.exe` from GitHub, checks it
-against the release's SHA-256 checksum, puts it in place of the running one,
+Yeager checks for a new version when it starts and every 6 hours. When one is
+out, **↑ Update to …** shows in the sidebar and the tray menu. Nothing is
+installed until you press **Update**. Yeager then downloads the new
+`yeager.exe`, checks it against the release's `SHA256SUMS.txt`, swaps it in,
 restores TCP and DNS, and restarts (with the engine back on if it was on).
-**General → Updates → Check** looks right away. Installed and portable copies
-update the same way.
 
-## Getting started
+To check right away: **General › Updates › Check**. To stop automatic checks,
+turn them off in the same place.
 
-1. Open Yeager and click the logo to reach the **home** page.
-2. Press the power button. Yeager turns on encrypted DNS and the engine.
-3. To limit the engine to particular sites, open **Engine**, set
-   **Apply to** to *Domain list*, and add the domains you need.
-4. Optionally open **TCP**, press **Diagnose**, then **Apply suggestion**.
-5. Open **DNS** and press **Check** to confirm lookups are encrypted.
+The in-app updater reads releases from GitHub. If GitHub is unreachable from
+your network, download the latest installer [from GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
+and run it over your current installation; your settings are kept.
 
-## How it works
+## FAQ
+
+**Is Yeager a VPN? Does it hide my IP address?**
+No. Your connections go directly to the sites you visit, from your own IP
+address. Yeager does not anonymise you.
+
+**Will it slow down my games?**
+No noticeable effect. If you'd rather it not touch games at all, use the
+*Domain list* scope so the engine only works on the sites you choose.
+
+**Does Yeager collect any data?**
+No account, no telemetry, no analytics, no ads. Settings stay in
+`%LOCALAPPDATA%\Yeager`. The only connections it makes on its own are to your
+DNS provider, Cloudflare once at start to name your ISP, GitHub for the update
+check, and Cloudflare and Google when you run **Diagnose** or *Auto*. See the
+[privacy policy](PRIVACY.md).
+
+**Why both GitHub and GitLab?**
+Every release is published in both places. If one of them is unreachable from
+your network, download from the other. The source code is on both
+[GitHub](https://github.com/iamcino/Yeager) and [GitLab](https://gitlab.com/cino-group/yeager) too.
+
+**Something stopped working. How do I undo everything?**
+Turn Yeager off, or quit it: TCP and DNS go back to how they were. **TCP ›
+Restore Windows defaults** also resets TCP to Windows' own defaults.
+
+**How do I uninstall it?**
+Turn Yeager off first, then **Settings › Apps › Yeager › Uninstall**. The
+uninstaller stops Yeager, removes its sign-in task and deletes
+`%LOCALAPPDATA%\Yeager`. Anything left over is restored the next time Yeager
+starts, if you reinstall.
+
+**Is there a command-line version?**
+`levi.exe` runs the connection engine without the interface, for servers and
+scripts. It isn't part of the regular downloads; build it from source as
+described in [`crates/levi/CLI.md`](crates/levi/CLI.md).
+
+## Troubleshooting
+
+### Windows and antivirus warnings
+
+Yeager releases are digitally signed, but with the project's own certificate
+rather than a commercial one. So Windows may show "Windows protected your PC"
+or "Unknown publisher" the first time. Click **More info › Run anyway**.
+
+Some antivirus products also watch Yeager closely, because it loads the
+WinDivert network driver and runs a local DNS resolver. Allow `yeager.exe` in
+your antivirus and firewall. To be sure your download is genuine:
+
+- **Download only** from the official release pages on [GitHub](https://github.com/iamcino/Yeager/releases) or [GitLab](https://gitlab.com/cino-group/yeager/-/releases).
+- **Check the signature:** open PowerShell in the file's folder and run
+  `(Get-AuthenticodeSignature .\yeager.exe).SignerCertificate.Thumbprint`.
+  For current releases it must print `9131F99C0B198E81FBA0F5818D0637B4A14D4CF1`.
+- **Check the hash** against `SHA256SUMS.txt` from the same release.
+
+Every thumbprint Yeager has used, the VirusTotal results and the full list of
+network endpoints are in [SECURITY.md](SECURITY.md#verifying-a-download).
+
+### A site still doesn't load
+
+- Make sure both the engine and encrypted DNS show as on, and run **DNS › Check**.
+- On the **Engine** page, try the *Hardened* profile; some networks need it.
+- With *Domain list*, check that the site's domain is in the list. Sites often
+  load parts from other domains too (images, video, APIs); add those as well,
+  or switch to *All*.
+
+### My Internet feels slower
+
+Run **TCP › Diagnose** and apply the suggestion, or press **Restore Windows
+defaults**. If you're inside a VPN tunnel, use the *Auto* or *Fast* profile.
+
+## For developers
+
+Yeager is written in Rust with a [Slint](https://slint.dev) interface. It
+is split into crates: `app` (interface, tray, orchestration), `levi`
+(connection engine on WinDivert), `erwin` (TCP), `hange` (DNS over HTTPS) and
+`common`.
 
 ```
  Browser / apps
        │
        ▼
- Windows TCP/IP stack ──── Erwin: congestion control (BBRv2 / CUBIC / CTCP)
+ Windows TCP/IP ──── Erwin: congestion control (BBRv2 / CUBIC / CTCP)
        │
-       ├── DNS queries ──► Hange: local DNS ──► DoH (HTTP/3 or HTTP/2) ──► Cloudflare / Google / AdGuard
+       ├── DNS ────► Hange: local resolver ──► DoH (HTTP/3 or HTTP/2) ──► Cloudflare / Google / AdGuard
        │
-       └── HTTPS ───────► Levi: connection engine (All / Domain list) ──► Internet
+       └── HTTPS ──► Levi: connection engine (All / Domain list) ──► Internet
 ```
 
-Each part can run independently, except that the engine always runs with
-encrypted DNS. More detail is in the [design document](docs/DESIGN.md).
+- [Design document](docs/DESIGN.md): how each part works and why.
+- [Build and release](docs/BUILD.md): building from source, the installer, signing, and publishing on GitHub and GitLab.
+- [Contributing](CONTRIBUTING.md): bug reports and pull requests.
 
-Repository layout:
+## License and credits
 
-| Crate | Role |
-|-------|------|
-| `crates/app` | Slint UI, system tray, orchestration (`yeager.exe`) |
-| `crates/levi` | Connection engine library and `levi.exe` CLI |
-| `crates/erwin` | TCP congestion control, configuration, launch at login |
-| `crates/hange` | Local DNS over HTTPS (HTTP/3 and HTTP/2) and system DoH setup |
-| `crates/common` | Shared types, configuration model, helpers |
+Copyright (C) 2026 Cino and the Yeager contributors
 
-## Privacy
+Yeager is free, open-source software under the [MIT License](LICENSE). It
+includes third-party components under their own licenses: the WinDivert
+driver (LGPL v3), the Slint toolkit (Slint Royalty-free License 2.0), the Be
+Vietnam Pro font (SIL OFL 1.1) and Rust crates, mostly MIT or Apache-2.0.
+Details are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-Yeager has no account, no telemetry, no analytics and no ads. Settings stay on
-your computer in `%LOCALAPPDATA%\Yeager`. The only connections it makes on its
-own are to your chosen DNS provider, to Cloudflare once at start to name your
-ISP, to GitHub to look for a new release
-(unless you turn that off), and, when you run **Diagnose** or **Auto**, to
-Cloudflare and Google for pings and a short speed test. See
-[PRIVACY.md](PRIVACY.md).
-
-## Uninstalling
-
-Use **Settings → Apps → Yeager → Uninstall**. The uninstaller stops Yeager,
-removes the launch-at-login task and deletes `%LOCALAPPDATA%\Yeager`. Turn
-Yeager off before uninstalling so your original TCP and DNS settings are put
-back immediately (they are also restored the next time Yeager starts).
-
-## Building from source
-
-You need the Rust toolchain and a resource compiler for the embedded icon and
-administrator manifest: `windres` (from [w64devkit](https://github.com/skeeto/w64devkit)
-or MSYS2) for the GNU toolchain, or the Windows SDK `rc.exe` for MSVC.
-
-```powershell
-# builds the app and copies it to dist\yeager.exe
-./build.ps1
-
-# or manually
-cargo build --release            # target\release\yeager.exe
-cargo build --release -p levi    # target\release\levi.exe (CLI)
-```
-
-Build the installer with [Inno Setup](https://jrsoftware.org/isinfo.php):
-
-```powershell
-iscc installer\setup.iss         # dist\Yeager-Setup-<version>.exe
-```
-
-From Linux you can type-check the Windows build with
-`cargo check --target x86_64-pc-windows-gnu` (needs `mingw-w64`).
-
-The logo is the vector `assets/logo/yeager.svg`. The script renders it to the
-1024 px master `assets/icons/src/yeager.png` and reduces every icon size from
-it natively. The sidebar mark is drawn from the same wing path, and while
-Yeager is on the tray icon's rim and wing light up in the UI accent color:
-
-```bash
-python3 tools/make_icons.py      # needs Pillow, numpy and rsvg-convert (librsvg)
-```
-
-Contributions are welcome; please read [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## FAQ
-
-**Is Yeager a VPN? Does it hide my IP address?**
-No. Your connections go directly to the sites you visit from your own IP
-address. Yeager does not anonymise you.
-
-**Why does it need administrator rights?**
-Changing TCP and DNS settings and loading the network driver are
-system-level operations in Windows.
-
-**My antivirus or firewall complained.**
-Yeager loads the WinDivert network driver and runs a local DNS resolver,
-which some security products watch closely. Allow `yeager.exe` in your
-antivirus and firewall. Yeager never uses hidden PowerShell or fake packets.
-Current scan result and how to verify the binary yourself:
-[Security & VirusTotal Inspection](#security--virustotal-inspection).
-
-**Will it slow down my games?**
-No noticeable effect on general traffic, but if you prefer, use the
-*Domain list* scope so the engine only touches the sites you choose.
-
-**Will Yeager support Windows 10?**
-No. Windows 10 reached End of Life (EOL) in October 2025 and lacks native DNS-over-HTTPS APIs. Running kernel-level network interception with Administrator privileges on an unpatched, unsupported OS presents an unacceptable security risk. Both the installer and the binaries enforce a strict runtime block for builds prior to Windows 11 / Server 2022 (Build 20348+).
-
-**Something stopped working. How do I undo everything?**
-Turn Yeager off, or press **Restore Windows defaults** on the TCP page.
-Quitting the app also restores TCP and DNS settings.
-
-## Security & VirusTotal Inspection
-
-Yeager runs at the system level (Administrator privileges + the WinDivert network driver), so we publish binary inspection results instead of leaving users to guess.
-
-### Release scan results
-
-Each GitHub release attaches `virustotal-v<version>.json` containing the SHA-256, analysis link and vendor statistics at scan time. Figures bind to the release's signed assets, never local builds.
-
-### Why the false positive
-
-- **Self-signed certificate, no CA-backed reputation:** Yeager releases are Authenticode-signed with a self-signed certificate for integrity verification and publisher pinning. This is not a commercial OV/EV code-signing certificate, so SmartScreen and some heuristic/ML engines may still flag the binary until public reputation is established.
-- **Signature verification:** Compare the signing certificate thumbprint (`0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`) with the public value pinned in `docs/signing/Yeager-codesign.cer`. You do not need to install the certificate to verify integrity.
-- **`obfuscated` tag:** from `.rsrc` entropy 7.92, normal for Rust embedding 9 multi-resolution PNG icons + a manifest. DetectItEasy reports no packer/protector; the source contains zero obfuscation or packing.
-- Mobile engines reporting `Unable to process file type` simply do not parse Windows x64 PE.
-
-### Network behavior (all IOCs)
-
-| Endpoint | Purpose |
-|---|---|
-| `1.1.1.1` / `1.0.0.1` | DNS-over-HTTPS (Hange) |
-| `github.com/iamcino/Yeager/releases/latest` | Update check |
-| `speed.cloudflare.com` | Latency probe (Erwin) |
-| `www.ssl.com` | Root CA fetch via TLS AIA during chain validation |
-
-*(All seven IPs in the Relations tab belong to three known autonomous systems: AS13335 Cloudflare — DNS `1.1.1.1`/`1.0.0.1` and CDN for `speed.cloudflare.com`; AS36459 GitHub; AS14618 AWS — related cloud infrastructure. None is a third-party endpoint or C2.)*
-
-No C2, no telemetry, no exfiltration in the source. *(The 1/92 flag on IP `1.1.1.1` is Cloudflare Anycast's own reputation, unrelated to this binary.)*
-
-### Verify it yourself
-
-Do not trust — check:
-
-```powershell
-Get-FileHash -Algorithm SHA256 .\yeager.exe
-```
-Compare against the hash in the link above, or build from source:
-```bash
-cargo build --release
-```
-
-> Results bind to each release's signed SHA-256 at analysis time. VirusTotal may periodically re-analyze and adjust vendor counts; each release publishes its own up-to-date metadata report.
-
-## Disclaimer
-
-Yeager is free, open-source software provided **"as is", without warranty of any kind** under the [MIT License](LICENSE).
-
-- **Not a VPN or proxy:** Yeager does not hide your identity or IP address, and is not an anonymity tool.
-- **Your responsibility:** You are responsible for using Yeager in compliance with applicable local laws, regulations, and provider terms.
-- **System changes:** Yeager adjusts Windows TCP and DNS parameters and loads the WinDivert driver. While settings are automatically backed up and restored upon exit, the authors assume no liability for connectivity interruptions, data loss, or system issues.
-- **Third-party services:** Cloudflare and Google DNS/speed-test services operate under their own terms and privacy policies.
-- **No affiliation:** Yeager is an independent project and is not affiliated with Microsoft, Cloudflare, Google, WinDivert, Slint, or *Attack on Titan*.
-
-See the full [DISCLAIMER.md](DISCLAIMER.md) for details.
-
-## License and third-party software
-
-Yeager's source code is released under the [MIT License](LICENSE).
-
-The app includes third-party components under their own licenses: the
-WinDivert driver (LGPL v3), the Slint UI toolkit (Slint Royalty-free License
-2.0), the Be Vietnam Pro font (SIL OFL 1.1) and a number of Rust crates (mostly
-MIT / Apache-2.0). Details are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-
-Please read the [disclaimer](DISCLAIMER.md) before use. Report security issues
-as described in [SECURITY.md](SECURITY.md). Changes are listed in the
-[changelog](CHANGELOG.md).
+Yeager is provided "as is", without warranty. You are responsible for using it
+in line with local laws and your provider's terms. It is an independent
+project, not affiliated with Microsoft, Cloudflare, Google, WinDivert, Slint
+or *Attack on Titan*. See the [disclaimer](DISCLAIMER.md) and the
+[security policy](SECURITY.md).
 
 <p align="center">
   <a href="https://slint.dev">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/icons/made-with-slint-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="assets/icons/made-with-slint-light.svg">
-      <img alt="Made with Slint" src="assets/icons/made-with-slint-light.svg" height="50">
-    </picture>
+    <img alt="Made with Slint" src="assets/icons/made-with-slint.png" height="56">
+
   </a>
 </p>
