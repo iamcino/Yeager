@@ -248,15 +248,19 @@ try {
 
     # ------------------------------------------------------------ notes
     function Get-Section($file) {
-        $section = @(); $found = $false
-        foreach ($line in Get-Content $file -Encoding utf8) {
-            if ($line.StartsWith('## ')) {
-                if ($found) { break }
-                $found = $line -match "^## \[?$([regex]::Escape($version))\]?(\s|$)"
-            } elseif ($found) { $section += $line }
+        # a tag cut before its changelog entry was written (v1.1.3) has no section for itself:
+        # fall back to the changelog of the checkout running this script
+        foreach ($path in @((Join-Path $work $file), (Join-Path $Repo $file))) {
+            $section = @(); $found = $false
+            foreach ($line in Get-Content $path -Encoding utf8) {
+                if ($line.StartsWith('## ')) {
+                    if ($found) { break }
+                    $found = $line -match "^## \[?$([regex]::Escape($version))\]?(\s|$)"
+                } elseif ($found) { $section += $line }
+            }
+            if ($found) { return ($section -join "`n").Trim() }
         }
-        if (-not $found) { throw "$file has no section for $version" }
-        ($section -join "`n").Trim()
+        throw "$file has no section for $version"
     }
     $blob = "$GitLab/$Project/-/blob/master"
     $notes = (Get-Section CHANGELOG.md) + "`n`n## Tiếng Việt`n`n" + (Get-Section CHANGELOG.vi.md) +
