@@ -256,10 +256,7 @@ dùng Yeager đúng pháp luật nơi bạn ở và điều khoản của nhà m
 
 <p align="center">
   <a href="https://slint.dev">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/icons/made-with-slint-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="assets/icons/made-with-slint-light.svg">
-      <img alt="Made with Slint" src="assets/icons/made-with-slint-light.svg" height="50">
-    </picture>
+    <img alt="Made with Slint" src="assets/icons/made-with-slint.png" height="56">
+
   </a>
 </p>
