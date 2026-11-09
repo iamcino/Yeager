@@ -8,6 +8,10 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **New code signing certificate:** releases are now signed with a new Yeager certificate, thumbprint `9131F99C0B198E81FBA0F5818D0637B4A14D4CF1` (`docs/signing/Yeager-codesign.cer`). It replaces `0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`, whose private key is no longer usable. Releases are also published on [GitLab](https://gitlab.com/cino-group/yeager/-/releases).
+
 ## [1.2.0] - 2026-11-03
 
 ### Changed

@@ -8,6 +8,10 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Thay đổi
+
+- **Chứng chỉ ký số mới:** các bản phát hành từ nay được ký bằng chứng chỉ Yeager mới, thumbprint `9131F99C0B198E81FBA0F5818D0637B4A14D4CF1` (`docs/signing/Yeager-codesign.cer`), thay cho `0E9C6BBE35AC13E58F951C446F2B524FA7297DCA` vì khóa riêng của chứng chỉ cũ không còn dùng được. Bản phát hành cũng được đăng trên [GitLab](https://gitlab.com/cino-group/yeager/-/releases).
+
 ## [1.1.3] - 2026-11-03
 
 ### Thêm

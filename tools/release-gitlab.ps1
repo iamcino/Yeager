@@ -102,6 +102,10 @@ Run git -C $Repo worktree add --detach $work $commit
 
 try {
     Set-Location $work
+    # signing always uses this checkout's helpers and pinned certificate, so an older tag is
+    # signed (and checked) with the current key after a key rotation
+    Copy-Item (Join-Path $Repo 'tools\signing\*.ps1') tools\signing -Force
+    Copy-Item (Join-Path $Repo 'docs\signing\Yeager-codesign.cer') docs\signing -Force
     $cargo = Get-Content Cargo.toml -Raw
     if ($cargo -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') { throw 'No workspace version in Cargo.toml' }
     $version = $Matches[1]
@@ -214,7 +218,7 @@ try {
 
             # -------------------------------------------------------- installer
             Step 'Building the installer'
-            $iscc = (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+            $iscc = Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
             if (-not $iscc) {
                 $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe",
                           "$env:LOCALAPPDATA\Programs\Inno Setup*\ISCC.exe", 'C:\Soft\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue |
@@ -263,9 +267,12 @@ try {
         throw "$file has no section for $version"
     }
     $blob = "$GitLab/$Project/-/blob/master"
+    $thumb = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 (Join-Path $work 'docs\signing\Yeager-codesign.cer')).Thumbprint
     $notes = (Get-Section CHANGELOG.md) + "`n`n## Tiếng Việt`n`n" + (Get-Section CHANGELOG.vi.md) +
         "`n`n---`n`nRun ``$setup`` to install, or unzip the portable build and run ``yeager.exe`` as administrator. " +
-        "Requires Windows 11 or Windows Server 2022, x64.`n`n[Changelog]($blob/CHANGELOG.md) · [Nhật ký thay đổi]($blob/CHANGELOG.vi.md)`n"
+        "Requires Windows 11 or Windows Server 2022, x64.`n`n" +
+        "Signed with the Yeager code signing certificate, thumbprint ``$thumb`` (``Yeager-codesign.cer`` in this release). " +
+        "``levi.exe`` is not part of this release.`n`n[Changelog]($blob/CHANGELOG.md) · [Nhật ký thay đổi]($blob/CHANGELOG.vi.md)`n"
     [IO.File]::WriteAllText("$out\release-notes.md", $notes, (New-Object Text.UTF8Encoding $false))
 
     $files = @(Get-ChildItem $out -File | Where-Object { $_.Name -ne 'release-notes.md' -and $_.Name -notlike 'levi*' } | ForEach-Object Name)

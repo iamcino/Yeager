@@ -336,7 +336,7 @@ Mỗi GitHub release đính kèm `virustotal-v<version>.json` chứa SHA-256, li
 ### Vì sao có cảnh báo giả
 
 - **Chứng chỉ tự ký, chưa có danh tiếng CA:** Yeager đã được ký Authenticode bằng chứng chỉ tự ký để bảo đảm tính toàn vẹn và cho phép ghim mã dấu vân tay. Đây chưa phải chứng chỉ ký số thương mại do CA xác minh danh tính, nên SmartScreen và một số engine heuristic/ML vẫn có thể cảnh báo khi chưa đủ danh tiếng công khai.
-- **Tự kiểm chứng chữ ký:** So sánh dấu vân tay chứng chỉ ký (`0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`) với giá trị công khai trong `docs/signing/Yeager-codesign.cer`. Không cần cài chứng chỉ vào máy nếu bạn chỉ muốn xác minh tính toàn vẹn.
+- **Tự kiểm chứng chữ ký:** So sánh dấu vân tay chứng chỉ ký (`9131F99C0B198E81FBA0F5818D0637B4A14D4CF1`) với giá trị công khai trong `docs/signing/Yeager-codesign.cer`. Không cần cài chứng chỉ vào máy nếu bạn chỉ muốn xác minh tính toàn vẹn.
 - **Nhãn `obfuscated`:** do entropy section `.rsrc` = 7.92, hệ quả chuẩn của Rust khi nhúng 9 icon PNG đa phân giải + manifest. DetectItEasy không phát hiện packer/protector nào; mã nguồn không chứa bước làm rối hay đóng gói.
 - Vài engine di động báo `Unable to process file type` vì chúng không phân tích PE x64.
 

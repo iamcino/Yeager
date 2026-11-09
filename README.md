@@ -337,7 +337,7 @@ Each GitHub release attaches `virustotal-v<version>.json` containing the SHA-256
 ### Why the false positive
 
 - **Self-signed certificate, no CA-backed reputation:** Yeager releases are Authenticode-signed with a self-signed certificate for integrity verification and publisher pinning. This is not a commercial OV/EV code-signing certificate, so SmartScreen and some heuristic/ML engines may still flag the binary until public reputation is established.
-- **Signature verification:** Compare the signing certificate thumbprint (`0E9C6BBE35AC13E58F951C446F2B524FA7297DCA`) with the public value pinned in `docs/signing/Yeager-codesign.cer`. You do not need to install the certificate to verify integrity.
+- **Signature verification:** Compare the signing certificate thumbprint (`9131F99C0B198E81FBA0F5818D0637B4A14D4CF1`) with the public value pinned in `docs/signing/Yeager-codesign.cer`. You do not need to install the certificate to verify integrity.
 - **`obfuscated` tag:** from `.rsrc` entropy 7.92, normal for Rust embedding 9 multi-resolution PNG icons + a manifest. DetectItEasy reports no packer/protector; the source contains zero obfuscation or packing.
 - Mobile engines reporting `Unable to process file type` simply do not parse Windows x64 PE.
 
