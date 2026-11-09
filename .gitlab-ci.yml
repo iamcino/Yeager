@@ -1,12 +1,16 @@
 # Yeager on GitLab.
 #
-# check    every push and merge request: tests and a release build, on GitLab's hosted
-#          Windows runner (no runner of your own needed). Rust is installed in the job.
+# Runs on the self-hosted Windows runner tagged "yeager-windows" (Garen-PC, shell executor,
+# PowerShell, running as LocalSystem; it also builds EasyKey). The runner needs the Visual
+# Studio C++ build tools, Inno Setup 6+ and the Windows SDK (signtool). Rust is installed by
+# the job itself into <runner folder>\rust the first time, so it does not depend on any
+# user's profile.
+#
+# check    every push and merge request: tests and a release build.
 # release  build, sign, installer, package and publish through tools/release-gitlab.ps1.
-#          Only run by hand, on master or a version tag, and only on a self-hosted Windows
-#          runner tagged "yeager-windows" that has the signing tools. Without such a runner
-#          it simply waits; it never fails the pipeline. Releases are normally made from a
-#          developer machine with the same script (see docs/BUILD.md).
+#          Only run by hand, on master or a version tag; it never fails the pipeline.
+#          Releases are normally made from a developer machine with the same script
+#          (see docs/BUILD.md).
 #
 # Protected CI/CD variables used by the release job (Settings > CI/CD > Variables):
 #   CODESIGN_PFX_BASE64    the signing PFX, base64 (masked, protected)
@@ -16,6 +20,9 @@
 # levi is excluded everywhere: it is never built for or shipped with a release.
 
 stages: [test, release]
+
+default:
+  tags: [yeager-windows]
 
 workflow:
   rules:
@@ -28,28 +35,35 @@ workflow:
 variables:
   GIT_DEPTH: "0"
   CARGO_TERM_COLOR: never
-  CARGO_INCREMENTAL: "0"
+
+# Windows PowerShell treats anything a native tool writes to stderr (cargo's progress) as an
+# error, so failures are judged by exit codes, not by $ErrorActionPreference.
+.rust: &rust |
+  $ErrorActionPreference = 'Continue'
+  $rust = Join-Path (Split-Path $env:CI_BUILDS_DIR) 'rust'
+  $env:RUSTUP_HOME = Join-Path $rust 'rustup'
+  $env:CARGO_HOME = Join-Path $rust 'cargo'
+  $env:Path = "$env:CARGO_HOME\bin;$env:Path"
+  if (-not (Test-Path "$env:CARGO_HOME\bin\cargo.exe")) {
+    New-Item -ItemType Directory -Force $rust | Out-Null
+    $init = Join-Path $rust 'rustup-init.exe'
+    Invoke-WebRequest -UseBasicParsing https://win.rustup.rs/x86_64 -OutFile $init
+    & $init -y --no-modify-path --profile minimal --default-toolchain stable --default-host x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) { throw 'rustup-init failed' }
+  } else {
+    rustup update stable --no-self-update
+    if ($LASTEXITCODE -ne 0) { Write-Host 'rustup update failed, using the installed toolchain' }
+  }
+  rustc --version
+  if ($LASTEXITCODE -ne 0) { throw 'Rust is not available' }
 
 check:
   stage: test
-  tags: [saas-windows-medium-amd64]
   rules:
     - if: $CI_COMMIT_TAG == null
   timeout: 90m
-  cache:
-    key: cargo-$CI_COMMIT_REF_SLUG
-    paths: [target/]
   script:
-    - $ErrorActionPreference = 'Stop'
-    - |
-      if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        Invoke-WebRequest -UseBasicParsing https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
-        .\rustup-init.exe -y --profile minimal --default-toolchain stable --default-host x86_64-pc-windows-msvc
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        Remove-Item rustup-init.exe
-      }
-      $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-      rustc --version
+    - *rust
     - cargo test --locked --workspace --exclude levi
     - if ($LASTEXITCODE -ne 0) { exit 1 }
     - cargo build --locked --release -p yeager
@@ -61,7 +75,6 @@ check:
 
 release:
   stage: release
-  tags: [yeager-windows]
   rules:
     - if: $CI_COMMIT_TAG
       when: manual
@@ -71,9 +84,7 @@ release:
       allow_failure: true
   # the signing key never touches the disk outside this job's temp folder
   script:
-    - $ErrorActionPreference = 'Stop'
-    - $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-    - if (Test-Path 'C:\Soft\w64devkit\bin') { $env:Path = "C:\Soft\w64devkit\bin;$env:Path" }
+    - *rust
     - |
       if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
         throw 'CODESIGN_PFX_BASE64 / CODESIGN_PFX_PASSWORD are not available. Make them protected variables and run on master or a protected tag.'
