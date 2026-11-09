@@ -8,6 +8,8 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-11-09
+
 ### Changed
 - **Updates from GitHub or GitLab:** the update check asks both sites at once and takes the newest version either has, then downloads from that site, or from the other one if the download fails. Updates keep working when one site is unreachable.
 - **About** shows links to the project on GitHub and GitLab, each with its logo.
