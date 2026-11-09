@@ -144,9 +144,11 @@ restores TCP and DNS, and restarts (with the engine back on if it was on).
 To check right away: **General › Updates › Check**. To stop automatic checks,
 turn them off in the same place.
 
-The in-app updater reads releases from GitHub. If GitHub is unreachable from
-your network, download the latest installer [from GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
-and run it over your current installation; your settings are kept.
+Yeager asks both GitHub and GitLab, so updates keep working when one of them
+is unreachable from your network. Versions up to 1.1.4 only ask GitHub: if an
+older copy says it cannot check for updates, download the latest installer
+[from GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
+once and run it over your current installation; your settings are kept.
 
 ## FAQ
 
@@ -161,8 +163,8 @@ No noticeable effect. If you'd rather it not touch games at all, use the
 **Does Yeager collect any data?**
 No account, no telemetry, no analytics, no ads. Settings stay in
 `%LOCALAPPDATA%\Yeager`. The only connections it makes on its own are to your
-DNS provider, Cloudflare once at start to name your ISP, GitHub for the update
-check, and Cloudflare and Google when you run **Diagnose** or *Auto*. See the
+DNS provider, Cloudflare once at start to name your ISP, GitHub and GitLab for
+the update check, and Cloudflare and Google when you run **Diagnose** or *Auto*. See the
 [privacy policy](PRIVACY.md).
 
 **Why both GitHub and GitLab?**

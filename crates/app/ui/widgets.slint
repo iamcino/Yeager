@@ -423,6 +423,66 @@ export component ValueRow {
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
+// A link row: a site's logo, its name and address, and "›"; opens it on click.
+export component LinkRow {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> subtitle;
+    callback clicked();
+
+    Rectangle {
+        background: link-ta.has-hover ? Theme.sidebar-sel : transparent;
+        border-radius: Theme.r-control;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: 22px;
+                height: 22px;
+                image-fit: contain;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 3px;
+            Text {
+                text: root.title;
+                color: Theme.label;
+                font-size: Theme.fs-body;
+                font-weight: 500;
+            }
+            if root.subtitle != "": Text {
+                text: root.subtitle;
+                color: Theme.label2;
+                font-size: Theme.fs-sub;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            min-height: 36px;
+            Text {
+                text: "›";
+                color: Theme.label2;
+                font-size: 16px;
+                vertical-alignment: center;
+            }
+        }
+    }
+    link-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // Large round on/off button for the home page.
 export component PowerButton {
     in property <bool> active;

@@ -575,9 +575,10 @@ fn main() -> Result<(), slint::PlatformError> {
             });
         });
     }
-    ui.on_open_repo(|| {
+    ui.on_open_repo(|site| {
+        let url = if site == 1 { GITLAB_URL } else { REPO_URL };
         // Handed to the shell so the browser does not inherit admin rights.
-        let _ = common::process::hidden("explorer").arg(REPO_URL).spawn();
+        let _ = common::process::hidden("explorer").arg(url).spawn();
     });
     // The network card: addresses looked up on demand and every few minutes
     // while the window shows.
@@ -921,7 +922,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    ui.on_open_download_page(|| updater::open_url(updater::RELEASES_PAGE));
+    ui.on_open_download_page(|| updater::open_url(updater::releases_page()));
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
@@ -1223,6 +1224,7 @@ fn refresh_texts(ui: &MainWindow, cfg: &Config) {
 }
 
 const REPO_URL: &str = "https://github.com/iamcino/Yeager";
+const GITLAB_URL: &str = "https://gitlab.com/cino-group/yeager";
 
 /// Latency of each DNS provider, for the home and DNS pages.
 ///
