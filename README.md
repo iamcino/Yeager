@@ -189,8 +189,10 @@ memory, and undoes every system change it makes.
 
 ## Installation
 
-1. Download `Yeager-Setup-<version>.exe` from the
-   [latest release](https://github.com/iamcino/Yeager/releases/latest).
+1. Download `Yeager-Setup-<version>.exe` from the latest release on
+   [GitHub](https://github.com/iamcino/Yeager/releases/latest) or
+   [GitLab](https://gitlab.com/cino-group/yeager/-/releases). Both carry the
+   same signed files, so if one site is unreachable, use the other.
 2. Run it and accept the administrator prompt.
 3. If your antivirus or firewall asks about `yeager.exe`, allow it. Yeager
    needs network access for encrypted DNS and the speed test.

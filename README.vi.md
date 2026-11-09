@@ -190,8 +190,10 @@ và hoàn tác mọi thay đổi hệ thống mà nó tạo ra.
 
 ## Cài đặt
 
-1. Tải `Yeager-Setup-<phiên bản>.exe` từ
-   [bản phát hành mới nhất](https://github.com/iamcino/Yeager/releases/latest).
+1. Tải `Yeager-Setup-<phiên bản>.exe` từ bản phát hành mới nhất trên
+   [GitHub](https://github.com/iamcino/Yeager/releases/latest) hoặc
+   [GitLab](https://gitlab.com/cino-group/yeager/-/releases). Hai nơi có cùng
+   những file đã ký số, nếu một nơi không vào được thì tải ở nơi còn lại.
 2. Chạy file và đồng ý khi Windows hỏi quyền quản trị.
 3. Nếu phần mềm diệt virus hoặc tường lửa hỏi về `yeager.exe`, hãy cho phép.
    Yeager cần truy cập mạng cho DNS mã hóa và đo tốc độ.
