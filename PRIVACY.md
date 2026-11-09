@@ -38,11 +38,12 @@ Uninstalling Yeager removes all of these.
   addresses. The local addresses are read from Windows; nothing is sent for
   them.
 - **Update check** (at start and every few hours, unless you turn it off under
-  General → Updates): a request to `github.com` to read the latest release
-  number. Only when you press **Update** is the new `yeager.exe` and its
-  checksum list downloaded from GitHub. GitHub sees your IP address, as with
-  any visit; see the
-  [GitHub privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
+  General → Updates): one request to `github.com` and one to `gitlab.com` to
+  read the latest release number. Only when you press **Update** are the new
+  `yeager.exe` and its checksum list downloaded, from whichever of the two has
+  the newest version. Both see your IP address, as with any visit; see the
+  [GitHub privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement)
+  and the [GitLab privacy statement](https://about.gitlab.com/privacy/).
 
 The connection engine works locally on your own traffic and sends nothing
 anywhere by itself. Yeager does not read or record the content of your
@@ -88,10 +89,12 @@ Gỡ cài đặt Yeager sẽ xoá toàn bộ những mục trên.
   `speed.cloudflare.com/meta` qua IPv4 và một qua IPv6, để hiện địa chỉ công
   cộng của bạn. Địa chỉ nội bộ đọc từ Windows, không gửi gì đi.
 - **Kiểm tra cập nhật** (khi mở và vài giờ một lần, trừ khi bạn tắt ở Hệ thống
-  → Cập nhật): một yêu cầu tới `github.com` để đọc số phiên bản mới nhất. Chỉ
-  khi bạn bấm **Cập nhật** thì `yeager.exe` mới và danh sách mã kiểm tra mới
-  được tải từ GitHub. GitHub thấy địa chỉ IP của bạn như mọi lần truy cập; xem
-  [tuyên bố quyền riêng tư của GitHub](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
+  → Cập nhật): một yêu cầu tới `github.com` và một tới `gitlab.com` để đọc số
+  phiên bản mới nhất. Chỉ khi bạn bấm **Cập nhật** thì `yeager.exe` mới và danh
+  sách mã kiểm tra mới được tải, từ nơi có bản mới nhất. Cả hai thấy địa chỉ IP
+  của bạn như mọi lần truy cập; xem
+  [tuyên bố quyền riêng tư của GitHub](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement)
+  và [của GitLab](https://about.gitlab.com/privacy/).
 
 Engine kết nối chỉ làm việc cục bộ trên lưu lượng của chính bạn và không tự gửi
 gì đi đâu. Yeager không đọc hay ghi lại nội dung kết nối của bạn.

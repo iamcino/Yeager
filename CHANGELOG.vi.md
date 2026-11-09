@@ -8,6 +8,12 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-11-09
+
+### Thay đổi
+- **Cập nhật từ GitHub hoặc GitLab:** khi kiểm tra cập nhật, Yeager hỏi cả hai nơi cùng lúc và lấy phiên bản mới nhất, rồi tải từ nơi đó, hoặc từ nơi còn lại nếu tải không được. Không vào được một nơi thì vẫn cập nhật được.
+- Mục **Thông tin** có link tới dự án trên GitHub và GitLab, kèm biểu tượng của từng nơi.
+
 ## [1.1.4] - 2026-11-09
 
 ### Thay đổi

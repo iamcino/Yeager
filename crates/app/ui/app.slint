@@ -4,7 +4,7 @@ import "../../../assets/fonts/BeVietnamPro-SemiBold.ttf";
 import { Theme } from "theme.slint";
 import { Lang } from "lang.slint";
 import { DomainListSheet } from "domain_list_sheet.slint";
-import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, PowerButton, ScrollBar, BrandMark } from "widgets.slint";
+import { GroupBox, Row, RowSeparator, ToggleRow, Switch, Segmented, PillButton, RadioRow, Swatch, TextField, ValueRow, LinkRow, PowerButton, ScrollBar, BrandMark } from "widgets.slint";
 export { Theme } from "theme.slint";
 export { Lang } from "lang.slint";
 
@@ -298,7 +298,8 @@ export component MainWindow inherits Window {
     callback set-doh-provider(int);
     callback set-doh-http3(bool);
     callback test-dns();
-    callback open-repo();
+    // 0 GitHub, 1 GitLab
+    callback open-repo(int);
     callback set-connect-on-launch(bool);
     callback set-launch-login(bool);
     callback set-dark(bool);
@@ -654,11 +655,28 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     RowSeparator { }
-                                    ValueRow {
+                                    Row {
                                         title: Lang.t("Nhà phát triển", "Developer");
+                                        Text {
+                                            text: "Cino";
+                                            color: Theme.label2;
+                                            font-size: Theme.fs-body;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    RowSeparator { }
+                                    LinkRow {
+                                        icon: Theme.dark ? @image-url("../../../assets/links/github-dark.svg") : @image-url("../../../assets/links/github.svg");
+                                        title: "GitHub";
                                         subtitle: "github.com/iamcino/Yeager";
-                                        value: "Cino";
-                                        clicked => { root.open-repo(); }
+                                        clicked => { root.open-repo(0); }
+                                    }
+                                    RowSeparator { }
+                                    LinkRow {
+                                        icon: @image-url("../../../assets/links/gitlab.svg");
+                                        title: "GitLab";
+                                        subtitle: "gitlab.com/cino-group/yeager";
+                                        clicked => { root.open-repo(1); }
                                     }
                                     RowSeparator { }
                                     Row {

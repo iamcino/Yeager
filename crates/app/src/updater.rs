@@ -1,19 +1,88 @@
-//! Updates `yeager.exe` in place from GitHub Releases, the way EasyKey does.
+//! Updates `yeager.exe` in place from the project's releases, the way EasyKey
+//! does.
 //!
-//! The latest version is the tag `releases/latest` redirects to. The new exe is
-//! downloaded over HTTPS (WinHTTP, so the Windows proxy and certificate store
-//! apply) and checked against the SHA-256 in the release's `SHA256SUMS.txt`.
-//! The running exe is renamed to `yeager.old.exe`, the new one takes its name
-//! and starts once this one has put Windows back, and the old file is deleted
-//! on the next start. Nothing is installed without asking.
+//! Every release is published on GitHub and on GitLab. Both are asked at once;
+//! the newest version either of them has wins, and if one site cannot be
+//! reached (blocked, down, or the repository unavailable) the other one is
+//! enough. The latest version is the tag each site's "latest release" link
+//! redirects to. The new exe is downloaded over HTTPS (WinHTTP, so the Windows
+//! proxy and certificate store apply) and checked against the SHA-256 in the
+//! release's `SHA256SUMS.txt`, both from the same site. The running exe is
+//! renamed to `yeager.old.exe`, the new one takes its name and starts once this
+//! one has put Windows back, and the old file is deleted on the next start.
+//! Nothing is installed without asking.
 
 use common::lang::tr;
 use common::{t, Error, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-pub const RELEASES_PAGE: &str = "https://github.com/iamcino/Yeager/releases/latest";
-const RELEASE_TAG: &str = "https://github.com/iamcino/Yeager/releases/tag/";
-const RELEASE_DOWNLOAD: &str = "https://github.com/iamcino/Yeager/releases/download/";
+/// A site the releases are published on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    GitHub,
+    GitLab,
+}
+
+impl Source {
+    const ALL: [Source; 2] = [Source::GitHub, Source::GitLab];
+
+    /// Redirects to the newest release's page.
+    fn latest_url(self) -> &'static str {
+        match self {
+            Source::GitHub => "https://github.com/iamcino/Yeager/releases/latest",
+            Source::GitLab => "https://gitlab.com/cino-group/yeager/-/releases/permalink/latest",
+        }
+    }
+
+    fn releases_page(self) -> &'static str {
+        match self {
+            Source::GitHub => "https://github.com/iamcino/Yeager/releases/latest",
+            Source::GitLab => "https://gitlab.com/cino-group/yeager/-/releases",
+        }
+    }
+
+    fn release_page(self, version: &str) -> String {
+        match self {
+            Source::GitHub => format!("https://github.com/iamcino/Yeager/releases/tag/v{version}"),
+            Source::GitLab => format!("https://gitlab.com/cino-group/yeager/-/releases/v{version}"),
+        }
+    }
+
+    /// Where the files of `version` are; the file name goes after it.
+    fn download_base(self, version: &str) -> String {
+        match self {
+            Source::GitHub => format!("https://github.com/iamcino/Yeager/releases/download/v{version}/"),
+            Source::GitLab => format!("https://gitlab.com/cino-group/yeager/-/releases/v{version}/downloads/"),
+        }
+    }
+}
+
+/// The site the last check found the newest version on; tried first for the
+/// download, the release notes and the download page.
+static PREFERRED: AtomicU8 = AtomicU8::new(0);
+
+fn preferred() -> Source {
+    if PREFERRED.load(Ordering::Relaxed) == 1 { Source::GitLab } else { Source::GitHub }
+}
+
+fn set_preferred(source: Source) {
+    PREFERRED.store(if source == Source::GitLab { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Both sites, the preferred one first.
+fn sources() -> [Source; 2] {
+    match preferred() {
+        Source::GitHub => [Source::GitHub, Source::GitLab],
+        Source::GitLab => [Source::GitLab, Source::GitHub],
+    }
+}
+
+/// The page to send people to when an update cannot be installed here.
+pub fn releases_page() -> &'static str {
+    preferred().releases_page()
+}
+
 const EXE_NAME: &str = "yeager.exe";
 const OLD_EXE: &str = "yeager.old.exe";
 const NEW_EXE: &str = "yeager.new.exe";
@@ -48,9 +117,11 @@ pub fn is_newer(latest: &str) -> bool {
     }
 }
 
-/// The version in a `…/releases/tag/v1.2.3` URL.
+/// The version in a release page URL: `…/releases/tag/v1.2.3` on GitHub,
+/// `…/-/releases/v1.2.3` on GitLab.
 fn version_from_tag_url(url: &str) -> Option<String> {
-    let tag = url.trim().rsplit_once("/tag/")?.1;
+    let url = url.trim();
+    let tag = url.rsplit_once("/tag/").or_else(|| url.rsplit_once("/-/releases/"))?.1;
     let tag = tag.split(['?', '#']).next()?;
     parse_version(tag).map(|(a, b, c)| format!("{a}.{b}.{c}"))
 }
@@ -73,16 +144,45 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-/// The release notes of `version` on GitHub.
+/// The release notes of `version`.
 pub fn notes_url(version: &str) -> String {
-    format!("{RELEASE_TAG}v{version}")
+    preferred().release_page(version)
 }
 
-/// Asks GitHub for the latest release. Blocking; run it off the UI thread.
-pub fn latest() -> Result<String> {
-    let location = http::redirect_target(RELEASES_PAGE)?;
+fn latest_from(source: Source) -> Result<String> {
+    let location = http::redirect_target(source.latest_url())?;
     version_from_tag_url(&location)
-        .ok_or_else(|| Error::new(tr("GitHub trả về phiên bản không hợp lệ.", "GitHub returned an invalid version.")))
+        .ok_or_else(|| Error::new(tr("Trang phát hành trả về phiên bản không hợp lệ.", "The release page returned an invalid version.")))
+}
+
+/// The newest of the versions each site reports, and the site it came from
+/// (GitHub when both have it). Errors only when neither site answered.
+fn newest(results: [(Source, Result<String>); 2]) -> Result<(String, Source)> {
+    let mut best: Option<(String, Source)> = None;
+    let mut error = None;
+    for (source, result) in results {
+        match result {
+            Ok(version) => {
+                if best.as_ref().is_none_or(|(b, _)| parse_version(&version) > parse_version(b)) {
+                    best = Some((version, source));
+                }
+            }
+            Err(e) => error = error.or(Some(e)),
+        }
+    }
+    best.ok_or_else(|| error.unwrap_or_else(|| Error::new("no release site")))
+}
+
+/// Asks GitHub and GitLab for the latest release, at the same time. Blocking;
+/// run it off the UI thread.
+pub fn latest() -> Result<String> {
+    let [github, gitlab] = std::thread::scope(|s| {
+        let jobs = Source::ALL.map(|source| s.spawn(move || latest_from(source)));
+        jobs.map(|job| job.join().unwrap_or_else(|_| Err(Error::new("update check failed"))))
+    });
+    let (version, source) = newest([(Source::GitHub, github), (Source::GitLab, gitlab)])?;
+    set_preferred(source);
+    Ok(version)
 }
 
 /// Why an update did not go through, each with its own advice.
@@ -113,16 +213,41 @@ impl Failure {
     }
 }
 
-/// Downloads `version`, checks it and puts it in place of the running exe.
-/// Returns the path to start. Blocking; run it off the UI thread.
-pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failure> {
-    let base = format!("{RELEASE_DOWNLOAD}v{version}/");
+/// Downloads `version` from `source` and checks it against that release's
+/// checksum list.
+fn download(source: Source, version: &str) -> std::result::Result<Vec<u8>, Failure> {
+    let base = source.download_base(version);
     let sums = http::get(&format!("{base}SHA256SUMS.txt"), 64 * 1024).map_err(Failure::Download)?;
     let expected = checksum_for(&String::from_utf8_lossy(&sums), EXE_NAME).ok_or(Failure::Mismatch)?;
     let exe = http::get(&format!("{base}{EXE_NAME}"), MAX_DOWNLOAD).map_err(Failure::Download)?;
     if !exe.starts_with(b"MZ") || sha256_hex(&exe) != expected {
         return Err(Failure::Mismatch);
     }
+    Ok(exe)
+}
+
+/// Downloads `version`, checks it and puts it in place of the running exe,
+/// from the site the check found it on, or the other one if that fails.
+/// Returns the path to start. Blocking; run it off the UI thread.
+pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failure> {
+    let mut failure = None;
+    let mut exe = None;
+    for source in sources() {
+        match download(source, version) {
+            Ok(bytes) => {
+                set_preferred(source);
+                exe = Some(bytes);
+                break;
+            }
+            // a file that does not match its checksum is reported over a site that could not be reached
+            Err(f) => {
+                if !matches!(failure, Some(Failure::Mismatch)) {
+                    failure = Some(f);
+                }
+            }
+        }
+    }
+    let Some(exe) = exe else { return Err(failure.unwrap_or(Failure::Mismatch)) };
     let path = std::env::current_exe().map_err(|e| Failure::Install(e.into()))?;
     install(&exe, &path).map_err(|e| Failure::Install(e.into()))?;
     Ok(path)
@@ -411,6 +536,23 @@ mod tests {
         );
         assert_eq!(version_from_tag_url("https://github.com/iamcino/Yeager/releases"), None);
         assert_eq!(version_from_tag_url("https://github.com/x/releases/tag/v2.0.0-rc1"), None);
+        assert_eq!(
+            version_from_tag_url("https://gitlab.com/cino-group/yeager/-/releases/v1.1.4").as_deref(),
+            Some("1.1.4")
+        );
+        assert_eq!(version_from_tag_url("https://gitlab.com/cino-group/yeager/-/releases"), None);
+    }
+
+    #[test]
+    fn picks_the_newest_site() {
+        let ok = |v: &str| Ok(v.to_string());
+        let down = || Err(Error::new("HTTP 404"));
+        let pick = |a, b| newest([(Source::GitHub, a), (Source::GitLab, b)]).ok();
+        assert_eq!(pick(ok("1.1.3"), ok("1.1.4")), Some(("1.1.4".into(), Source::GitLab)));
+        assert_eq!(pick(ok("1.1.4"), ok("1.1.4")), Some(("1.1.4".into(), Source::GitHub)));
+        assert_eq!(pick(down(), ok("1.1.4")), Some(("1.1.4".into(), Source::GitLab)));
+        assert_eq!(pick(ok("1.1.4"), down()), Some(("1.1.4".into(), Source::GitHub)));
+        assert_eq!(pick(down(), down()), None);
     }
 
     #[test]

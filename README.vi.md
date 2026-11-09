@@ -142,9 +142,11 @@ rồi khởi động lại (engine bật lại nếu trước đó đang bật).
 Kiểm tra ngay: **Hệ thống › Cập nhật › Kiểm tra**. Muốn tắt tự kiểm tra thì tắt
 ở cùng chỗ đó.
 
-Trình cập nhật trong ứng dụng đọc bản phát hành từ GitHub. Nếu mạng của bạn
-không vào được GitHub, hãy tải bộ cài mới nhất [từ GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
-và cài đè lên bản hiện tại; thiết lập của bạn được giữ nguyên.
+Yeager hỏi cả GitHub lẫn GitLab, nên vẫn cập nhật được khi mạng của bạn không
+vào được một trong hai. Các bản tới 1.1.4 chỉ hỏi GitHub: nếu bản cũ báo không
+kiểm tra được cập nhật, hãy tải bộ cài mới nhất
+[từ GitLab](https://gitlab.com/cino-group/yeager/-/releases/permalink/latest/downloads/Yeager-Setup.exe)
+một lần và cài đè lên bản hiện tại; thiết lập của bạn được giữ nguyên.
 
 ## Câu hỏi thường gặp
 
@@ -159,8 +161,8 @@ Không đáng kể. Nếu muốn engine hoàn toàn không động tới game, h
 **Yeager có thu thập dữ liệu không?**
 Không tài khoản, không telemetry, không phân tích, không quảng cáo. Thiết lập
 nằm ở `%LOCALAPPDATA%\Yeager`. Kết nối duy nhất Yeager tự tạo là tới nhà cung
-cấp DNS của bạn, tới Cloudflare một lần khi mở để biết nhà mạng, tới GitHub để
-kiểm tra cập nhật, và tới Cloudflare, Google khi bạn bấm **Chẩn đoán** hoặc
+cấp DNS của bạn, tới Cloudflare một lần khi mở để biết nhà mạng, tới GitHub và
+GitLab để kiểm tra cập nhật, và tới Cloudflare, Google khi bạn bấm **Chẩn đoán** hoặc
 dùng *Tự động*. Xem [chính sách quyền riêng tư](PRIVACY.md#tiếng-việt).
 
 **Sao lại có cả GitHub và GitLab?**

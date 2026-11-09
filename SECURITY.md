@@ -93,7 +93,7 @@ These are all the connections Yeager makes on its own:
 | Endpoint | Purpose |
 |---|---|
 | Your DNS provider (`1.1.1.1` / `1.0.0.1` Cloudflare, Google or AdGuard) | DNS over HTTPS (Hange) |
-| `github.com/iamcino/Yeager/releases/latest` | Update check, and the update download when you agree |
+| `github.com/iamcino/Yeager/releases` and `gitlab.com/cino-group/yeager/-/releases` | Update check, and the update download when you agree |
 | `speed.cloudflare.com` | ISP name at start; latency and speed test (Erwin) |
 | `1.1.1.1`, `8.8.8.8` (Cloudflare, Google) | Ping tests when you run **Diagnose** or *Auto* (Erwin) |
 | `www.ssl.com` and similar | Windows fetching certificate chains (TLS AIA) during validation |
@@ -196,7 +196,7 @@ Vì chưa dùng chứng chỉ thương mại, Windows SmartScreen vẫn có th�
 | Địa chỉ | Mục đích |
 |---|---|
 | Nhà cung cấp DNS của bạn (`1.1.1.1` / `1.0.0.1` Cloudflare, Google hoặc AdGuard) | DNS over HTTPS (Hange) |
-| `github.com/iamcino/Yeager/releases/latest` | Kiểm tra cập nhật, và tải bản cập nhật khi bạn đồng ý |
+| `github.com/iamcino/Yeager/releases` và `gitlab.com/cino-group/yeager/-/releases` | Kiểm tra cập nhật, và tải bản cập nhật khi bạn đồng ý |
 | `speed.cloudflare.com` | Biết nhà mạng khi mở; đo độ trễ và tốc độ (Erwin) |
 | `1.1.1.1`, `8.8.8.8` (Cloudflare, Google) | Đo ping khi bạn bấm **Chẩn đoán** hoặc dùng *Tự động* (Erwin) |
 | `www.ssl.com` và tương tự | Windows tải chuỗi chứng chỉ (TLS AIA) khi xác thực |
