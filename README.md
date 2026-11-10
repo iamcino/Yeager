@@ -9,7 +9,8 @@ A connection engine, TCP tuning and encrypted DNS in a single native app. Not a 
 
 **English** · [Tiếng Việt](README.vi.md)
 
-[![Release](https://img.shields.io/gitlab/v/release/cino-group/yeager?label=release&color=0a7aff)](https://gitlab.com/cino-group/yeager/-/releases)
+[![GitHub release](https://img.shields.io/github/v/release/iamcino/Yeager?label=GitHub&logo=github&color=0a7aff)](https://github.com/iamcino/Yeager/releases)
+[![GitLab release](https://img.shields.io/gitlab/v/release/cino-group/yeager?label=GitLab&logo=gitlab&color=fc6d26)](https://gitlab.com/cino-group/yeager/-/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011%20x64-0a7aff)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
