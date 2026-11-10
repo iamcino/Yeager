@@ -2,8 +2,8 @@
 
 [English](BUILD.md) · **Tiếng Việt**
 
-Cách build Yeager từ mã nguồn, ký số, và đăng bản phát hành trên GitHub và
-GitLab. Muốn biết Yeager hoạt động bên trong ra sao, xem
+Cách build Yeager từ mã nguồn, ký số, đăng bản phát hành trên GitLab và sao
+sang GitHub. Muốn biết Yeager hoạt động bên trong ra sao, xem
 [tài liệu thiết kế](DESIGN.vi.md).
 
 ## Build từ mã nguồn
@@ -63,30 +63,43 @@ Các script nằm trong `tools/signing`:
 
 **Đổi chứng chỉ:** chạy `new-cert.ps1 -Force`, commit file `.cer` mới, cập nhật
 thumbprint trong `SECURITY.md`, các README và changelog, rồi cập nhật secret
-của CI và biến GitHub `CODESIGN_EXPECTED_THUMBPRINT`. Giữ thumbprint cũ trong
+của CI/CD trên GitLab (`CODESIGN_PFX_BASE64`, `CODESIGN_PFX_PASSWORD`). Giữ thumbprint cũ trong
 `SECURITY.md` để người dùng vẫn kiểm tra được các bản tải cũ.
+
+## Yeager nằm ở đâu
+
+| | |
+|---|---|
+| [gitlab.com/cino-group/yeager](https://gitlab.com/cino-group/yeager) | Repo chính: merge request, CI (trên runner tự host Garen-PC) và bản phát hành. |
+| [github.com/iamcino/Yeager](https://github.com/iamcino/Yeager) | Bản sao y hệt: cùng các commit `master`, cùng các tag `v*`, và bản phát hành với cùng file. Không commit hay phát hành trực tiếp trên GitHub. |
+
+`tools/sync-github.ps1` giữ GitHub luôn khớp. Chạy nó sau mỗi lần merge vào
+`master` trên GitLab và sau mỗi bản phát hành:
+
+```powershell
+.\tools\sync-github.ps1          # xem sẽ đẩy gì
+.\tools\sync-github.ps1 -Push    # đẩy master của GitLab và các tag v* mới sang GitHub
+```
+
+Script không bao giờ đẩy ép (force), nên `master` trên GitHub luôn phải là tổ
+tiên của `master` trên GitLab. Nó dùng remote `gl` (GitLab) và `origin`
+(GitHub); tên khác thì truyền `-GitLab` / `-GitHub`.
 
 ## Các bước phát hành
 
 1. Đặt phiên bản trong `Cargo.toml` (`[workspace.package] version`).
 2. Viết mục mới ở cả `CHANGELOG.md` và `CHANGELOG.vi.md` dưới tiêu đề
    `## [x.y.z] - YYYY-MM-DD`. Ghi chú phát hành được lấy từ đây.
-3. Merge vào `master`.
-4. Đăng trên GitHub, rồi GitLab, như dưới đây. Cả hai dùng tag `vx.y.z`.
+3. Merge vào `master` trên GitLab và chờ job `check` qua.
+4. Đăng trên GitLab bằng `tools/release-gitlab.ps1` (bên dưới). Script tạo tag `vx.y.z`.
+5. Chạy `.\tools\sync-github.ps1 -Push`. Tag mới sẽ khởi động workflow phát
+   hành trên GitHub, đăng cùng bản phát hành đó lên GitHub.
 
-Mỗi bản phát hành có cùng bộ file: `Yeager-Setup-<phiên bản>.exe`,
+Mỗi bản phát hành có cùng bộ file ở cả hai nơi: `Yeager-Setup-<phiên bản>.exe`,
 `Yeager-<phiên bản>-portable-x64.zip`, file `yeager.exe` riêng mà trình cập nhật
 trong ứng dụng tải về, `SHA256SUMS.txt`, các báo cáo `*-signature.json`,
-`Yeager-codesign.cer`, `LICENSE` và `THIRD-PARTY-NOTICES.md`.
-
-## Đăng trên GitHub
-
-`.github/workflows/release.yml` chạy trên runner `windows-2022`. Đẩy một tag
-`v*` lên là nó build, test, ký và đăng bản phát hành; chạy workflow bằng tay
-thì ra cùng bộ file dưới dạng artifact, và tick **publish** thì tạo luôn tag.
-Workflow cần secret `CODESIGN_PFX_BASE64`, `CODESIGN_PFX_PASSWORD` và biến
-`CODESIGN_EXPECTED_THUMBPRINT` của repo. Báo cáo VirusTotal
-(`virustotal-v<phiên bản>.json`) được đính kèm sau.
+`Yeager-codesign.cer`, `LICENSE` và `THIRD-PARTY-NOTICES.md`. Trên GitHub còn
+có thêm báo cáo VirusTotal (`virustotal-v<phiên bản>.json`) được đính kèm sau.
 
 ## Đăng trên GitLab
 
@@ -105,9 +118,8 @@ hai changelog, tiếng Anh trước. `levi.exe` không bao giờ được phát 
 
 ```powershell
 .\tools\release-gitlab.ps1 -Ref master -DryRun   # chỉ build và ký; file giữ ở target\release-gitlab\out-<phiên bản>
-.\tools\release-gitlab.ps1 -Ref v1.2.0           # build, ký và đăng
-.\tools\release-gitlab.ps1 -FromGitHub           # đăng đúng các file của bản phát hành GitHub
-.\tools\release-gitlab.ps1 -Ref v1.2.0 -AssetsDir D:\yeager-1.2.0   # đăng các file bạn đã có
+.\tools\release-gitlab.ps1 -Ref master           # build, ký và đăng
+.\tools\release-gitlab.ps1 -Ref v1.1.5 -AssetsDir D:\yeager-1.1.5   # đăng các file bạn đã có
 ```
 
 | Tùy chọn | Ý nghĩa |
@@ -115,7 +127,7 @@ hai changelog, tiếng Anh trước. `levi.exe` không bao giờ được phát 
 | `-Ref` | Nhánh, tag hoặc commit cần build. Phiên bản lấy từ `Cargo.toml` của nó; tag là `v<phiên bản>`. |
 | `-DryRun` | Build và ký, không tải lên gì. |
 | `-SkipTests` | Bỏ qua `cargo test`. Cần khi cửa sổ dòng lệnh không có quyền Admin. |
-| `-FromGitHub` / `-AssetsDir` | Không build; kiểm tra rồi đăng lại file phát hành có sẵn (chữ ký và `SHA256SUMS.txt` phải khớp). |
+| `-AssetsDir` | Không build; kiểm tra rồi đăng lại file phát hành có sẵn (chữ ký và `SHA256SUMS.txt` phải khớp). |
 | `-PfxPath` | Ký bằng file PFX này khi khóa không có trong `CurrentUser\My`. |
 | `-Prerelease` | Cho phép phiên bản kiểu `1.2.0-rc1`. GitLab không có cờ pre-release, nên nó sẽ thành bản mới nhất. |
 
@@ -130,8 +142,23 @@ Read-Host -AsSecureString | Export-Clixml "$env:LOCALAPPDATA\Yeager-signing\gitl
 Script không ghi đè bản phát hành GitLab đã có; hãy xóa nó trước hoặc tăng
 phiên bản.
 
-**Chạy trên GitLab CI:** `.gitlab-ci.yml` chạy test và build bản release ở mỗi
-lần push và merge request, và job release khi có tag `v*` hoặc khi bấm tay trên
-`master`. Nó cần một runner Windows tự host gắn tag `yeager-windows` với đủ các
-công cụ trên, và hai biến CI/CD được bảo vệ `CODESIGN_PFX_BASE64`,
+**Chạy trên GitLab CI:** `.gitlab-ci.yml` chạy test và build bản release
+(`check`) ở mỗi lần push và merge request, trên runner Windows tự host gắn tag
+`yeager-windows` (Garen-PC). Job `release` chỉ chạy khi bấm tay, trên `master`
+hoặc tag `v*`, và cần hai biến CI/CD được bảo vệ `CODESIGN_PFX_BASE64`,
 `CODESIGN_PFX_PASSWORD`.
+
+## Đăng trên GitHub
+
+Bản phát hành GitHub không bao giờ được build trên GitHub.
+`.github/workflows/release.yml` chạy khi một tag `v*` tới (từ `sync-github.ps1`)
+và gọi `tools/release-github.ps1`: tải bản phát hành GitLab về, kiểm từng file
+với `SHA256SUMS.txt` và chữ ký đã ghim, rồi tạo bản phát hành GitHub với cùng
+tên, ghi chú và file. Nó không cần secret ký nào. Nếu workflow không chạy được,
+làm y như vậy bằng tay trên máy đã đăng nhập `gh`:
+
+```powershell
+.\tools\release-github.ps1 -Tag v1.1.5
+```
+
+Sau đó workflow `VirusTotal reference` quét bản phát hành GitHub và đính kèm báo cáo.

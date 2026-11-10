@@ -1,265 +1,37 @@
+# Publish a Yeager release on GitHub with the same files as the GitLab release.
+#
+# Releases are built and signed once, on GitLab (tools/release-gitlab.ps1). When the release tag
+# reaches this repository (tools/sync-github.ps1 mirrors GitLab's master and v* tags), this
+# workflow downloads that GitLab release, checks the hashes and the pinned Yeager signature, and
+# creates the GitHub release with identical files (tools/release-github.ps1). No signing key is
+# needed here. It can also be started by hand for an existing tag.
+
 name: Release
 
-# Pushing a tag like v1.0.0 builds Yeager on Windows and publishes a GitHub
-# release with the installer and a portable zip. Run it by hand to get the
-# same files as a workflow artifact; tick "publish" to also create the
-# v<Cargo version> tag on the chosen commit and release it.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
-      publish:
-        description: Create the v<version> tag and publish the release
-        type: boolean
-        default: false
+      tag:
+        description: "Release tag, for example v1.1.5"
+        required: true
 
 permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-2022
+  mirror:
+    name: Publish the GitLab release on GitHub
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Read version
-        id: version
-        shell: pwsh
-        run: |
-          $cargoVersion = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
-            Where-Object name -eq 'yeager' | Select-Object -ExpandProperty version
-          $relVersion = $cargoVersion
-          if ($env:GITHUB_REF_TYPE -eq 'tag') {
-            $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
-            if ($tagVersion -ne $cargoVersion -and -not $tagVersion.StartsWith("$cargoVersion-")) {
-              throw "Tag $env:GITHUB_REF_NAME does not match Cargo version $cargoVersion"
-            }
-            $relVersion = $tagVersion
-          }
-          # Extract clean numeric version for Inno Setup (e.g. 1.1.3-rc1 -> 1.1.3 -> 1.1.3.0)
-          $baseNumeric = ($relVersion -replace '-.*$', '')
-          if ($baseNumeric -match '^\d+\.\d+\.\d+$') {
-            $numericVersion = "$baseNumeric.0"
-          } elseif ($baseNumeric -match '^\d+\.\d+$') {
-            $numericVersion = "$baseNumeric.0.0"
-          } elseif ($baseNumeric -match '^\d+\.\d+\.\d+\.\d+$') {
-            $numericVersion = $baseNumeric
-          } else {
-            $numericVersion = "0.0.0.0"
-          }
-          "version=$relVersion" >> $env:GITHUB_OUTPUT
-          "numeric_version=$numericVersion" >> $env:GITHUB_OUTPUT
-
-      - name: Test
-        run: cargo test --locked --workspace --exclude levi
-
-      - name: Build
-        shell: pwsh
-        run: ./build.ps1
-
-      - name: Sign binaries with Authenticode
-        shell: pwsh
-        env:
-          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
-          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
-          CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
-        run: |
-          $isOfficial = ($env:GITHUB_REPOSITORY -and $env:GITHUB_REPOSITORY.Trim().ToLowerInvariant() -eq 'iamcino/yeager')
-          if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
-            if ($isOfficial) {
-              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"
-            }
-            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork). Skipping Authenticode signing."
-            exit 0
-          }
-          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            if ($isOfficial) {
-              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_PFX_BASE64 and CODESIGN_PFX_PASSWORD secrets!"
-            }
-            Write-Warning "Code signing secrets not configured (fork). Skipping Authenticode signing."
-            exit 0
-          }
-          $pfxPath = "$env:RUNNER_TEMP/release-cert.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
-          try {
-            ./tools/signing/sign.ps1 -Path "dist/yeager.exe" -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
-            ./tools/signing/verify.ps1 -Path "dist/yeager.exe" -JsonPath "dist/yeager-signature.json"
-            if (Test-Path "dist/levi.exe") {
-              ./tools/signing/sign.ps1 -Path "dist/levi.exe" -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
-              ./tools/signing/verify.ps1 -Path "dist/levi.exe" -JsonPath "dist/levi-signature.json"
-            }
-          } finally {
-            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
-          }
-
-      - name: Install Inno Setup
-        shell: pwsh
-        run: |
-          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
-            choco install innosetup -y --no-progress
-            $innoPath = "${env:ProgramFiles(x86)}\Inno Setup 6"
-            if (-not (Test-Path $innoPath)) {
-              $innoPath = "${env:ProgramFiles}\Inno Setup 6"
-            }
-            if (-not (Test-Path $innoPath)) {
-              $innoCandidate = Get-ChildItem -Path "${env:ProgramFiles(x86)}","${env:ProgramFiles}" -Filter "Inno Setup*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($innoCandidate) { $innoPath = $innoCandidate.FullName }
-            }
-            if ($innoPath -and (Test-Path $innoPath)) {
-              "$innoPath" >> $env:GITHUB_PATH
-            }
-          }
-
-      - name: Installer
-        shell: pwsh
-        run: |
-          $appVer = '${{ steps.version.outputs.version }}'
-          $numVer = '${{ steps.version.outputs.numeric_version }}'
-          Write-Host "Compiling Inno Setup: AppVersion=$appVer, NumericVersion=$numVer"
-          iscc installer\setup.iss "/DAppVersion=$appVer" "/DNumericVersion=$numVer"
-
-      - name: Sign installer with Authenticode
-        shell: pwsh
-        env:
-          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
-          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
-          CODESIGN_EXPECTED_THUMBPRINT: ${{ vars.CODESIGN_EXPECTED_THUMBPRINT }}
-        run: |
-          $isOfficial = ($env:GITHUB_REPOSITORY -and $env:GITHUB_REPOSITORY.Trim().ToLowerInvariant() -eq 'iamcino/yeager')
-          if (-not $env:CODESIGN_EXPECTED_THUMBPRINT) {
-            if ($isOfficial) {
-              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_EXPECTED_THUMBPRINT variable to be set!"
-            }
-            Write-Warning "CODESIGN_EXPECTED_THUMBPRINT is not configured (fork). Skipping installer signing."
-            exit 0
-          }
-          if (-not $env:CODESIGN_PFX_BASE64 -or -not $env:CODESIGN_PFX_PASSWORD) {
-            if ($isOfficial) {
-              throw "Official repository ($env:GITHUB_REPOSITORY) requires CODESIGN_PFX_BASE64 and CODESIGN_PFX_PASSWORD secrets!"
-            }
-            Write-Warning "Code signing secrets not configured (fork). Skipping installer signing."
-            exit 0
-          }
-          $v = '${{ steps.version.outputs.version }}'
-          $installerPath = "dist/Yeager-Setup-$v.exe"
-          if (-not (Test-Path $installerPath)) {
-            throw "Installer not found at $installerPath!"
-          }
-          $pfxPath = "$env:RUNNER_TEMP/release-cert.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
-          try {
-            ./tools/signing/sign.ps1 -Path $installerPath -PfxPath $pfxPath -ExpectedThumbprint $env:CODESIGN_EXPECTED_THUMBPRINT
-            ./tools/signing/verify.ps1 -Path $installerPath -JsonPath "dist/Yeager-Setup-$v-signature.json"
-          } finally {
-            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
-          }
-
-      - name: Portable zip and checksums
-        shell: pwsh
-        run: |
-          $v = '${{ steps.version.outputs.version }}'
-          $stage = 'dist\Yeager-portable'
-          New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item dist/yeager.exe, LICENSE $stage
-          if (Test-Path THIRD-PARTY-NOTICES.md) { Copy-Item THIRD-PARTY-NOTICES.md $stage }
-          if (Test-Path licenses) { Copy-Item licenses $stage -Recurse }
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\Yeager-$v-portable-x64.zip" -Force
-          # yeager.exe on its own is what the in-app updater downloads; it
-          # checks it against this list.
-          $files = @(
-            "dist/Yeager-Setup-$v.exe",
-            "dist/Yeager-$v-portable-x64.zip",
-            "dist/yeager.exe"
-          )
-          if (Test-Path "dist/levi.exe") {
-            $files += "dist/levi.exe"
-          }
-          $hashLines = $files | Where-Object { Test-Path $_ } | ForEach-Object {
-            $item = Get-Item $_
-            "$((Get-FileHash $item -Algorithm SHA256).Hash.ToLowerInvariant())  $($item.Name)"
-          }
-          # Force LF line endings for Linux sha256sum compatibility
-          [IO.File]::WriteAllText("dist/SHA256SUMS.txt", ($hashLines -join "`n") + "`n")
-
-      - name: Release notes
-        shell: pwsh
-        run: |
-          $v = '${{ steps.version.outputs.version }}'
-          # This version's section of a changelog, without its heading.
-          function Section($file) {
-            $out = @()
-            if (Test-Path $file) {
-              $inside = $false
-              foreach ($line in Get-Content $file -Encoding utf8) {
-                if ($line -match '^## ') {
-                  if ($inside) { break }
-                  $inside = $line -match [regex]::Escape($v)
-                  continue
-                }
-                if ($inside) { $out += $line }
-              }
-            }
-            return ,$out
-          }
-          # English first, then Vietnamese under its own heading.
-          $notes = @()
-          $notes += Section 'CHANGELOG.md'
-          $vi = Section 'CHANGELOG.vi.md'
-          if ($vi.Count -gt 0) {
-            $notes += ''
-            $notes += '## Tiếng Việt'
-            $notes += $vi
-          }
-          $notes += ''
-          $notes += '---'
-          $notes += ''
-          $notes += 'Run `Yeager-Setup-' + $v + '.exe` to install, or unzip the portable build and run `yeager.exe` as administrator. Requires Windows 11 or Windows Server 2022, x64.'
-          $notes += ''
-          $notes += '<p align="center">'
-          $notes += '  <a href="https://slint.dev">'
-          $notes += '    <picture>'
-          $notes += '      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-dark.svg">'
-          $notes += '      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-light.svg">'
-          $notes += '      <img alt="Made with Slint" src="https://raw.githubusercontent.com/iamcino/Yeager/master/assets/icons/made-with-slint-light.svg" height="50">'
-          $notes += '    </picture>'
-          $notes += '  </a>'
-          $notes += '</p>'
-          $notes -join "`n" | Set-Content dist\RELEASE_NOTES.md -Encoding utf8
-
-      - uses: actions/upload-artifact@v5
+      - uses: actions/checkout@v4
         with:
-          name: yeager-${{ steps.version.outputs.version }}
-          path: |
-            dist/Yeager-Setup-*.exe
-            dist/Yeager-*-portable-x64.zip
-            dist/yeager.exe
-            dist/levi.exe
-            dist/SHA256SUMS.txt
-            dist/RELEASE_NOTES.md
-
-      - name: Publish release
-        if: github.ref_type == 'tag' || inputs.publish
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          name: Yeager ${{ steps.version.outputs.version }}
-          body_path: dist/RELEASE_NOTES.md
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
-          make_latest: ${{ !contains(steps.version.outputs.version, '-') }}
-          files: |
-            dist/Yeager-Setup-${{ steps.version.outputs.version }}.exe
-            dist/Yeager-${{ steps.version.outputs.version }}-portable-x64.zip
-            dist/yeager.exe
-            dist/levi.exe
-            dist/SHA256SUMS.txt
-            docs/signing/Yeager-codesign.cer
-            dist/*-signature.json
-            LICENSE
-            THIRD-PARTY-NOTICES.md
-          fail_on_unmatched_files: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Mirror GitLab release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ('${{ github.event.inputs.tag }}') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
+          .\tools\release-github.ps1 -Tag $tag -WaitMinutes 30
