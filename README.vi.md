@@ -9,7 +9,8 @@ Engine kết nối, tối ưu TCP và DNS mã hóa trong một ứng dụng gố
 
 [English](README.md) · **Tiếng Việt**
 
-[![Phiên bản](https://img.shields.io/gitlab/v/release/cino-group/yeager?label=phi%C3%AAn%20b%E1%BA%A3n&color=0a7aff)](https://gitlab.com/cino-group/yeager/-/releases)
+[![GitHub release](https://img.shields.io/github/v/release/iamcino/Yeager?label=GitHub&logo=github&color=0a7aff)](https://github.com/iamcino/Yeager/releases)
+[![GitLab release](https://img.shields.io/gitlab/v/release/cino-group/yeager?label=GitLab&logo=gitlab&color=fc6d26)](https://gitlab.com/cino-group/yeager/-/releases)
 ![Nền tảng](https://img.shields.io/badge/n%E1%BB%81n%20t%E1%BA%A3ng-Windows%2011%20x64-0a7aff)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
 [![Giấy phép: MIT](https://img.shields.io/badge/gi%E1%BA%A5y%20ph%C3%A9p-MIT-green)](LICENSE)
