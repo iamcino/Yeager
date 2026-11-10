@@ -8,6 +8,9 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Thay đổi
+- **GitHub là bản sao của GitLab:** GitLab là repo chính; GitHub mang cùng commit và tag, và bản phát hành trên GitHub có đúng những file đã ký như trên GitLab, được `tools/release-github.ps1` chép sang và kiểm tra thay vì build và ký lại. `tools/sync-github.ps1` giữ hai nơi luôn khớp.
+
 ## [1.1.5] - 2026-11-09
 
 ### Thay đổi

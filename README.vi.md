@@ -166,9 +166,11 @@ GitLab để kiểm tra cập nhật, và tới Cloudflare, Google khi bạn b�
 dùng *Tự động*. Xem [chính sách quyền riêng tư](PRIVACY.md#tiếng-việt).
 
 **Sao lại có cả GitHub và GitLab?**
-Mỗi bản phát hành được đăng ở cả hai nơi. Nếu mạng của bạn không vào được nơi
-này thì tải ở nơi kia. Mã nguồn cũng có ở cả
-[GitHub](https://github.com/iamcino/Yeager) và [GitLab](https://gitlab.com/cino-group/yeager).
+Hai nơi được giữ giống hệt nhau. [GitLab](https://gitlab.com/cino-group/yeager) là nơi Yeager được phát
+triển, kiểm thử và phát hành; [GitHub](https://github.com/iamcino/Yeager) là bản sao với cùng commit và
+tag, và mỗi bản phát hành trên GitHub có đúng những file đã ký như trên GitLab
+(chỉ thêm báo cáo VirusTotal). Mạng của bạn không vào được nơi này thì dùng nơi
+kia. Trình cập nhật của Yeager hỏi cả hai.
 
 **Có gì đó không chạy nữa. Làm sao hoàn tác tất cả?**
 Tắt Yeager, hoặc thoát nó: TCP và DNS trở về như cũ. **TCP › Khôi phục mặc
@@ -236,8 +238,12 @@ WinDivert), `erwin` (TCP), `hange` (DNS over HTTPS) và `common`.
        └── HTTPS ──► Levi: engine kết nối (Toàn bộ / Theo tên miền) ──► Internet
 ```
 
+Repo chính là [GitLab](https://gitlab.com/cino-group/yeager);
+[GitHub](https://github.com/iamcino/Yeager) là bản sao y hệt, nên merge request
+và phát hành đều làm trên GitLab.
+
 - [Tài liệu thiết kế](docs/DESIGN.vi.md): từng phần hoạt động thế nào và vì sao.
-- [Build và phát hành](docs/BUILD.vi.md): build từ mã nguồn, bộ cài, ký số, và đăng bản phát hành trên GitHub, GitLab.
+- [Build và phát hành](docs/BUILD.vi.md): build từ mã nguồn, bộ cài, ký số, phát hành trên GitLab và sao sang GitHub.
 - [Đóng góp](CONTRIBUTING.md#tiếng-việt): báo lỗi và gửi pull request.
 
 ## Giấy phép và ghi công

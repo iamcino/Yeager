@@ -2,8 +2,8 @@
 
 **English** · [Tiếng Việt](BUILD.vi.md)
 
-How to build Yeager from source, sign it, and publish a release on GitHub and
-GitLab. For how Yeager works inside, see the [design document](DESIGN.md).
+How to build Yeager from source, sign it, publish a release on GitLab and mirror
+it to GitHub. For how Yeager works inside, see the [design document](DESIGN.md).
 
 ## Build from source
 
@@ -62,31 +62,44 @@ The scripts are in `tools/signing`:
 
 **Rotating the certificate:** run `new-cert.ps1 -Force`, commit the new
 `.cer`, update the thumbprint in `SECURITY.md`, the READMEs and the changelog,
-then update the CI secrets and the GitHub variable
-`CODESIGN_EXPECTED_THUMBPRINT`. Keep the old thumbprint listed in `SECURITY.md`
+then update the GitLab CI/CD variables `CODESIGN_PFX_BASE64` and
+`CODESIGN_PFX_PASSWORD`. Keep the old thumbprint listed in `SECURITY.md`
 so older downloads can still be checked.
+
+## Where Yeager lives
+
+| | |
+|---|---|
+| [gitlab.com/cino-group/yeager](https://gitlab.com/cino-group/yeager) | The main repository: merge requests, CI (on the self-hosted Garen-PC runner) and releases. |
+| [github.com/iamcino/Yeager](https://github.com/iamcino/Yeager) | An exact mirror: the same `master` commits and the same `v*` tags, and releases with the same files. Nothing is committed or released on GitHub directly. |
+
+`tools/sync-github.ps1` keeps GitHub in step. Run it after each merge to
+GitLab `master` and after each release:
+
+```powershell
+.\tools\sync-github.ps1          # show what would be pushed
+.\tools\sync-github.ps1 -Push    # push GitLab master and any new v* tags to GitHub
+```
+
+It never forces a push, so GitHub `master` must always be an ancestor of
+GitLab `master`. It expects the remotes `gl` (GitLab) and `origin` (GitHub);
+pass `-GitLab` / `-GitHub` for other names.
 
 ## Release checklist
 
 1. Set the version in `Cargo.toml` (`[workspace.package] version`).
 2. Write the entry in both `CHANGELOG.md` and `CHANGELOG.vi.md` under a
    `## [x.y.z] - YYYY-MM-DD` heading. The release notes are taken from these.
-3. Merge to `master`.
-4. Publish on GitHub, then on GitLab, as below. Both use tag `vx.y.z`.
+3. Merge to GitLab `master` and wait for the `check` job to pass.
+4. Publish on GitLab with `tools/release-gitlab.ps1` (below). It creates tag `vx.y.z`.
+5. Run `.\tools\sync-github.ps1 -Push`. The new tag starts the GitHub release
+   workflow, which publishes the same release on GitHub.
 
-Every release ships the same set of files: `Yeager-Setup-<version>.exe`,
+Every release ships the same set of files on both sites: `Yeager-Setup-<version>.exe`,
 `Yeager-<version>-portable-x64.zip`, the bare `yeager.exe` the in-app updater
 downloads, `SHA256SUMS.txt`, the `*-signature.json` reports,
-`Yeager-codesign.cer`, `LICENSE` and `THIRD-PARTY-NOTICES.md`.
-
-## Publishing on GitHub
-
-`.github/workflows/release.yml` runs on a `windows-2022` runner. Pushing a
-`v*` tag builds, tests, signs and publishes the release; running the workflow
-by hand produces the same files as an artifact, and ticking **publish** also
-creates the tag. It needs the repository secrets `CODESIGN_PFX_BASE64` and
-`CODESIGN_PFX_PASSWORD` and the variable `CODESIGN_EXPECTED_THUMBPRINT`.
-A VirusTotal report (`virustotal-v<version>.json`) is attached afterwards.
+`Yeager-codesign.cer`, `LICENSE` and `THIRD-PARTY-NOTICES.md`. On GitHub a
+VirusTotal report (`virustotal-v<version>.json`) is added afterwards.
 
 ## Publishing on GitLab
 
@@ -105,9 +118,8 @@ The stable link to the newest installer is
 
 ```powershell
 .\tools\release-gitlab.ps1 -Ref master -DryRun   # build and sign only; files kept in target\release-gitlab\out-<version>
-.\tools\release-gitlab.ps1 -Ref v1.2.0           # build, sign and publish
-.\tools\release-gitlab.ps1 -FromGitHub           # publish exactly the files of the GitHub release
-.\tools\release-gitlab.ps1 -Ref v1.2.0 -AssetsDir D:\yeager-1.2.0   # publish files you already have
+.\tools\release-gitlab.ps1 -Ref master           # build, sign and publish
+.\tools\release-gitlab.ps1 -Ref v1.1.5 -AssetsDir D:\yeager-1.1.5   # publish files you already have
 ```
 
 | Option | Meaning |
@@ -115,7 +127,7 @@ The stable link to the newest installer is
 | `-Ref` | Branch, tag or commit to build. The version comes from its `Cargo.toml`; the tag is `v<version>`. |
 | `-DryRun` | Build and sign, upload nothing. |
 | `-SkipTests` | Skip `cargo test`. Needed in a shell without administrator rights. |
-| `-FromGitHub` / `-AssetsDir` | Don't build; check and republish existing release files (signature and `SHA256SUMS.txt` must match). |
+| `-AssetsDir` | Don't build; check and republish existing release files (signature and `SHA256SUMS.txt` must match). |
 | `-PfxPath` | Sign with this PFX when the key is not in `CurrentUser\My`. |
 | `-Prerelease` | Allow a version like `1.2.0-rc1`. GitLab has no pre-release flag, so it becomes the latest release. |
 
@@ -130,8 +142,24 @@ Read-Host -AsSecureString | Export-Clixml "$env:LOCALAPPDATA\Yeager-signing\gitl
 The script refuses to overwrite an existing GitLab release; delete it first or
 raise the version.
 
-**From GitLab CI:** `.gitlab-ci.yml` runs tests and a release build on every
-push and merge request, and the release job on a `v*` tag or by hand on
-`master`. It needs a self-hosted Windows runner tagged `yeager-windows` with
-the same tools, and the protected CI/CD variables `CODESIGN_PFX_BASE64` and
-`CODESIGN_PFX_PASSWORD`.
+**From GitLab CI:** `.gitlab-ci.yml` runs tests and a release build (`check`)
+on every push and merge request, on the self-hosted Windows runner tagged
+`yeager-windows` (Garen-PC). The `release` job runs only when started by hand,
+on `master` or a `v*` tag, and needs the protected CI/CD variables
+`CODESIGN_PFX_BASE64` and `CODESIGN_PFX_PASSWORD`.
+
+## Publishing on GitHub
+
+GitHub releases are never built on GitHub. `.github/workflows/release.yml`
+runs when a `v*` tag arrives (from `sync-github.ps1`) and calls
+`tools/release-github.ps1`, which downloads the GitLab release, checks every
+file against `SHA256SUMS.txt` and the pinned signature, and creates the GitHub
+release with the same name, notes and files. It needs no signing secrets. If
+the workflow cannot run, do the same by hand on a machine where `gh` is signed in:
+
+```powershell
+.\tools\release-github.ps1 -Tag v1.1.5
+```
+
+The `VirusTotal reference` workflow then scans the GitHub release and attaches
+its report.

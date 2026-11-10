@@ -168,9 +168,11 @@ the update check, and Cloudflare and Google when you run **Diagnose** or *Auto*.
 [privacy policy](PRIVACY.md).
 
 **Why both GitHub and GitLab?**
-Every release is published in both places. If one of them is unreachable from
-your network, download from the other. The source code is on both
-[GitHub](https://github.com/iamcino/Yeager) and [GitLab](https://gitlab.com/cino-group/yeager) too.
+The two are kept identical. [GitLab](https://gitlab.com/cino-group/yeager) is where Yeager is developed,
+tested and released; [GitHub](https://github.com/iamcino/Yeager) mirrors it with the same commits and
+tags, and each GitHub release carries the very same signed files as the GitLab
+one (only a VirusTotal report is added). If one site is unreachable from your
+network, use the other. Yeager's updater checks both.
 
 **Something stopped working. How do I undo everything?**
 Turn Yeager off, or quit it: TCP and DNS go back to how they were. **TCP ›
@@ -239,8 +241,12 @@ is split into crates: `app` (interface, tray, orchestration), `levi`
        └── HTTPS ──► Levi: connection engine (All / Domain list) ──► Internet
 ```
 
+The main repository is [GitLab](https://gitlab.com/cino-group/yeager);
+[GitHub](https://github.com/iamcino/Yeager) is an exact mirror, so merge requests
+and releases happen on GitLab.
+
 - [Design document](docs/DESIGN.md): how each part works and why.
-- [Build and release](docs/BUILD.md): building from source, the installer, signing, and publishing on GitHub and GitLab.
+- [Build and release](docs/BUILD.md): building from source, the installer, signing, releasing on GitLab and mirroring to GitHub.
 - [Contributing](CONTRIBUTING.md): bug reports and pull requests.
 
 ## License and credits
