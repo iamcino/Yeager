@@ -2,10 +2,12 @@
 //!
 //! Injection design: harness-owned TCP state. The harness builds SYN / ACK /
 //! ClientHello fragments / RST itself and injects them with WinDivertSend; the
-//! OS stack never owns the connection. A DROP handle scoped to the harness's
-//! own inbound flow shields the host stack from the server's replies (so it
-//! cannot RST an unowned port); a SNIFF handle records both directions,
-//! including the injected fragments. Rationale: YUMI-UNIT2-L2.md.
+//! OS stack never owns the connection. Capture is a disjoint pair: a SNIFF
+//! handle records the outbound direction (the injected fragments) and never
+//! drops, while a DROP shield on the harness's own inbound flow records the
+//! inbound direction and consumes it, so the host stack never sees the
+//! server's replies (and cannot RST an unowned port).
+//! Rationale: YUMI-UNIT2-L2.md.
 //!
 //! No module, engine, main.rs or Cargo edits. No dependency beyond levi's own.
 //! SMOKE runs are machinery proofs, never evidence. Evidence runs additionally
@@ -139,29 +141,92 @@ fn cuts_for_arm(level: AdaptiveLevel, payload: &[u8]) -> Result<Vec<usize>, Stri
 
 // ---------------------------------------------------------------------------
 // Safety gate: <= 60 handshakes per target per rolling hour (hard stop),
-// >= 2 s between handshakes to the same target, session cap.
+// >= 2 s between handshakes to the same target, session cap. The attempt
+// history is persisted in <out_dir>/gate_history.jsonl at slot-consumption
+// time, so the hourly cap and the spacing bind the whole campaign across
+// invocations of the same out dir, not just one process.
 // ---------------------------------------------------------------------------
 
+const GATE_HISTORY_FILE: &str = "gate_history.jsonl";
+
+fn epoch_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 struct SafetyGate {
-    history: HashMap<String, VecDeque<Instant>>,
+    history: HashMap<String, VecDeque<i64>>,
     session_count: usize,
     session_cap: usize,
+    journal: Option<PathBuf>,
 }
 
 impl SafetyGate {
+    /// In-memory gate (unit tests). Sessions use `load` so prior attempts on
+    /// disk count toward the caps.
     fn new(session_cap: usize) -> Self {
-        Self { history: HashMap::new(), session_count: 0, session_cap }
+        Self {
+            history: HashMap::new(),
+            session_count: 0,
+            session_cap,
+            journal: None,
+        }
     }
 
-    fn check(&mut self, target: &str, now: Instant) -> Result<(), String> {
+    /// Fresh gate for a session: inherits every attempt already recorded
+    /// under out_dir (rolling hour + last attempt per target). A missing
+    /// journal means no prior attempts; a corrupt or unreadable journal is a
+    /// hard error — the caps cannot be verified, so no handshake may proceed.
+    fn load(out_dir: &Path, session_cap: usize) -> Result<Self, String> {
+        let path = out_dir.join(GATE_HISTORY_FILE);
+        let mut gate = Self {
+            journal: Some(path.clone()),
+            ..Self::new(session_cap)
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                for (i, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let rec = json_parse(line)
+                        .map_err(|e| format!("gate history line {}: {e}", i + 1))?;
+                    let target = rec
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| format!("gate history line {}: missing target", i + 1))?;
+                    let ts = rec
+                        .get("ts_ms")
+                        .and_then(|v| v.as_f64())
+                        .ok_or_else(|| format!("gate history line {}: missing ts_ms", i + 1))?
+                        as i64;
+                    gate.history
+                        .entry(target.to_string())
+                        .or_default()
+                        .push_back(ts);
+                }
+                for h in gate.history.values_mut() {
+                    h.make_contiguous().sort();
+                }
+                Ok(gate)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(gate),
+            Err(e) => Err(format!("gate history read: {e}")),
+        }
+    }
+
+    fn check(&mut self, target: &str, now_ms: i64) -> Result<(), String> {
         if self.session_count >= self.session_cap {
             return Err(format!(
                 "session cap reached ({} handshakes); hard stop",
                 self.session_cap
             ));
         }
+        let hour_ms = HOUR.as_millis() as i64;
         let h = self.history.entry(target.to_string()).or_default();
-        while h.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
+        while h.front().is_some_and(|t| now_ms - t >= hour_ms) {
             h.pop_front();
         }
         if h.len() >= HOURLY_CAP {
@@ -170,14 +235,36 @@ impl SafetyGate {
             ));
         }
         if let Some(last) = h.back() {
-            if now.duration_since(*last) < MIN_SPACING {
+            if now_ms - last < MIN_SPACING.as_millis() as i64 {
                 return Err(format!(
                     "spacing violation for {target}: < {} between handshakes",
                     MIN_SPACING.as_secs()
                 ));
             }
         }
-        h.push_back(now);
+        // Persist the attempt BEFORE granting the slot: a consumed slot stays
+        // consumed even if this process dies mid-handshake. Fail closed (no
+        // slot) when the journal cannot be written.
+        if let Some(path) = &self.journal {
+            let rec = J::O(vec![
+                ("target".into(), J::s(target)),
+                ("ts_ms".into(), J::I(now_ms)),
+                (
+                    "utc".into(),
+                    J::s(format_utc(
+                        UNIX_EPOCH + Duration::from_millis(now_ms.max(0) as u64),
+                    )),
+                ),
+            ]);
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("gate history open: {e}"))?;
+            writeln!(f, "{}", rec.compact())
+                .map_err(|e| format!("gate history write: {e}"))?;
+        }
+        h.push_back(now_ms);
         self.session_count += 1;
         Ok(())
     }
@@ -1175,9 +1262,10 @@ impl FragmentSender for WireSender {
 }
 
 // ---------------------------------------------------------------------------
-// Capture: SNIFF handle records both directions (no impostor exclusion, so
-// injected fragments are recorded). The DROP shield consumes the harness's
-// own inbound flow without re-injecting, keeping the host stack out.
+// Capture: a disjoint pair. The SNIFF handle records the outbound direction
+// only (the injected fragments; no impostor exclusion needed). The DROP
+// shield records the inbound direction and consumes it without re-injecting,
+// keeping the host stack out.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -1433,6 +1521,7 @@ struct SessionCtx {
 struct RunResult {
     summary: J,
     run_id: String,
+    error: Option<String>,
 }
 
 fn hex_encode(data: &[u8]) -> String {
@@ -1464,10 +1553,7 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         return Err(format!("target {site} is not on the approved clean-site list"));
     }
     let started = SystemTime::now();
-    ctx.gate
-        .lock()
-        .unwrap()
-        .check(site, Instant::now())?;
+    ctx.gate.lock().unwrap().check(site, epoch_ms_now())?;
 
     let cfg = arm_cfg(arm);
     let run_id = format!("{}-{}-{}-{:03}", format_utc_compact(started), site, arm.name, seq_no);
@@ -1634,7 +1720,13 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         cleanup(&shared, &shield_stop);
         let _ = cap_thread.join();
         let _ = shield_thread.join();
-        return Err(format!("SYN send failed: {e}"));
+        let err = format!("SYN send failed: {e}");
+        log.push(err.clone());
+        let summary = write_early_failure(
+            &ctx.out_dir, ctx.kind, &ctx.harness_commit, site, arm, &run_id, started,
+            "send_failed", &err, &log,
+        )?;
+        return Ok(RunResult { summary, run_id, error: Some(err) });
     }
     sender.sent.lock().unwrap().push(SentRecord { seq: isn, len: 0, qpc: syn_qpc, kind: "syn" });
     log.push(format!("SYN sent isn={isn}"));
@@ -1686,7 +1778,13 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         cleanup(&shared, &shield_stop);
         let _ = cap_thread.join();
         let _ = shield_thread.join();
-        return Err("PORT_COLLISION".into());
+        let err = "PORT_COLLISION".to_string();
+        log.push("SYN-ACK ack != ISN+1: a live host flow owns this TCP port (PORT_COLLISION)".into());
+        let summary = write_early_failure(
+            &ctx.out_dir, ctx.kind, &ctx.harness_commit, site, arm, &run_id, started,
+            "port_collision", &err, &log,
+        )?;
+        return Ok(RunResult { summary, run_id, error: Some(err) });
     }
 
     let mut maps = AdaptiveMaps::new();
@@ -2144,18 +2242,19 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         ("d3_window_stall".into(), J::B(d3.flag)),
         ("started_utc".into(), J::s(format_utc(started))),
         ("base_sha".into(), J::s(BASE_SHA)),
+        ("error".into(), fatal.as_ref().map(|e| J::s(e.as_str())).unwrap_or(J::Null)),
     ]);
-    if let Some(e) = fatal {
-        return Err(e);
-    }
-    Ok(RunResult { summary, run_id })
+    // Every attempt that wrote a run directory belongs in the master table,
+    // failed ones included, with the error filled.
+    append_master(&ctx.out_dir, &summary).map_err(|e| format!("master append: {e}"))?;
+    Ok(RunResult { summary, run_id, error: fatal })
 }
 
 // ---------------------------------------------------------------------------
 // Session driver: master table (JSONL + CSV), session.json, manifest.sha256.
 // ---------------------------------------------------------------------------
 
-const CSV_HEADER: &str = "run_id,kind,site,arm,level,outcome,latency_ms,fragment_count,order_ok,seq_ok,options_consistent,d1_uneven_options,d2_regular_gaps,d3_window_stall,started_utc,base_sha";
+const CSV_HEADER: &str = "run_id,kind,site,arm,level,outcome,latency_ms,fragment_count,order_ok,seq_ok,options_consistent,d1_uneven_options,d2_regular_gaps,d3_window_stall,started_utc,base_sha,error";
 
 fn csv_field(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
@@ -2188,6 +2287,7 @@ fn csv_row(summary: &J) -> String {
         b("d3_window_stall").to_string(),
         csv_field(s("started_utc")),
         csv_field(s("base_sha")),
+        csv_field(s("error")),
     ]
     .join(",")
 }
@@ -2212,6 +2312,98 @@ fn append_master(out_dir: &Path, summary: &J) -> Result<(), String> {
     }
     writeln!(csv, "{}", csv_row(summary)).map_err(|e| format!("master.csv write: {e}"))?;
     Ok(())
+}
+
+/// A wire-reached attempt that returns before the full artifact write
+/// (PORT_COLLISION, SYN send failed) still consumed a gate slot: it gets a
+/// run directory and a master row with the error filled, like every other
+/// attempt that reached the wire.
+fn write_early_failure(
+    out_dir: &Path,
+    kind: &str,
+    harness_commit: &str,
+    site: &str,
+    arm: Arm,
+    run_id: &str,
+    started: SystemTime,
+    outcome: &str,
+    error: &str,
+    log: &[String],
+) -> Result<J, String> {
+    let cfg = arm_cfg(arm);
+    let run_dir = out_dir.join("runs").join(run_id);
+    std::fs::create_dir_all(&run_dir).map_err(|e| format!("create run dir: {e}"))?;
+    PcapWriter::create(&run_dir.join("capture.pcap")).map_err(|e| format!("pcap create: {e}"))?;
+    let run_json = J::O(vec![
+        ("run_id".into(), J::s(run_id)),
+        ("kind".into(), J::s(kind)),
+        ("site".into(), J::s(site)),
+        ("arm".into(), J::s(arm.name)),
+        ("level".into(), J::s(level_name(arm.level))),
+        (
+            "profile_config".into(),
+            J::O(vec![
+                ("enabled_max_level".into(), J::s(level_name(cfg.enabled_max_level))),
+                ("allow_inter_delay".into(), J::B(cfg.allow_inter_delay)),
+                ("allow_window_override".into(), J::B(cfg.allow_window_override)),
+                ("balanced_cut_variant".into(), J::U(cfg.balanced_cut_variant as u64)),
+            ]),
+        ),
+        ("base_sha".into(), J::s(BASE_SHA)),
+        ("harness_commit".into(), J::s(harness_commit)),
+        ("started_utc".into(), J::s(format_utc(started))),
+        ("outcome".into(), J::s(outcome)),
+        ("latency_ms".into(), J::Null),
+        ("fragment_count".into(), J::U(0)),
+        ("error".into(), J::s(error)),
+        (
+            "notes".into(),
+            J::A(vec![J::s(
+                "attempt returned before the full artifact write; no fragments were emitted",
+            )]),
+        ),
+    ]);
+    std::fs::write(run_dir.join("run.json"), run_json.pretty())
+        .map_err(|e| format!("run.json write: {e}"))?;
+    let mut log_lines = log.to_vec();
+    log_lines.push(format!("artifacts written to {}", run_dir.display()));
+    std::fs::write(run_dir.join("run.log"), log_lines.join("\n") + "\n")
+        .map_err(|e| format!("run.log write: {e}"))?;
+    let summary = J::O(vec![
+        ("run_id".into(), J::s(run_id)),
+        ("kind".into(), J::s(kind)),
+        ("site".into(), J::s(site)),
+        ("arm".into(), J::s(arm.name)),
+        ("level".into(), J::s(level_name(arm.level))),
+        ("outcome".into(), J::s(outcome)),
+        ("latency_ms".into(), J::Null),
+        ("fragment_count".into(), J::U(0)),
+        ("order_ok".into(), J::B(false)),
+        ("seq_ok".into(), J::B(false)),
+        ("options_consistent".into(), J::B(false)),
+        ("d1_uneven_options".into(), J::B(false)),
+        ("d2_regular_gaps".into(), J::B(false)),
+        ("d3_window_stall".into(), J::B(false)),
+        ("started_utc".into(), J::s(format_utc(started))),
+        ("base_sha".into(), J::s(BASE_SHA)),
+        ("error".into(), J::s(error)),
+    ]);
+    append_master(out_dir, &summary).map_err(|e| format!("master append: {e}"))?;
+    Ok(summary)
+}
+
+/// Plan section h stop conditions: interference, WinDivert open/send failure,
+/// cap exhaustion. A spacing refusal only reaches here after the bounded gap
+/// waits failed, and a gate-history failure means the caps cannot be enforced
+/// at all, so both stop the session too.
+fn stops_session(e: &str) -> bool {
+    e.starts_with("INTERFERENCE")
+        || e.starts_with("hourly cap")
+        || e.starts_with("session cap")
+        || e.starts_with("spacing violation")
+        || e.starts_with("WinDivertOpen failed")
+        || e.starts_with("gate history")
+        || e.contains("send failed")
 }
 
 fn write_manifest(out_dir: &Path) -> Result<usize, String> {
@@ -2274,7 +2466,7 @@ fn run_session(
         out_dir: out_dir.to_path_buf(),
         api,
         qpc,
-        gate: Mutex::new(SafetyGate::new(session_cap)),
+        gate: Mutex::new(SafetyGate::load(out_dir, session_cap)?),
         harness_commit: git_head(),
         anchor_utc,
         anchor_qpc,
@@ -2293,30 +2485,51 @@ fn run_session(
     'session: for arm in arms {
         for _ in 0..count_per_arm {
             seq_no += 1;
-            let mut attempt = 0;
+            let mut collisions = 0;
+            let mut gap_waits = 0;
             loop {
-                attempt += 1;
                 match run_one(&ctx, site, *arm, seq_no) {
+                    // Ok = a run record exists (master row appended), even
+                    // for a failed attempt; the error rides on the result.
                     Ok(r) => {
-                        append_master(out_dir, &r.summary)?;
                         println!(
-                            "[{kind}] {} outcome={} latency_ms={:?}",
+                            "[{kind}] {} outcome={} latency_ms={:?} error={:?}",
                             r.run_id,
                             r.summary.get("outcome").and_then(|v| v.as_str()).unwrap_or("?"),
-                            r.summary.get("latency_ms").and_then(|v| v.as_f64())
+                            r.summary.get("latency_ms").and_then(|v| v.as_f64()),
+                            r.error
                         );
                         summaries.push(r.summary);
-                        break;
+                        match r.error {
+                            None => break,
+                            Some(e) if e == "PORT_COLLISION" && collisions < 2 => {
+                                collisions += 1;
+                                println!("[{kind}] port collision, retrying with a fresh port");
+                                continue;
+                            }
+                            Some(e) => {
+                                blockers.push(format!("{} arm={} seq={seq_no}: {e}", site, arm.name));
+                                eprintln!("[{kind}] BLOCKER: {e}");
+                                if stops_session(&e) {
+                                    break 'session;
+                                }
+                                break;
+                            }
+                        }
                     }
-                    Err(e) if e == "PORT_COLLISION" && attempt < 3 => {
-                        println!("[{kind}] port collision, retrying with a fresh port (attempt {attempt})");
+                    Err(e) if e.starts_with("spacing violation") && gap_waits < 2 => {
+                        gap_waits += 1;
+                        println!(
+                            "[{kind}] gate spacing: waiting out the {} s gap before retry",
+                            MIN_SPACING.as_secs()
+                        );
+                        std::thread::sleep(MIN_SPACING);
                         continue;
                     }
                     Err(e) => {
-                        let is_interference = e.starts_with("INTERFERENCE");
                         blockers.push(format!("{} arm={} seq={seq_no}: {e}", site, arm.name));
                         eprintln!("[{kind}] BLOCKER: {e}");
-                        if is_interference {
+                        if stops_session(&e) {
                             break 'session;
                         }
                         break;
@@ -2348,6 +2561,10 @@ fn run_session(
                 ("min_spacing_ms".into(), J::U(MIN_SPACING.as_millis() as u64)),
                 ("handshake_window_ms".into(), J::U(HANDSHAKE_WINDOW.as_millis() as u64)),
                 ("session_cap".into(), J::U(session_cap as u64)),
+                (
+                    "persisted_history".into(),
+                    J::s("gate_history.jsonl in this out dir; hourly cap and spacing bind across invocations"),
+                ),
             ]),
         ),
         ("runs".into(), J::A(summaries.clone())),
@@ -2469,13 +2686,25 @@ fn cmd_compare(dir: &Path, site_filter: Option<&str>) -> Result<(), String> {
             };
             let anomalies = if is_fast {
                 J::Null
-            } else {
-                let (f1, f2, f3) = fast.map(|f| (f.d1, f.d2, f.d3)).unwrap_or((0, 0, 0));
+            } else if let Some(f) = fast {
                 J::O(vec![
-                    ("uneven_options".into(), J::B(new_anomaly(st.d1, f1))),
-                    ("regular_gaps".into(), J::B(new_anomaly(st.d2, f2))),
-                    ("window_stall".into(), J::B(new_anomaly(st.d3, f3))),
-                    ("fast_flag_counts".into(), J::A(vec![J::U(f1 as u64), J::U(f2 as u64), J::U(f3 as u64)])),
+                    ("uneven_options".into(), J::B(new_anomaly(st.d1, f.d1))),
+                    ("regular_gaps".into(), J::B(new_anomaly(st.d2, f.d2))),
+                    ("window_stall".into(), J::B(new_anomaly(st.d3, f.d3))),
+                    ("fast_flag_counts".into(), J::A(vec![J::U(f.d1 as u64), J::U(f.d2 as u64), J::U(f.d3 as u64)])),
+                ])
+            } else {
+                // A missing Fast arm is not a clean Fast arm: without the
+                // baseline there is no new-anomaly verdict for any detector.
+                J::O(vec![
+                    ("baseline_missing".into(), J::B(true)),
+                    ("uneven_options".into(), J::Null),
+                    ("regular_gaps".into(), J::Null),
+                    ("window_stall".into(), J::Null),
+                    (
+                        "note".into(),
+                        J::s("Fast arm absent for this site; baseline missing, no new-anomaly verdict"),
+                    ),
                 ])
             };
             arm_objs.push(J::O(vec![
@@ -2750,47 +2979,177 @@ mod tests {
 
     // ---- Safety gate ------------------------------------------------------
 
+    const GATE_T0: i64 = 1_763_000_000_000; // fixed epoch ms for deterministic gate tests
+
+    fn gate_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("levi_measure_gate_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed_gate_history(dir: &Path, target: &str, times_ms: &[i64]) {
+        let mut text = String::new();
+        for t in times_ms {
+            let rec = J::O(vec![
+                ("target".into(), J::s(target)),
+                ("ts_ms".into(), J::I(*t)),
+                ("utc".into(), J::s(format_utc(UNIX_EPOCH + Duration::from_millis(*t as u64)))),
+            ]);
+            text.push_str(&rec.compact());
+            text.push('\n');
+        }
+        std::fs::write(dir.join(GATE_HISTORY_FILE), text).unwrap();
+    }
+
     #[test]
     fn cap_allows_60_blocks_61() {
         let mut gate = SafetyGate::new(1000);
-        let t0 = Instant::now();
         for i in 0..60 {
-            gate.check("example.com", t0 + Duration::from_secs(i * 3)).unwrap();
+            gate.check("example.com", GATE_T0 + i * 3000).unwrap();
         }
-        let err = gate.check("example.com", t0 + Duration::from_secs(180)).unwrap_err();
+        let err = gate.check("example.com", GATE_T0 + 180_000).unwrap_err();
         assert!(err.contains("hourly cap"));
     }
 
     #[test]
     fn cap_sliding_window_expires() {
         let mut gate = SafetyGate::new(1000);
-        let t0 = Instant::now();
         for i in 0..60 {
-            gate.check("example.com", t0 + Duration::from_secs(i * 3)).unwrap();
+            gate.check("example.com", GATE_T0 + i * 3000).unwrap();
         }
-        // First entry was at t0; one hour + 1 s later it has slid out.
-        gate.check("example.com", t0 + Duration::from_secs(3601)).unwrap();
+        // First entry was at GATE_T0; one hour + 1 s later it has slid out.
+        gate.check("example.com", GATE_T0 + 3_601_000).unwrap();
     }
 
     #[test]
     fn spacing_enforced() {
         let mut gate = SafetyGate::new(1000);
-        let t0 = Instant::now();
-        gate.check("example.com", t0).unwrap();
-        assert!(gate.check("example.com", t0 + Duration::from_millis(1999)).is_err());
-        gate.check("example.com", t0 + Duration::from_secs(2)).unwrap();
+        gate.check("example.com", GATE_T0).unwrap();
+        assert!(gate.check("example.com", GATE_T0 + 1999).is_err());
+        gate.check("example.com", GATE_T0 + 2000).unwrap();
         // Different target is independent.
-        gate.check("google.com", t0 + Duration::from_secs(2)).unwrap();
+        gate.check("google.com", GATE_T0 + 2000).unwrap();
     }
 
     #[test]
     fn session_cap_hard_stop() {
         let mut gate = SafetyGate::new(2);
-        let t0 = Instant::now();
-        gate.check("example.com", t0).unwrap();
-        gate.check("example.com", t0 + Duration::from_secs(3)).unwrap();
-        let err = gate.check("example.com", t0 + Duration::from_secs(6)).unwrap_err();
+        gate.check("example.com", GATE_T0).unwrap();
+        gate.check("example.com", GATE_T0 + 3000).unwrap();
+        let err = gate.check("example.com", GATE_T0 + 6000).unwrap_err();
         assert!(err.contains("session cap"));
+    }
+
+    #[test]
+    fn seeded_history_counts_toward_hourly_cap() {
+        // 60 attempts already recorded on disk (3 s apart, 5 min ago): a
+        // FRESH gate loaded from the out dir must refuse the 61st.
+        let dir = gate_tmp_dir("seed_cap");
+        let now = GATE_T0 + 300_000;
+        let times: Vec<i64> = (0..60).map(|i| GATE_T0 + i * 3000).collect();
+        seed_gate_history(&dir, "example.com", &times);
+        let mut gate = SafetyGate::load(&dir, 1000).unwrap();
+        let err = gate.check("example.com", now).unwrap_err();
+        assert!(err.contains("hourly cap"), "{err}");
+
+        // 59 on disk: the fresh gate allows exactly one more (the 60th),
+        // and the granted attempt is appended to the journal.
+        seed_gate_history(&dir, "example.com", &times[..59]);
+        let mut gate = SafetyGate::load(&dir, 1000).unwrap();
+        gate.check("example.com", now).unwrap();
+        let lines = std::fs::read_to_string(dir.join(GATE_HISTORY_FILE)).unwrap();
+        assert_eq!(lines.lines().count(), 60);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seeded_history_enforces_spacing() {
+        let dir = gate_tmp_dir("seed_gap");
+        let now = GATE_T0 + 10_000;
+        // Prior attempt recorded 1 s ago: refused; 2 s after it: allowed.
+        seed_gate_history(&dir, "example.com", &[now - 1000]);
+        let mut gate = SafetyGate::load(&dir, 1000).unwrap();
+        let err = gate.check("example.com", now).unwrap_err();
+        assert!(err.contains("spacing violation"), "{err}");
+        gate.check("example.com", now + 1000).unwrap();
+        // Prior attempt older than the gap: allowed immediately.
+        seed_gate_history(&dir, "google.com", &[now - 2500]);
+        let mut gate = SafetyGate::load(&dir, 1000).unwrap();
+        gate.check("google.com", now).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn campaign_cap_binds_across_invocations() {
+        // 7 invocations x 20 attempts to one target inside the rolling hour.
+        // Each invocation loads a FRESH gate from the same out dir; only the
+        // first 60 attempts may pass, and invocation 4 must stop on its very
+        // first handshake.
+        let dir = gate_tmp_dir("campaign");
+        let mut t = GATE_T0;
+        let mut granted = 0;
+        for invocation in 0..7 {
+            let mut gate = SafetyGate::load(&dir, 1000).unwrap();
+            for _ in 0..20 {
+                match gate.check("example.com", t) {
+                    Ok(()) => {
+                        granted += 1;
+                        t += 3000;
+                    }
+                    Err(e) => {
+                        assert_eq!(invocation, 3, "unexpected stop in invocation {invocation}: {e}");
+                        assert!(e.contains("hourly cap"), "{e}");
+                        assert_eq!(granted, 60);
+                        let lines = std::fs::read_to_string(dir.join(GATE_HISTORY_FILE)).unwrap();
+                        assert_eq!(lines.lines().count(), 60);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("campaign cap never stopped the 7x20 sequence");
+    }
+
+    #[test]
+    fn spacing_binds_across_invocations() {
+        let dir = gate_tmp_dir("xproc_gap");
+        let mut first = SafetyGate::load(&dir, 1000).unwrap();
+        first.check("example.com", GATE_T0).unwrap();
+        drop(first);
+        // Fresh process, 1 s later: the recorded attempt still enforces the gap.
+        let mut second = SafetyGate::load(&dir, 1000).unwrap();
+        let err = second.check("example.com", GATE_T0 + 1000).unwrap_err();
+        assert!(err.contains("spacing violation"), "{err}");
+        second.check("example.com", GATE_T0 + 2000).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_journal_fails_closed() {
+        let dir = gate_tmp_dir("corrupt");
+        std::fs::write(dir.join(GATE_HISTORY_FILE), "this is not json\n").unwrap();
+        assert!(SafetyGate::load(&dir, 1000).is_err());
+        std::fs::write(dir.join(GATE_HISTORY_FILE), "{\"target\":\"example.com\"}\n").unwrap();
+        let err = SafetyGate::load(&dir, 1000).err().expect("corrupt journal must fail closed");
+        assert!(err.contains("ts_ms"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_write_failure_refuses_handshake() {
+        let dir = gate_tmp_dir("write_fail");
+        // Journal path occupied by a directory: the append must fail and no
+        // slot may be consumed (fail closed).
+        std::fs::create_dir_all(dir.join(GATE_HISTORY_FILE)).unwrap();
+        let mut gate = SafetyGate::new(1000);
+        gate.journal = Some(dir.join(GATE_HISTORY_FILE));
+        let err = gate.check("example.com", GATE_T0).unwrap_err();
+        assert!(err.contains("gate history"), "{err}");
+        assert_eq!(gate.session_count, 0);
+        assert!(gate.history.get("example.com").map(|h| h.is_empty()).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3103,6 +3462,89 @@ mod tests {
         assert!(!new_anomaly(0, 2));
     }
 
+    fn master_row(run_id: &str, site: &str, arm: &str, d1: bool, d2: bool, d3: bool) -> J {
+        J::O(vec![
+            ("run_id".into(), J::s(run_id)),
+            ("kind".into(), J::s("EVIDENCE")),
+            ("site".into(), J::s(site)),
+            ("arm".into(), J::s(arm)),
+            ("level".into(), J::s(if arm == "fast" { "Fast" } else { "Hardened" })),
+            ("outcome".into(), J::s("success")),
+            ("latency_ms".into(), J::F(30.0)),
+            ("fragment_count".into(), J::U(3)),
+            ("order_ok".into(), J::B(true)),
+            ("seq_ok".into(), J::B(true)),
+            ("options_consistent".into(), J::B(true)),
+            ("d1_uneven_options".into(), J::B(d1)),
+            ("d2_regular_gaps".into(), J::B(d2)),
+            ("d3_window_stall".into(), J::B(d3)),
+            ("started_utc".into(), J::s("2026-11-13T00:00:00.000Z")),
+            ("base_sha".into(), J::s(BASE_SHA)),
+            ("error".into(), J::Null),
+        ])
+    }
+
+    fn write_master(dir: &Path, rows: &[J]) {
+        let text: String = rows.iter().map(|r| r.compact() + "\n").collect();
+        std::fs::write(dir.join("master.jsonl"), text).unwrap();
+    }
+
+    fn comparison_arm(dir: &Path, arm_name: &str) -> J {
+        let cmp = json_parse(&std::fs::read_to_string(dir.join("comparison.json")).unwrap()).unwrap();
+        let J::A(sites) = cmp.get("sites").unwrap() else { panic!("sites not an array") };
+        assert_eq!(sites.len(), 1);
+        let J::A(arms) = sites[0].get("arms").unwrap() else { panic!("arms not an array") };
+        arms.iter()
+            .find(|a| a.get("arm").and_then(|v| v.as_str()) == Some(arm_name))
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn compare_missing_fast_baseline_is_not_clean() {
+        // Hardened rows with detector flags and NO Fast arm on disk: the
+        // comparison must state the baseline is missing and must not call
+        // any anomaly new.
+        let dir = std::env::temp_dir().join(format!("levi_measure_cmp_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_master(&dir, &[
+            master_row("h1", "example.com", "hardened", true, false, false),
+            master_row("h2", "example.com", "hardened", false, true, true),
+        ]);
+        cmd_compare(&dir, None).unwrap();
+        let hardened = comparison_arm(&dir, "hardened");
+        let anom = hardened.get("new_anomalies_vs_fast").unwrap();
+        assert_eq!(anom.get("baseline_missing").and_then(|v| v.as_bool()), Some(true));
+        for k in ["uneven_options", "regular_gaps", "window_stall"] {
+            assert!(matches!(anom.get(k), Some(J::Null)), "{k} must be null without a baseline");
+        }
+        assert!(matches!(hardened.get("delta_median_vs_fast_ms"), Some(J::Null)));
+        assert!(matches!(hardened.get("delta_p95_vs_fast_ms"), Some(J::Null)));
+        // Per-arm flag counts stay as they are.
+        let J::A(counts) = hardened.get("detector_flag_counts").unwrap() else { panic!("counts") };
+        assert_eq!(counts.iter().filter_map(|v| v.as_f64()).collect::<Vec<_>>(), vec![1.0, 1.0, 1.0]);
+
+        // Control: with a clean Fast arm present, the same flags ARE new.
+        let dir2 = std::env::temp_dir().join(format!("levi_measure_cmp_present_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        write_master(&dir2, &[
+            master_row("f1", "example.com", "fast", false, false, false),
+            master_row("h1", "example.com", "hardened", true, false, false),
+            master_row("h2", "example.com", "hardened", false, true, true),
+        ]);
+        cmd_compare(&dir2, None).unwrap();
+        let hardened = comparison_arm(&dir2, "hardened");
+        let anom = hardened.get("new_anomalies_vs_fast").unwrap();
+        assert!(anom.get("baseline_missing").is_none());
+        for k in ["uneven_options", "regular_gaps", "window_stall"] {
+            assert_eq!(anom.get(k).and_then(|v| v.as_bool()), Some(true), "{k}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     // ---- CSV / manifest -----------------------------------------------------------
 
     #[test]
@@ -3150,6 +3592,44 @@ mod tests {
         // The manifest never covers itself.
         assert!(!manifest.contains("manifest.sha256"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn early_failure_writes_record_and_master_row() {
+        // A wire-reached attempt that returns before the full artifact write
+        // still gets a run directory and a master row with the error filled.
+        let dir = std::env::temp_dir().join(format!("levi_measure_early_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = UNIX_EPOCH + Duration::from_millis(GATE_T0 as u64);
+        let summary = write_early_failure(
+            &dir, "SMOKE", "testcommit", "example.com", arm_by_name("fast").unwrap(),
+            "early-run-001", started, "port_collision", "PORT_COLLISION",
+            &["SYN sent isn=1".to_string()],
+        )
+        .unwrap();
+        let run_dir = dir.join("runs").join("early-run-001");
+        assert!(run_dir.join("run.json").exists());
+        assert!(run_dir.join("run.log").exists());
+        let pcap = std::fs::read(run_dir.join("capture.pcap")).unwrap();
+        assert_eq!(pcap, pcap_global_header()); // valid empty capture
+        let rj = json_parse(&std::fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(rj.get("error").and_then(|v| v.as_str()), Some("PORT_COLLISION"));
+        assert_eq!(rj.get("outcome").and_then(|v| v.as_str()), Some("port_collision"));
+        assert_eq!(summary.get("error").and_then(|v| v.as_str()), Some("PORT_COLLISION"));
+        let jsonl = std::fs::read_to_string(dir.join("master.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 1);
+        let row = json_parse(jsonl.lines().next().unwrap()).unwrap();
+        assert_eq!(row.get("run_id").and_then(|v| v.as_str()), Some("early-run-001"));
+        assert_eq!(row.get("error").and_then(|v| v.as_str()), Some("PORT_COLLISION"));
+        let csv = std::fs::read_to_string(dir.join("master.csv")).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), CSV_HEADER);
+        let data = lines.next().unwrap();
+        assert_eq!(data.split(',').count(), CSV_HEADER.split(',').count());
+        assert!(data.ends_with(",PORT_COLLISION"));
+        assert!(lines.next().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- UTC formatting -------------------------------------------------------------
