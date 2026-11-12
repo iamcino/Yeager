@@ -2,6 +2,7 @@
 //! Provides surgical-precision TLS transport stabilization directly in user-space via WinDivert.
 
 pub mod adaptive;
+pub mod adaptive_emit;
 pub mod engine;
 pub mod packet;
 pub mod raw;
