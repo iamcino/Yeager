@@ -22,7 +22,7 @@ use levi::raw::{
     WINDIVERT_PARAM_QUEUE_LENGTH, WINDIVERT_PARAM_QUEUE_SIZE, WINDIVERT_PARAM_QUEUE_TIME,
 };
 use levi::tls;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -847,7 +847,7 @@ fn build_client_hello(sni: &str, rng: &mut Rng) -> Vec<u8> {
     push_ext(
         &mut exts,
         0x0010,
-        &[0x00, 0x0e, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'],
+        &[0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'],
     );
     push_ext(&mut exts, 0x0017, &[]);
     push_ext(&mut exts, 0x0023, &[]);
@@ -1053,6 +1053,7 @@ struct WireSender {
     error: Mutex<Option<String>>,
     sent: Mutex<Vec<SentRecord>>,
     ip_id: AtomicU16,
+    injected_ip_ids: Arc<Mutex<HashSet<u16>>>,
 }
 
 impl WireSender {
@@ -1063,6 +1064,17 @@ impl WireSender {
         addr.if_idx = if_idx;
         unsafe {
             (self.api.calc_checksums)(pkt.as_mut_ptr(), pkt.len() as u32, &mut addr, 0);
+        }
+        // Re-assert direction/impostor after the checksum helper, mirroring the
+        // merged engine's send_raw. Note the SNIFF capture will clear Impostor
+        // regardless, so ownership is tracked by IP id below, not this flag.
+        addr.set_outbound(true);
+        addr.set_impostor(true);
+        // Track the IP identification field so the capture loop can recognise
+        // this injected packet even though SNIFF strips the Impostor flag.
+        if pkt.len() >= 6 {
+            let ip_id = u16::from_be_bytes([pkt[4], pkt[5]]);
+            self.injected_ip_ids.lock().unwrap().insert(ip_id);
         }
         let mut sent_len = 0u32;
         let res = unsafe {
@@ -1175,12 +1187,18 @@ struct CapturedPacket {
     utc: SystemTime,
     outbound: bool,
     impostor: bool,
+    bitfields: u32,
+    // True when the packet is one the harness injected. SNIFF captures clear the
+    // driver's Impostor flag (they set Sniffed instead), so ownership is decided
+    // by the IP identification field the harness assigns and tracks, not impostor.
+    harness: bool,
 }
 
 struct CaptureShared {
     packets: Mutex<Vec<CapturedPacket>>,
     interference: AtomicBool,
     stop: AtomicBool,
+    injected_ip_ids: Arc<Mutex<HashSet<u16>>>,
 }
 
 fn capture_loop(api: Arc<WinDivertApi>, handle: SafeHandle, shared: Arc<CaptureShared>, qpc: Arc<Qpc>) {
@@ -1210,9 +1228,17 @@ fn capture_loop(api: Arc<WinDivertApi>, handle: SafeHandle, shared: Arc<CaptureS
         }
         let outbound = addr.is_outbound();
         let impostor = addr.is_impostor();
-        // Any host-originated packet on the measurement flow means something
-        // else owns this port: stop the session (blocker).
-        if outbound && !impostor {
+        // SNIFF clears Impostor (sets Sniffed), so identify our own injected
+        // packets by the IP identification field we assign and track.
+        let harness = if recv_len >= 6 {
+            let ip_id = u16::from_be_bytes([buf[4], buf[5]]);
+            shared.injected_ip_ids.lock().unwrap().contains(&ip_id)
+        } else {
+            false
+        };
+        // Any host-originated outbound packet on the measurement flow means
+        // something else owns this port: stop the session (blocker).
+        if outbound && !harness {
             shared.interference.store(true, Ordering::SeqCst);
         }
         let ts = if addr.timestamp != 0 { addr.timestamp } else { qpc.now() };
@@ -1222,11 +1248,20 @@ fn capture_loop(api: Arc<WinDivertApi>, handle: SafeHandle, shared: Arc<CaptureS
             utc: SystemTime::now(),
             outbound,
             impostor,
+            bitfields: addr.bitfields,
+            harness,
         });
     }
 }
 
-fn shield_loop(api: Arc<WinDivertApi>, handle: SafeHandle, stop: Arc<AtomicBool>, count: Arc<AtomicUsize>) {
+fn shield_loop(
+    api: Arc<WinDivertApi>,
+    handle: SafeHandle,
+    stop: Arc<AtomicBool>,
+    count: Arc<AtomicUsize>,
+    shared: Arc<CaptureShared>,
+    qpc: Arc<Qpc>,
+) {
     let mut buf = vec![0u8; 65535];
     let mut addr = WinDivertAddress::default();
     let mut recv_len = 0u32;
@@ -1251,7 +1286,18 @@ fn shield_loop(api: Arc<WinDivertApi>, handle: SafeHandle, stop: Arc<AtomicBool>
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        // Deliberately not re-injected: the host stack must never see this flow.
+        // Record the inbound packet for the capture, then deliberately do NOT
+        // re-inject it: the host stack must never see this flow.
+        let ts = if addr.timestamp != 0 { addr.timestamp } else { qpc.now() };
+        shared.packets.lock().unwrap().push(CapturedPacket {
+            bytes: buf[..recv_len as usize].to_vec(),
+            qpc: ts,
+            utc: SystemTime::now(),
+            outbound: addr.is_outbound(),
+            impostor: addr.is_impostor(),
+            bitfields: addr.bitfields,
+            harness: false,
+        });
         count.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1482,15 +1528,17 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
     let ts_val = (rng.next_u64() & 0x7FFF_FFFF) as u32;
     let flow = flow_key_v4(local_ip, remote, local_port, 443);
 
+    // Disjoint-direction capture: the SNIFF handle records outbound (our injected
+    // packets) and never drops; the shield records inbound AND drops it. Because
+    // the two filters match opposite directions, no priority ordering between the
+    // handles is required for the capture to see every packet on the flow.
     let sniff_filter = format!(
-        "(ip.SrcAddr == {local_ip} and ip.DstAddr == {remote} and tcp.SrcPort == {local_port} and tcp.DstPort == 443) or (ip.SrcAddr == {remote} and ip.DstAddr == {local_ip} and tcp.SrcPort == 443 and tcp.DstPort == {local_port})"
+        "outbound and ip.SrcAddr == {local_ip} and ip.DstAddr == {remote} and tcp.SrcPort == {local_port} and tcp.DstPort == 443"
     );
     let shield_filter = format!(
         "inbound and ip.SrcAddr == {remote} and ip.DstAddr == {local_ip} and tcp.SrcPort == 443 and tcp.DstPort == {local_port}"
     );
-    // SNIFF at higher priority (lower number) than the DROP shield so the
-    // capture sees every inbound packet before the shield removes it.
-    let sniff = open_handle(&ctx.api, &sniff_filter, -100, WINDIVERT_FLAG_SNIFF)?;
+    let sniff = open_handle(&ctx.api, &sniff_filter, 0, WINDIVERT_FLAG_SNIFF)?;
     let shield = match open_handle(&ctx.api, &shield_filter, 0, 0) {
         Ok(h) => h,
         Err(e) => {
@@ -1499,10 +1547,12 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         }
     };
 
+    let injected_ip_ids: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
     let shared = Arc::new(CaptureShared {
         packets: Mutex::new(Vec::new()),
         interference: AtomicBool::new(false),
         stop: AtomicBool::new(false),
+        injected_ip_ids: Arc::clone(&injected_ip_ids),
     });
     let shield_stop = Arc::new(AtomicBool::new(false));
     let shield_count = Arc::new(AtomicUsize::new(0));
@@ -1516,7 +1566,9 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         let api = Arc::clone(&ctx.api);
         let stop = Arc::clone(&shield_stop);
         let count = Arc::clone(&shield_count);
-        std::thread::spawn(move || shield_loop(api, shield, stop, count))
+        let shared = Arc::clone(&shared);
+        let qpc = Arc::clone(&ctx.qpc);
+        std::thread::spawn(move || shield_loop(api, shield, stop, count, shared, qpc))
     };
 
     let sender = Arc::new(WireSender {
@@ -1527,6 +1579,7 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         error: Mutex::new(None),
         sent: Mutex::new(Vec::new()),
         ip_id: AtomicU16::new((rng.next_u64() & 0xFFFF) as u16),
+        injected_ip_ids: Arc::clone(&injected_ip_ids),
     });
     sender.flows.lock().unwrap().insert(
         flow,
@@ -1722,7 +1775,7 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
             for p in &snapshot {
                 let Some(parsed) = ParsedPacket::parse(&p.bytes) else { continue };
                 if p.outbound {
-                    if p.impostor && !parsed.payload.is_empty() && first_frag_qpc.is_none() {
+                    if p.harness && !parsed.payload.is_empty() && first_frag_qpc.is_none() {
                         first_frag_qpc = Some(p.qpc);
                         deadline = Some(Instant::now() + HANDSHAKE_WINDOW);
                     }
@@ -1807,10 +1860,8 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
     maps.wipe();
     drop(reserve);
 
-    if let Some(e) = fatal {
-        return Err(e);
-    }
-
+    // Blocked/failed runs still write their capture + record so the blocker can
+    // be diagnosed from artifacts; the Err is returned only after they exist.
     let packets = shared.packets.lock().unwrap().clone();
     let shielded = shield_count.load(Ordering::Relaxed);
     log.push(format!(
@@ -1847,6 +1898,8 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
             ("i".into(), J::U(i as u64)),
             ("dir".into(), J::s(if p.outbound { "out" } else { "in" })),
             ("impostor".into(), J::B(p.impostor)),
+            ("harness".into(), J::B(p.harness)),
+            ("bitfields".into(), J::s(format!("0x{:08X}", p.bitfields))),
             ("qpc".into(), J::I(p.qpc)),
             ("utc".into(), J::s(format_utc(p.utc))),
             ("seq".into(), J::U(parsed.tcp_seq as u64)),
@@ -1856,7 +1909,7 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
             ("payload_len".into(), J::U(parsed.payload.len() as u64)),
             ("option_kinds".into(), J::A(kinds.iter().map(|k| J::U(*k as u64)).collect())),
         ]));
-        if p.outbound && p.impostor && !parsed.payload.is_empty() {
+        if p.outbound && p.harness && !parsed.payload.is_empty() {
             let offset = parsed.tcp_seq.wrapping_sub(base_seq) as usize;
             frag_offsets.push(offset);
             frag_kinds.push(kinds.clone());
@@ -2064,6 +2117,7 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         ("packets".into(), J::A(packet_records)),
         ("shielded_inbound".into(), J::U(shielded as u64)),
         ("interference".into(), J::B(shared.interference.load(Ordering::SeqCst))),
+        ("error".into(), fatal.as_ref().map(|e| J::s(e.as_str())).unwrap_or(J::Null)),
         ("notes".into(), J::A(notes.iter().map(J::s).collect())),
     ]);
 
@@ -2091,6 +2145,9 @@ fn run_one(ctx: &SessionCtx, site: &str, arm: Arm, seq_no: usize) -> Result<RunR
         ("started_utc".into(), J::s(format_utc(started))),
         ("base_sha".into(), J::s(BASE_SHA)),
     ]);
+    if let Some(e) = fatal {
+        return Err(e);
+    }
     Ok(RunResult { summary, run_id })
 }
 
@@ -2761,6 +2818,48 @@ mod tests {
         assert_eq!(record_len + 5, hello.len());
         let hs_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
         assert_eq!(hs_len + 9, hello.len());
+    }
+
+    #[test]
+    fn hello_extensions_lengths_consistent() {
+        let hello = sample_hello();
+        // Walk the ClientHello body to the extension block.
+        let mut c = 9usize; // record header (5) + handshake header (4)
+        c += 2; // client_version
+        c += 32; // random
+        let sid_len = hello[c] as usize;
+        c += 1 + sid_len;
+        let suites_len = u16::from_be_bytes([hello[c], hello[c + 1]]) as usize;
+        c += 2 + suites_len;
+        let comp_len = hello[c] as usize;
+        c += 1 + comp_len;
+        let ext_total = u16::from_be_bytes([hello[c], hello[c + 1]]) as usize;
+        c += 2;
+        let ext_end = c + ext_total;
+        assert_eq!(ext_end, hello.len(), "extension block must end exactly at the record end");
+        let mut saw_alpn = false;
+        while c < ext_end {
+            let kind = u16::from_be_bytes([hello[c], hello[c + 1]]);
+            let len = u16::from_be_bytes([hello[c + 2], hello[c + 3]]) as usize;
+            assert!(c + 4 + len <= ext_end, "extension {kind:#06x} overruns the block");
+            let data = &hello[c + 4..c + 4 + len];
+            if kind == 0x0010 {
+                saw_alpn = true;
+                // ALPN: 2-byte protocol-list length, then (1-byte len + name) entries.
+                let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                assert_eq!(list_len + 2, data.len(), "ALPN list length must cover exactly the protocol bytes");
+                let mut p = 2usize;
+                while p < data.len() {
+                    let n = data[p] as usize;
+                    assert!(p + 1 + n <= data.len(), "ALPN protocol overruns the list");
+                    p += 1 + n;
+                }
+                assert_eq!(p, data.len(), "ALPN protocols must consume the list exactly");
+            }
+            c += 4 + len;
+        }
+        assert_eq!(c, ext_end);
+        assert!(saw_alpn, "ClientHello must carry ALPN");
     }
 
     #[test]
