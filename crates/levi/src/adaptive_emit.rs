@@ -124,7 +124,7 @@ fn ceil_tick_of(epoch: Instant, now: Instant) -> u64 {
         .checked_duration_since(epoch)
         .unwrap_or(Duration::ZERO)
         .as_nanos();
-    ((nanos + TICK_NANOS - 1) / TICK_NANOS) as u64
+    nanos.div_ceil(TICK_NANOS) as u64
 }
 
 /// Split the payload at the cut points into (offset, bytes) segments. Invalid cuts
@@ -175,7 +175,7 @@ impl QueueState {
         let order = emit_order(hello.plan.order, segments.len());
         let delay = hello.plan.inter_delay;
         let now_tick = ceil_tick_of(self.epoch, now);
-        let delay_ticks = ((delay.as_nanos() + TICK_NANOS - 1) / TICK_NANOS) as u64;
+        let delay_ticks = delay.as_nanos().div_ceil(TICK_NANOS) as u64;
         let mut slots: Vec<Option<Fragment>> = segments
             .into_iter()
             .map(|(offset, bytes)| {

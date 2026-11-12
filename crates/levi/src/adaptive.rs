@@ -233,11 +233,11 @@ impl<K: Clone + Eq + Hash, V> HandLru<K, V> {
             return None;
         }
         let mut evicted = None;
-        if self.map.len() >= self.cap {
-            if let Some(old) = self.order.pop_back() {
-                self.map.remove(&old);
-                evicted = Some(old);
-            }
+        if self.map.len() >= self.cap
+            && let Some(old) = self.order.pop_back()
+        {
+            self.map.remove(&old);
+            evicted = Some(old);
         }
         self.map.insert(key.clone(), value);
         self.order.push_front(key);
@@ -266,12 +266,11 @@ impl<K: Clone + Eq + Hash, V> HandLru<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        if let Some(pos) = self.order.iter().position(|k| k.borrow() == key) {
-            if pos != 0 {
-                if let Some(k) = self.order.remove(pos) {
-                    self.order.push_front(k);
-                }
-            }
+        if let Some(pos) = self.order.iter().position(|k| k.borrow() == key)
+            && pos != 0
+            && let Some(k) = self.order.remove(pos)
+        {
+            self.order.push_front(k);
         }
     }
 }
@@ -446,15 +445,14 @@ impl AdaptiveMaps {
                 descend(st);
             }
         }
-        if let Some(key) = st.sni_key.as_deref() {
-            if st.level <= AdaptiveLevel::Fast {
-                if let Some(entry) = self.domain_map.get_mut(key) {
-                    entry.decay = entry.decay.saturating_add(1);
-                    if entry.decay >= DOMAIN_STICKY_DECAY_SUCCESSES {
-                        entry.level = entry.level.lowered().max(AdaptiveLevel::Fast);
-                        entry.decay = 0;
-                    }
-                }
+        if let Some(key) = st.sni_key.as_deref()
+            && st.level <= AdaptiveLevel::Fast
+            && let Some(entry) = self.domain_map.get_mut(key)
+        {
+            entry.decay = entry.decay.saturating_add(1);
+            if entry.decay >= DOMAIN_STICKY_DECAY_SUCCESSES {
+                entry.level = entry.level.lowered().max(AdaptiveLevel::Fast);
+                entry.decay = 0;
             }
         }
     }
@@ -515,10 +513,10 @@ impl AdaptiveMaps {
                 sni_key: sni.and_then(normalize_sni),
             },
         );
-        if let Some(evicted_flow) = evicted {
-            if let Some(sink) = &self.sink {
-                sink.cancel_flow(&evicted_flow);
-            }
+        if let Some(evicted_flow) = evicted
+            && let Some(sink) = &self.sink
+        {
+            sink.cancel_flow(&evicted_flow);
         }
     }
 
