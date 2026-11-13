@@ -178,6 +178,17 @@ impl Snapshot {
     }
 }
 
+/// A complete two-family capture for one adapter: IPv4 from the documented
+/// Flags=0 path plus IPv6 from the approved version-gated family selector
+/// (Q1 ruling, Garen 2026-11-14). Both snapshots are deep-owned and freed
+/// exactly once. There is no IPv4-only variant: if the IPv6 selector is
+/// unavailable or inconsistent the whole capture is refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFamilySnapshot {
+    pub ipv4: Snapshot,
+    pub ipv6: Snapshot,
+}
+
 /// Adapter identity. Hints detect reincarnation; the GUID is authoritative.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterIdentity {
@@ -242,6 +253,11 @@ pub enum CaptureError {
     UnsupportedFamily(Family),
     /// Q1 gate: no approved complete getter contract for this family/build.
     RefuseUnsupportedTakeover(String),
+    /// Q1 ruling defense-in-depth: the IPv6 family-selector result is not
+    /// self-consistent (a nameserver is not IPv6, or the returned properties do
+    /// not belong to the IPv6 settings structure). Capture is refused, never
+    /// silently downgraded to an IPv4-only snapshot.
+    FamilyInconsistent(String),
 }
 
 impl std::fmt::Display for CaptureError {
@@ -267,6 +283,7 @@ impl std::fmt::Display for CaptureError {
             CaptureError::NoSelectedOnlineAdapter => write!(f, "no selected online adapter"),
             CaptureError::UnsupportedFamily(fam) => write!(f, "unsupported family {}", fam.as_str()),
             CaptureError::RefuseUnsupportedTakeover(m) => write!(f, "refusing unsupported takeover: {m}"),
+            CaptureError::FamilyInconsistent(m) => write!(f, "IPv6 selector result family-inconsistent: {m}"),
         }
     }
 }

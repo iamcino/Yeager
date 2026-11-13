@@ -1,11 +1,25 @@
 //! DnsBackend trait, deep-owned reader/readback/capability probing and the
-//! capture pipeline (U01). Platform-independent: the Windows API and a fake
-//! both plug into the same generic pipeline, so the capture contract is
+//! capture pipeline (U01 + U01b). Platform-independent: the Windows API and a
+//! fake both plug into the same generic pipeline, so the capture contract is
 //! testable off Windows. No mutation/setter integration lives here.
+//!
+//! Q1 ruling (Garen, 2026-11-14, under Cino's flow delegation of 2026-11-14
+//! 00:46, reported to the owner 09:00; evidence base Q1-EVIDENCE.md): the
+//! version-gated family-selector exception is approved for the reader. IPv4
+//! stays on the documented Version=3/Flags=0 path; IPv6 may use the
+//! DNS_SETTING_IPV6 selector only on OS builds >= [`MIN_SELECTOR_BUILD`], as a
+//! read only, with defense-in-depth family-consistency verification. Where the
+//! exception is unavailable the reader refuses unsupported takeover — there is
+//! no silent IPv4-only snapshot fallback.
 
 use crate::model::*;
 
 pub const DNS_SETTING_IPV6: u64 = 1;
+/// Minimum Windows build for the approved IPv6 family-selector exception
+/// (Q1 ruling, Garen 2026-11-14). The *threshold* is the ruling's bound; the
+/// actual OS build is read at runtime (see `windows::os_build`) and compared
+/// against it — never a compile-time build assumption.
+pub const MIN_SELECTOR_BUILD: u32 = 20348;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 /// ENABLE_AUTO | ENABLE | FALLBACK_TO_UDP | ENABLE_DDR.
@@ -100,15 +114,25 @@ pub trait FamilyProbe {
 
 /// Which getter family-selector contract the reader may use.
 ///
-/// Q1 (SPEC-DNS-FIX.md §4/§13): the documented path (Flags=0) exposes IPv4
-/// only. Complete IPv6 readback requires the DNS_SETTING_IPV6 family selector,
-/// which is a *candidate*, not an approved documented contract. The default
-/// policy therefore refuses IPv6 capture; the exception is usable only when
-/// explicitly approved for specific builds (a coordinator/owner ruling).
+/// Q1 (SPEC-DNS-FIX.md §4/§13) was settled by the coordinator ruling (Garen,
+/// 2026-11-14, under Cino's flow delegation of 2026-11-14 00:46, reported to the
+/// owner 09:00; evidence base Q1-EVIDENCE.md): the documented path (Flags=0)
+/// exposes complete IPv4 only, and complete IPv6 readback is obtained with the
+/// DNS_SETTING_IPV6 family selector. The ruling APPROVES that selector as a
+/// bounded, version-gated, read-only exception — implemented by
+/// [`Self::VersionGatedException`]. [`Self::DocumentedOnly`] keeps the prior
+/// conservative behavior (refuse IPv6). The default stays conservative; the
+/// approved exception is opt-in and is never self-applied by the library.
 #[derive(Clone, Debug)]
 pub enum FamilySelectorPolicy {
+    /// Documented path only: IPv4 via Flags=0; IPv6 capture is refused.
     DocumentedOnly,
-    VersionGatedException { approved_builds: Vec<String> },
+    /// The approved Q1 exception: IPv4 via Flags=0 (documented path stays
+    /// primary) and IPv6 via the DNS_SETTING_IPV6 selector, but only when the
+    /// runtime OS build is >= [`MIN_SELECTOR_BUILD`]. Read-only; the selector
+    /// is never a setter flag. Below the gate, or if the build cannot be
+    /// established, IPv6 capture is refused (no silent fallback).
+    VersionGatedException,
 }
 
 impl Default for FamilySelectorPolicy {
@@ -123,22 +147,68 @@ impl FamilySelectorPolicy {
             FamilySelectorPolicy::DocumentedOnly => match family {
                 Family::Ipv4 => Ok(0),
                 Family::Ipv6 => Err(CaptureError::RefuseUnsupportedTakeover(
-                    "Q1 unresolved: no approved documented IPv6 getter contract".into(),
+                    "no approved documented IPv6 getter contract (DocumentedOnly policy)".into(),
                 )),
             },
-            FamilySelectorPolicy::VersionGatedException { approved_builds } => {
-                if !approved_builds.iter().any(|b| b == os_build) {
-                    return Err(CaptureError::RefuseUnsupportedTakeover(format!(
-                        "Q1 family-selector exception not approved for build {os_build}"
-                    )));
+            FamilySelectorPolicy::VersionGatedException => match family {
+                // Bound 1: the documented path stays primary for IPv4.
+                Family::Ipv4 => Ok(0),
+                // Bound 2: the IPv6 selector is gated on the runtime OS build.
+                Family::Ipv6 => {
+                    let build = major_build(os_build).ok_or_else(|| {
+                        CaptureError::RefuseUnsupportedTakeover(format!(
+                            "cannot establish OS build from {os_build:?}; refusing IPv6 selector"
+                        ))
+                    })?;
+                    if build < MIN_SELECTOR_BUILD {
+                        return Err(CaptureError::RefuseUnsupportedTakeover(format!(
+                            "Q1 family-selector exception requires build >= {MIN_SELECTOR_BUILD}; OS build {build}"
+                        )));
+                    }
+                    Ok(DNS_SETTING_IPV6)
                 }
-                Ok(match family {
-                    Family::Ipv4 => 0,
-                    Family::Ipv6 => DNS_SETTING_IPV6,
-                })
+            },
+        }
+    }
+}
+
+/// Major Windows build number from an OS build string such as "26300.9974" or
+/// "20348". The UBR suffix is a revision, not part of the >= 20348 gate. Returns
+/// `None` when the build cannot be established, so the caller refuses rather
+/// than guesses (defense in depth).
+fn major_build(os_build: &str) -> Option<u32> {
+    os_build.split('.').next()?.trim().parse::<u32>().ok()
+}
+
+/// Defense in depth for the approved IPv6 selector (Q1 ruling bound 3): the
+/// selector result must be self-consistent before it is accepted.
+///
+/// * The getter must echo the DNS_SETTING_IPV6 selector in `flags_returned`
+///   (Q1-EVIDENCE.md: "flags_returned echoes the input selector"). That confirms
+///   the returned properties belong to the IPv6 settings structure, not the
+///   IPv4 one.
+/// * Every returned nameserver address must parse as IPv6.
+///
+/// Any violation refuses capture with [`CaptureError::FamilyInconsistent`];
+/// there is no silent fallback to an IPv4-only snapshot.
+fn verify_ipv6_selector(raw: &RawSettings) -> Result<(), CaptureError> {
+    if raw.flags_returned != DNS_SETTING_IPV6 {
+        return Err(CaptureError::FamilyInconsistent(format!(
+            "selector returned flags {} (expected {DNS_SETTING_IPV6}); properties are not the IPv6 settings structure",
+            raw.flags_returned
+        )));
+    }
+    if let Some(ns) = &raw.name_server {
+        for server in parse_servers(ns)? {
+            if !server.address.is_ipv6() {
+                return Err(CaptureError::FamilyInconsistent(format!(
+                    "IPv6 selector returned non-IPv6 nameserver {}",
+                    server.canonical()
+                )));
             }
         }
     }
+    Ok(())
 }
 
 /// Capture one family once: registry provenance corroborated by the configured
@@ -169,6 +239,12 @@ pub fn capture_family<A: SettingsApi, R: RegistryProvenance>(
 
     let guard = SettingsGuard::new(api, guid, flags)?;
     let raw = guard.deep_copy()?;
+    // Bound 3: when the IPv6 selector was used, verify the result is
+    // self-consistent before accepting it. On refusal the guard still drops
+    // (frees exactly once); there is no silent fallback.
+    if flags == DNS_SETTING_IPV6 {
+        verify_ipv6_selector(&raw)?;
+    }
     let snapshot = build_snapshot(family, flags, &rv, reg_servers, &raw, capability, captured_at_utc)?;
     drop(guard);
     Ok(snapshot)
@@ -194,6 +270,27 @@ pub fn capture_stable<A: SettingsApi, R: RegistryProvenance>(
         last = again;
     }
     Err(CaptureError::CaptureUnstable)
+}
+
+/// Assemble a complete two-family snapshot: IPv4 from the documented Flags=0
+/// path plus IPv6 from the approved version-gated selector (Q1 ruling, Garen
+/// 2026-11-14). Each family is captured stably and deep-owned, freed exactly
+/// once. Read-only.
+///
+/// Bound 4: if the IPv6 selector is unavailable (DocumentedOnly policy, build
+/// below [`MIN_SELECTOR_BUILD`]) or errors or returns family-inconsistent data,
+/// the whole capture is refused — there is NO IPv4-only snapshot fallback.
+pub fn capture_two_families<A: SettingsApi, R: RegistryProvenance>(
+    api: &A,
+    reg: &R,
+    guid: &str,
+    policy: &FamilySelectorPolicy,
+    capability: Capability,
+    captured_at_utc: &str,
+) -> Result<TwoFamilySnapshot, CaptureError> {
+    let ipv4 = capture_stable(api, reg, guid, Family::Ipv4, policy, capability.clone(), captured_at_utc)?;
+    let ipv6 = capture_stable(api, reg, guid, Family::Ipv6, policy, capability, captured_at_utc)?;
+    Ok(TwoFamilySnapshot { ipv4, ipv6 })
 }
 
 fn build_snapshot(
@@ -346,6 +443,26 @@ impl<A: SettingsApi, R: RegistryProvenance, P: FamilyProbe> ReaderDnsBackend<A, 
             api_version: 3,
             family_supported: self.probe.family_supported(guid, family)?,
         })
+    }
+
+    /// Complete two-family capture for one adapter (Q1 ruling). Probes both
+    /// families, then assembles IPv4 (documented Flags=0) + IPv6 (approved
+    /// version-gated selector). Refuses the whole capture if either family is
+    /// unsupported or the IPv6 selector is unavailable/inconsistent — no
+    /// IPv4-only fallback. Read-only.
+    pub fn capture_complete(&self, guid: &str) -> Result<TwoFamilySnapshot, CaptureError> {
+        let cap4 = self.capability_for(guid, Family::Ipv4)?;
+        if !cap4.family_supported {
+            return Err(CaptureError::UnsupportedFamily(Family::Ipv4));
+        }
+        let cap6 = self.capability_for(guid, Family::Ipv6)?;
+        if !cap6.family_supported {
+            return Err(CaptureError::UnsupportedFamily(Family::Ipv6));
+        }
+        let now = (self.clock)();
+        let ipv4 = capture_stable(&self.api, &self.registry, guid, Family::Ipv4, &self.policy, cap4, &now)?;
+        let ipv6 = capture_stable(&self.api, &self.registry, guid, Family::Ipv6, &self.policy, cap6, &now)?;
+        Ok(TwoFamilySnapshot { ipv4, ipv6 })
     }
 }
 

@@ -17,7 +17,7 @@ fn documented() -> FamilySelectorPolicy {
     FamilySelectorPolicy::DocumentedOnly
 }
 fn exception() -> FamilySelectorPolicy {
-    FamilySelectorPolicy::VersionGatedException { approved_builds: vec![BUILD.into()] }
+    FamilySelectorPolicy::VersionGatedException
 }
 fn cv4(api: &FakeSettingsApi, reg: &FakeRegistry, p: &FamilySelectorPolicy) -> Result<Snapshot, CaptureError> {
     capture_family(api, reg, GUID, Family::Ipv4, p, cap(), NOW)
@@ -35,11 +35,16 @@ fn auto_v4(api: &FakeSettingsApi, reg: &FakeRegistry) {
 }
 fn static_v6(api: &FakeSettingsApi, reg: &FakeRegistry, ns: &str, props: Vec<RawProperty>) {
     reg.set_value(GUID, Family::Ipv6, static_value(GUID, Family::Ipv6, ns));
-    api.set_response(GUID, DNS_SETTING_IPV6, raw_settings(Some(ns), props));
+    // The getter echoes the input selector (Q1-EVIDENCE.md): flags_returned=1.
+    let mut raw = raw_settings(Some(ns), props);
+    raw.flags_returned = DNS_SETTING_IPV6;
+    api.set_response(GUID, DNS_SETTING_IPV6, raw);
 }
 fn auto_v6(api: &FakeSettingsApi, reg: &FakeRegistry) {
     reg.set_value(GUID, Family::Ipv6, absent_value(GUID, Family::Ipv6));
-    api.set_response(GUID, DNS_SETTING_IPV6, raw_settings(Some(""), vec![]));
+    let mut raw = raw_settings(Some(""), vec![]);
+    raw.flags_returned = DNS_SETTING_IPV6;
+    api.set_response(GUID, DNS_SETTING_IPV6, raw);
 }
 fn snap(family: Family, servers: &[&str], props: Vec<ServerProperty>) -> Snapshot {
     Snapshot {
@@ -477,15 +482,148 @@ fn exception_uses_ipv6_selector_on_approved_build() {
     assert_eq!(s.provenance_evidence.api_flags, DNS_SETTING_IPV6);
 }
 
+// ---- U01b: version-gated family-selector exception (Q1 ruling) ------------
+// Coordinator ruling: Garen, 2026-11-14, under Cino's flow delegation of
+// 2026-11-14 00:46 (reported to the owner 09:00). Evidence base: Q1-EVIDENCE.md.
+// The four cases below are the envelope's named (a)-(d) fake-backed tests.
+
+/// (a) A build below 20348 refuses the selector path (no getter runs); the
+/// boundary build 20348 is accepted, and the documented IPv4 path stays primary
+/// even on a low build.
 #[test]
-fn exception_refuses_unapproved_build() {
+fn selector_refused_below_min_build() {
+    for build in ["19041", "20347", "", "not-a-build"] {
+        let api = FakeSettingsApi::new();
+        let reg = FakeRegistry::new();
+        static_v6(&api, &reg, "2620:fe::fe", vec![]);
+        let capability = Capability { os_build: build.into(), ..cap() };
+        let e = capture_family(&api, &reg, GUID, Family::Ipv6, &exception(), capability, NOW).unwrap_err();
+        assert!(matches!(e, CaptureError::RefuseUnsupportedTakeover(_)), "build {build:?}");
+        assert_eq!(api.gets(), 0, "selector must not run below the minimum build");
+        assert_eq!(api.frees(), 0);
+    }
+    // At the gate (>= 20348) the selector is allowed.
     let api = FakeSettingsApi::new();
     let reg = FakeRegistry::new();
     static_v6(&api, &reg, "2620:fe::fe", vec![]);
-    let p = FamilySelectorPolicy::VersionGatedException { approved_builds: vec!["19041".into()] };
-    let e = cv6(&api, &reg, &p).unwrap_err();
-    assert!(matches!(e, CaptureError::RefuseUnsupportedTakeover(_)));
-    assert_eq!(api.gets(), 0);
+    let capability = Capability { os_build: "20348".into(), ..cap() };
+    let s = capture_family(&api, &reg, GUID, Family::Ipv6, &exception(), capability, NOW).unwrap();
+    assert_eq!(s.provenance_evidence.api_flags, DNS_SETTING_IPV6);
+    // The documented IPv4 path stays primary even on a below-gate build.
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    static_v4(&api, &reg, "9.9.9.9", vec![]);
+    let capability = Capability { os_build: "19041".into(), ..cap() };
+    let s = capture_family(&api, &reg, GUID, Family::Ipv4, &exception(), capability, NOW).unwrap();
+    assert_eq!(s.provenance_evidence.api_flags, 0);
+}
+
+/// (b) A selector returning IPv4-shaped or mixed data (or properties not from
+/// the IPv6 settings structure) refuses capture, freeing exactly once.
+#[test]
+fn selector_inconsistent_data_refuses() {
+    // IPv4-shaped nameservers from the IPv6 selector.
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    reg.set_value(GUID, Family::Ipv6, static_value(GUID, Family::Ipv6, "9.9.9.9"));
+    let mut raw = raw_settings(Some("9.9.9.9"), vec![]);
+    raw.flags_returned = DNS_SETTING_IPV6;
+    api.set_response(GUID, DNS_SETTING_IPV6, raw);
+    let e = cv6(&api, &reg, &exception()).unwrap_err();
+    assert!(matches!(e, CaptureError::FamilyInconsistent(_)));
+    assert_eq!(api.frees(), 1, "freed exactly once on family inconsistency");
+    assert_eq!(api.live_handles(), 0);
+
+    // Mixed IPv4 + IPv6 list.
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    reg.set_value(GUID, Family::Ipv6, static_value(GUID, Family::Ipv6, "2620:fe::fe,9.9.9.9"));
+    let mut raw = raw_settings(Some("2620:fe::fe,9.9.9.9"), vec![]);
+    raw.flags_returned = DNS_SETTING_IPV6;
+    api.set_response(GUID, DNS_SETTING_IPV6, raw);
+    let e = cv6(&api, &reg, &exception()).unwrap_err();
+    assert!(matches!(e, CaptureError::FamilyInconsistent(_)));
+    assert_eq!(api.frees(), 1);
+
+    // flags_returned does not echo the selector: the returned properties are
+    // not the IPv6 settings structure.
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    reg.set_value(GUID, Family::Ipv6, static_value(GUID, Family::Ipv6, "2620:fe::fe"));
+    let mut raw = raw_settings(Some("2620:fe::fe"), vec![]);
+    raw.flags_returned = 0;
+    api.set_response(GUID, DNS_SETTING_IPV6, raw);
+    let e = cv6(&api, &reg, &exception()).unwrap_err();
+    assert!(matches!(e, CaptureError::FamilyInconsistent(_)));
+    assert_eq!(api.frees(), 1);
+}
+
+/// (c) A selector call error refuses capture (no free of a failed get), and the
+/// two-family capture refuses rather than falling back to an IPv4-only snapshot.
+#[test]
+fn selector_error_refuses() {
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    static_v6(&api, &reg, "2620:fe::fe", vec![]);
+    api.set_get_error(CaptureError::QueryFailure("selector getter failed".into()));
+    let e = cv6(&api, &reg, &exception()).unwrap_err();
+    assert!(matches!(e, CaptureError::QueryFailure(_)));
+    assert_eq!(api.gets(), 1);
+    assert_eq!(api.frees(), 0, "never free a failed get");
+
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    static_v6(&api, &reg, "2620:fe::fe", vec![]);
+    api.set_get_error(CaptureError::AccessDenied("selector denied".into()));
+    let e = cv6(&api, &reg, &exception()).unwrap_err();
+    assert!(matches!(e, CaptureError::AccessDenied(_)));
+    assert_eq!(api.frees(), 0);
+
+    // No IPv4-only fallback: IPv4 succeeds but the IPv6 selector errors, so the
+    // complete two-family capture refuses the whole thing.
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    static_v4(&api, &reg, "9.9.9.9", vec![]);
+    static_v6(&api, &reg, "2620:fe::fe", vec![]);
+    api.set_get_error_for(DNS_SETTING_IPV6, CaptureError::QueryFailure("selector failed".into()));
+    let e = capture_two_families(&api, &reg, GUID, &exception(), cap(), NOW).unwrap_err();
+    assert!(matches!(e, CaptureError::QueryFailure(_)));
+    assert_eq!(api.writes(), 0);
+}
+
+/// (d) Happy path: a complete two-family snapshot assembled from a Flags=0 IPv4
+/// result plus a selector IPv6 result, using the exact Q1 experiment values.
+#[test]
+fn two_family_happy_path() {
+    let api = FakeSettingsApi::new();
+    let reg = FakeRegistry::new();
+    static_v4(&api, &reg, "9.9.9.9,149.112.112.112", vec![doh_prop(1, Some("https://dns.quad9.net/dns-query"), 2)]);
+    static_v6(&api, &reg, "2620:fe::fe,2620:fe::9", vec![doh_prop(0, Some("https://dns9.quad9.net/dns-query"), 6), doh_prop(1, None, 1)]);
+    let two = capture_two_families(&api, &reg, GUID, &exception(), cap(), NOW).unwrap();
+
+    assert_eq!(two.ipv4.family, Family::Ipv4);
+    assert_eq!(two.ipv6.family, Family::Ipv6);
+    // IPv4 from the documented Flags=0 path; IPv6 from the approved selector.
+    assert_eq!(two.ipv4.provenance_evidence.api_flags, 0);
+    assert_eq!(two.ipv6.provenance_evidence.api_flags, DNS_SETTING_IPV6);
+    assert_eq!(two.ipv4.provenance, Provenance::Static);
+    assert_eq!(two.ipv6.provenance, Provenance::Static);
+    assert_eq!(two.ipv4.ordered_servers.iter().map(|c| c.canonical()).collect::<Vec<_>>(), vec!["9.9.9.9", "149.112.112.112"]);
+    assert_eq!(two.ipv6.ordered_servers.iter().map(|c| c.canonical()).collect::<Vec<_>>(), vec!["2620:fe::fe", "2620:fe::9"]);
+    // Per-family properties preserved, including the null AUTO template.
+    assert_eq!(two.ipv4.server_properties.len(), 1);
+    assert_eq!(two.ipv4.server_properties[0].server_index, 1);
+    assert_eq!(two.ipv6.server_properties.len(), 2);
+    assert_eq!(two.ipv6.server_properties[0].doh.flags, 6);
+    assert_eq!(two.ipv6.server_properties[1].doh.template, None);
+    assert_eq!(two.ipv6.server_properties[1].doh.flags, 1);
+    // Complete two-family snapshot: distinct fingerprints, deep-owned.
+    assert_ne!(two.ipv4.fingerprint(), two.ipv6.fingerprint());
+    // capture_stable: two agreeing gets per family, each freed exactly once.
+    assert_eq!(api.gets(), 4);
+    assert_eq!(api.frees(), 4);
+    assert_eq!(api.live_handles(), 0);
+    assert_eq!(api.writes(), 0, "capture performs no writes");
 }
 
 #[test]

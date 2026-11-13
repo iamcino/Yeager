@@ -176,8 +176,11 @@ impl FamilyProbe for WinProbe {
 // ---- backend --------------------------------------------------------------
 
 /// Windows DNS backend: capability probing + stable deep-owned capture.
-/// Construct with an explicit [`FamilySelectorPolicy`]; the default refuses
-/// IPv6 until Q1 is ruled (no approved documented IPv6 getter contract).
+/// Construct with an explicit [`FamilySelectorPolicy`]. The conservative
+/// default refuses IPv6; [`FamilySelectorPolicy::VersionGatedException`] enables
+/// the Q1 ruling's approved, version-gated IPv6 selector (build >= 20348, read
+/// only, family-consistency verified). The OS build used for the gate is read
+/// from the registry at runtime by [`os_build`], not a compile-time constant.
 pub struct WindowsDnsBackend {
     reader: ReaderDnsBackend<WinSettingsApi, WinRegistry, WinProbe>,
 }
@@ -195,6 +198,14 @@ impl WindowsDnsBackend {
                 clock: system_clock(),
             },
         }
+    }
+
+    /// Complete two-family capture (Q1 ruling): IPv4 via the documented Flags=0
+    /// path plus IPv6 via the approved version-gated selector. Refuses the whole
+    /// capture if the exception is unavailable or inconsistent — no IPv4-only
+    /// fallback. Read-only.
+    pub fn capture_complete(&self, guid: &str) -> Result<TwoFamilySnapshot, CaptureError> {
+        self.reader.capture_complete(guid)
     }
 }
 
@@ -326,6 +337,9 @@ fn reg_text(subkey: &str, value: &str) -> Option<String> {
     out
 }
 
+/// Runtime OS build ("CurrentBuild" + optional ".UBR") read from the registry.
+/// This is the value the Q1 version gate compares against MIN_SELECTOR_BUILD;
+/// it is read from the OS at runtime, never a compile-time constant.
 fn os_build() -> String {
     let key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
     let build = reg_text(key, "CurrentBuild").unwrap_or_default();

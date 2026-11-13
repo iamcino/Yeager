@@ -82,6 +82,7 @@ struct FakeInner {
     responses: HashMap<(String, u64), RawSettings>,
     sequence: Option<VecDeque<RawSettings>>,
     get_error: Option<CaptureError>,
+    get_error_by_flags: HashMap<u64, CaptureError>,
     deep_copy_error: Option<CaptureError>,
     gets: u64,
     deep_copies: u64,
@@ -109,6 +110,12 @@ impl FakeSettingsApi {
     }
     pub fn set_get_error(&self, e: CaptureError) {
         self.inner.borrow_mut().get_error = Some(e);
+    }
+    /// Error only the getter call made with these flags (e.g. the IPv6
+    /// selector), leaving other families' getters unaffected. Used to prove the
+    /// two-family capture refuses rather than falling back to IPv4-only.
+    pub fn set_get_error_for(&self, flags: u64, e: CaptureError) {
+        self.inner.borrow_mut().get_error_by_flags.insert(flags, e);
     }
     pub fn set_deep_copy_error(&self, e: CaptureError) {
         self.inner.borrow_mut().deep_copy_error = Some(e);
@@ -142,6 +149,9 @@ impl SettingsApi for FakeSettingsApi {
         inner.gets += 1;
         inner.last_flags = Some(flags);
         if let Some(e) = &inner.get_error {
+            return Err(e.clone());
+        }
+        if let Some(e) = inner.get_error_by_flags.get(&flags) {
             return Err(e.clone());
         }
         let data = if let Some(seq) = inner.sequence.as_mut() {
