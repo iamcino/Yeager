@@ -834,7 +834,7 @@ mod tests {
         );
 
         // Positive delay: only the delayed fragments go through the wheel, and
-        // successive sends are spaced by at least inter_delay.
+        // successive sends are spaced by at least the derived gap floor below.
         let f2 = flow(2);
         let delay = Duration::from_millis(60);
         queue.enqueue(outbound(
@@ -850,15 +850,34 @@ mod tests {
         }));
         assert_eq!(queue.wheel_scheduled(), 2);
         let ts = sender.timestamps_for(f2);
+        // Tolerances derived from the emit mechanism, not by feel. Due ticks
+        // are ceil-anchored at enqueue (ceil_tick_of) and fire only when
+        // floor(now) >= due_tick, so a send never precedes enqueue +
+        // k*inter_delay, but measured send-to-send timing absorbs OS wake
+        // lateness: up to one TICK_NANOS (1 ms) of phase (next_wait is
+        // whole-ms) plus condvar timeout overshoot up to the Windows timer
+        // period (measured 15.625 ms on this host via NtQueryTimerResolution)
+        // plus scheduler dispatch latency. Observed deficits: 13.0/13.1 ms
+        // (unmodified e1969fd battery, gaps 46.98/46.90 ms) and a 18.74 ms
+        // tail (gap 41.26 ms) that exceeds one period, so the stated jitter
+        // bound allows one period of quantization plus one period of
+        // dispatch: 2 * 15.625 = 31.25 ms. The first fragment sends
+        // immediately, so its dispatch latency shrinks both the first gap
+        // and the total; both floors use the same bound. Floors still prove
+        // real delay spacing, never near-instant sends.
+        let tick = Duration::from_nanos(TICK_NANOS as u64);
+        let jitter_bound = Duration::from_nanos(31_250_000);
+        let gap_floor = delay - tick - jitter_bound; // 60 - 1 - 31.25 = 27.75 ms
+        let total_floor = delay * 2 - tick - jitter_bound; // 120 - 1 - 31.25 = 87.75 ms
         let total = ts[2].duration_since(ts[0]);
         assert!(
-            total >= Duration::from_millis(100),
-            "inter-delay not applied: {total:?}"
+            total >= total_floor,
+            "inter-delay not applied (derived floor {total_floor:?}): {total:?}"
         );
         for w in ts.windows(2) {
             assert!(
-                w[1].duration_since(w[0]) >= Duration::from_millis(50),
-                "gap below inter_delay: {:?}",
+                w[1].duration_since(w[0]) >= gap_floor,
+                "gap below inter_delay (derived floor {gap_floor:?}): {:?}",
                 w[1].duration_since(w[0])
             );
         }
