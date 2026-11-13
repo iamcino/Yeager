@@ -2,14 +2,21 @@
 //! touch a real NIC. The settings fake counts get/deep-copy/free, poisons
 //! freed handles (use-after-free detection) and can inject errors or a
 //! changing-state sequence.
+//!
+//! U03 adds [`FakeOs`]: a mutable fake OS implementing both [`DnsBackend`]
+//! (read, via the same qualified capture pipeline) and [`DnsSetter`] (write),
+//! with setter-call recording, request-ID counting, error/death injection and
+//! per-adapter readback/capture faults. Clones share one machine state.
 
 use crate::backend::{
-    EffectiveDnsProbe, FamilyProbe, RawProperty, RawSettings, RegistryProvenance, RegistryValue,
-    SettingsApi,
+    capture_stable, DnsBackend, EffectiveDnsProbe, FamilyProbe, FamilySelectorPolicy, RawProperty,
+    RawSettings, RegistryProvenance, RegistryValue, SettingsApi, DNS_SETTING_IPV6,
 };
-use crate::model::{CanonicalServer, CaptureError, Family};
+use crate::model::{AdapterIdentity, CanonicalServer, Capability, CaptureError, Family, Snapshot};
+use crate::setter::{DnsSetter, SetterError, SetterImage};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 fn utf16le_z(text: &str) -> Vec<u8> {
     let mut v: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -304,5 +311,307 @@ impl FakeProbe {
 impl FamilyProbe for FakeProbe {
     fn family_supported(&self, guid: &str, family: Family) -> Result<bool, CaptureError> {
         Ok(*self.overrides.borrow().get(&(guid.to_string(), family)).unwrap_or(&true))
+    }
+}
+
+// ---- FakeOs (U03) ----------------------------------------------------------
+
+/// One recorded setter call (evidence for write counts / request-ID dedup).
+#[derive(Clone, Debug)]
+pub struct SetterCall {
+    pub request_id: String,
+    pub guid: String,
+    pub family: Family,
+    pub image: SetterImage,
+}
+
+/// Setter fault: numeric status, whether the change lands BEFORE the error is
+/// reported, and whether the process dies right after applying the change.
+#[derive(Clone, Copy, Debug)]
+pub struct FailSpec {
+    pub status: u32,
+    pub after_change: bool,
+    pub die: bool,
+}
+
+#[derive(Default)]
+struct OsInner {
+    /// Configured state per adapter/family. `name_server` None = pristine
+    /// automatic (absent registry value, null getter); Some("") = cleared
+    /// automatic (present-empty REG_SZ, empty-string getter); Some(list) =
+    /// static override. Profile/context fields live in the same RawSettings.
+    state: HashMap<(String, Family), RawSettings>,
+    identities: Vec<AdapterIdentity>,
+    calls: Vec<SetterCall>,
+    request_counts: HashMap<String, u32>,
+    fail_next: Option<FailSpec>,
+    fail_for: HashMap<(String, Family), FailSpec>,
+    readback_errors: HashMap<(String, Family), CaptureError>,
+    capture_errors: HashMap<(String, Family), CaptureError>,
+}
+
+/// Mutable fake OS: one shared machine state behind clones. Reads go through
+/// the real qualified capture pipeline (registry + getter corroboration, IPv6
+/// selector verification); writes apply the full setter image and re-sync both
+/// evidence sources. Never touches a real NIC.
+#[derive(Clone)]
+pub struct FakeOs {
+    inner: Rc<RefCell<OsInner>>,
+    api: Rc<FakeSettingsApi>,
+    reg: Rc<FakeRegistry>,
+    probe: Rc<FakeProbe>,
+    os_build: String,
+}
+
+impl Default for FakeOs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeOs {
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(OsInner::default())),
+            api: Rc::new(FakeSettingsApi::new()),
+            reg: Rc::new(FakeRegistry::new()),
+            probe: Rc::new(FakeProbe::new()),
+            os_build: "26300.9974".to_string(),
+        }
+    }
+
+    pub fn with_os_build(mut self, build: &str) -> Self {
+        self.os_build = build.to_string();
+        self
+    }
+
+    pub fn settings_api(&self) -> Rc<FakeSettingsApi> {
+        Rc::clone(&self.api)
+    }
+    pub fn registry(&self) -> Rc<FakeRegistry> {
+        Rc::clone(&self.reg)
+    }
+    pub fn probe(&self) -> Rc<FakeProbe> {
+        Rc::clone(&self.probe)
+    }
+
+    /// Register an adapter, pristine automatic on both families.
+    pub fn add_adapter(&self, guid: &str, name_hint: &str) {
+        let mut inner = self.inner.borrow_mut();
+        inner.identities.push(AdapterIdentity {
+            adapter_guid: guid.to_string(),
+            luid: 1,
+            if_index: 12,
+            name_hint: name_hint.to_string(),
+            device_instance_hint: Some(format!("fake\\{guid}")),
+        });
+        for family in [Family::Ipv4, Family::Ipv6] {
+            inner.state.entry((guid.to_string(), family)).or_default();
+            self.sync(&mut inner, guid, family);
+        }
+    }
+
+    /// Remove an adapter (disconnection / death): reads fail afterwards.
+    pub fn remove_adapter(&self, guid: &str) {
+        let mut inner = self.inner.borrow_mut();
+        inner.identities.retain(|i| i.adapter_guid != guid);
+        for family in [Family::Ipv4, Family::Ipv6] {
+            inner.state.remove(&(guid.to_string(), family));
+        }
+    }
+
+    /// Fixture input: set the configured NameServer + properties directly
+    /// (bypasses the setter; no call is recorded).
+    pub fn set_configured(&self, guid: &str, family: Family, ns: &str, props: Vec<RawProperty>) {
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner.state.entry((guid.to_string(), family)).or_default();
+        entry.name_server = Some(ns.to_string());
+        entry.server_properties = props;
+        self.sync(&mut inner, guid, family);
+    }
+
+    pub fn configured(&self, guid: &str, family: Family) -> (String, Vec<RawProperty>) {
+        let inner = self.inner.borrow();
+        match inner.state.get(&(guid.to_string(), family)) {
+            Some(s) => (s.name_server.clone().unwrap_or_default(), s.server_properties.clone()),
+            None => (String::new(), Vec::new()),
+        }
+    }
+
+    /// Fixture input: an active profile override (capture must refuse).
+    pub fn set_profile(&self, guid: &str, family: Family, ns: Option<&str>, props: Vec<RawProperty>) {
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner.state.entry((guid.to_string(), family)).or_default();
+        entry.profile_name_server = ns.map(|s| s.to_string());
+        entry.profile_server_properties = props;
+        self.sync(&mut inner, guid, family);
+    }
+
+    /// Mutate context/profile evidence fields, then re-sync the getter.
+    pub fn update_raw(&self, guid: &str, family: Family, f: impl FnOnce(&mut RawSettings)) {
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner.state.entry((guid.to_string(), family)).or_default();
+        f(entry);
+        self.sync(&mut inner, guid, family);
+    }
+
+    pub fn fail_next_setter(&self, status: u32, after_change: bool) {
+        self.inner.borrow_mut().fail_next = Some(FailSpec { status, after_change, die: false });
+    }
+    pub fn fail_setter_for(&self, guid: &str, family: Family, status: u32, after_change: bool) {
+        self.inner.borrow_mut().fail_for.insert(
+            (guid.to_string(), family),
+            FailSpec { status, after_change, die: false },
+        );
+    }
+    /// The next setter call applies the change, then the process dies (lost
+    /// reply): recovery must settle the intent by readback, never re-call.
+    pub fn die_after_change(&self) {
+        self.inner.borrow_mut().fail_next = Some(FailSpec { status: 0, after_change: true, die: true });
+    }
+
+    pub fn set_readback_error(&self, guid: &str, family: Family, e: CaptureError) {
+        self.inner.borrow_mut().readback_errors.insert((guid.to_string(), family), e);
+    }
+    pub fn clear_readback_error(&self, guid: &str, family: Family) {
+        self.inner.borrow_mut().readback_errors.remove(&(guid.to_string(), family));
+    }
+    pub fn set_capture_error(&self, guid: &str, family: Family, e: CaptureError) {
+        self.inner.borrow_mut().capture_errors.insert((guid.to_string(), family), e);
+    }
+    pub fn clear_capture_error(&self, guid: &str, family: Family) {
+        self.inner.borrow_mut().capture_errors.remove(&(guid.to_string(), family));
+    }
+    pub fn clear_failures(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.fail_next = None;
+        inner.fail_for.clear();
+        inner.readback_errors.clear();
+        inner.capture_errors.clear();
+    }
+
+    pub fn setter_calls(&self) -> Vec<SetterCall> {
+        self.inner.borrow().calls.clone()
+    }
+    pub fn setter_call_count(&self) -> usize {
+        self.inner.borrow().calls.len()
+    }
+    pub fn calls_for_request(&self, request_id: &str) -> u32 {
+        self.inner.borrow().request_counts.get(request_id).copied().unwrap_or(0)
+    }
+
+    fn sync(&self, inner: &mut OsInner, guid: &str, family: Family) {
+        let flags = match family {
+            Family::Ipv4 => 0,
+            Family::Ipv6 => DNS_SETTING_IPV6,
+        };
+        let entry = inner.state.get(&(guid.to_string(), family)).cloned().unwrap_or_default();
+        let mut raw = entry.clone();
+        raw.flags_returned = flags;
+        self.api.set_response(guid, flags, raw);
+        let rv = match &entry.name_server {
+            None => absent_value(guid, family),
+            Some(s) if s.is_empty() => empty_value(guid, family),
+            Some(s) => static_value(guid, family, s),
+        };
+        self.reg.set_value(guid, family, rv);
+    }
+
+    fn read(&self, guid: &str, family: Family) -> Result<Snapshot, CaptureError> {
+        let cap = self.capability(guid, family)?;
+        if !cap.family_supported {
+            return Err(CaptureError::UnsupportedFamily(family));
+        }
+        if !self.inner.borrow().state.contains_key(&(guid.to_string(), family)) {
+            return Err(CaptureError::QueryFailure(format!("adapter {guid} not present")));
+        }
+        let now = (crate::backend::system_clock())();
+        capture_stable(
+            &*self.api,
+            &*self.reg,
+            guid,
+            family,
+            &FamilySelectorPolicy::VersionGatedException,
+            cap,
+            &now,
+        )
+    }
+}
+
+impl DnsBackend for FakeOs {
+    fn adapters(&self) -> Result<Vec<AdapterIdentity>, CaptureError> {
+        Ok(self.inner.borrow().identities.clone())
+    }
+    fn capability(&self, guid: &str, family: Family) -> Result<Capability, CaptureError> {
+        Ok(Capability {
+            os_build: self.os_build.clone(),
+            reader_revision: 1,
+            api_version: 3,
+            family_supported: self.probe.family_supported(guid, family)?,
+        })
+    }
+    fn capture(&self, guid: &str, family: Family) -> Result<Snapshot, CaptureError> {
+        if let Some(e) = self.inner.borrow().capture_errors.get(&(guid.to_string(), family)) {
+            return Err(e.clone());
+        }
+        self.read(guid, family)
+    }
+    fn readback(&self, guid: &str, family: Family) -> Result<Snapshot, CaptureError> {
+        if let Some(e) = self.inner.borrow().readback_errors.get(&(guid.to_string(), family)) {
+            return Err(e.clone());
+        }
+        self.read(guid, family)
+    }
+}
+
+impl DnsSetter for FakeOs {
+    fn set(
+        &self,
+        request_id: &str,
+        guid: &str,
+        family: Family,
+        image: &SetterImage,
+    ) -> Result<(), SetterError> {
+        let mut inner = self.inner.borrow_mut();
+        inner.calls.push(SetterCall {
+            request_id: request_id.to_string(),
+            guid: guid.to_string(),
+            family,
+            image: image.clone(),
+        });
+        *inner.request_counts.entry(request_id.to_string()).or_insert(0) += 1;
+        let spec = inner
+            .fail_next
+            .take()
+            .or_else(|| inner.fail_for.get(&(guid.to_string(), family)).copied());
+        let apply = spec.map(|s| s.status == 0 || s.after_change).unwrap_or(true);
+        if apply {
+            let entry = inner.state.entry((guid.to_string(), family)).or_default();
+            entry.name_server = Some(image.name_server.clone());
+            entry.server_properties = image
+                .properties
+                .iter()
+                .map(|p| RawProperty {
+                    version: p.version,
+                    server_index: p.server_index,
+                    prop_type: p.prop_type,
+                    template: p.doh.template.clone(),
+                    flags: p.doh.flags,
+                })
+                .collect();
+            self.sync(&mut inner, guid, family);
+        }
+        if let Some(s) = spec {
+            if s.die {
+                panic!("FakeOs: death injection after change");
+            }
+            if s.status != 0 {
+                return Err(SetterError {
+                    status: s.status,
+                    message: format!("injected setter failure for {guid} {}", family.as_str()),
+                });
+            }
+        }
+        Ok(())
     }
 }

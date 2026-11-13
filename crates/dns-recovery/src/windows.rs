@@ -1,17 +1,29 @@
-//! Deep-owned Windows reader/readback/capability probing (U01). Implements the
-//! same [`SettingsApi`]/[`RegistryProvenance`]/[`FamilyProbe`] traits as the
-//! fakes, so the capture contract is identical. Read-only: no setter is linked
-//! into the library. Every successful getter is freed exactly once via the
-//! generic RAII guard after a deep copy.
+//! Deep-owned Windows reader/readback/capability probing (U01) and the
+//! qualified setter adapter (U03). The reader implements the same
+//! [`SettingsApi`]/[`RegistryProvenance`]/[`FamilyProbe`] traits as the fakes,
+//! so the capture contract is identical; every successful getter is freed
+//! exactly once via the generic RAII guard after a deep copy.
+//!
+//! [`WinSetter`] is the qualified mutation adapter (Q1-EVIDENCE.md, build
+//! 26300.9974): Version=3, mask NAMESERVER|DOH (+ IPv6 family selector, gated
+//! at runtime on build >= [`MIN_SELECTOR_BUILD`]), full intended property set
+//! on every call (the setter is not field-atomic), empty-string NameServer for
+//! automatic — never a null pointer. Interface-scoped only: no profile, global
+//! DoH table, NRPT or domain/search/registration writes. Standard tests cover
+//! mask/construction only; live-adapter operations belong to guarded,
+//! fully-restored qualified probes, never to `cargo test`.
 
 #![cfg(windows)]
 
 use crate::backend::*;
+use crate::backend::{DNS_SETTING_IPV6, MIN_SELECTOR_BUILD};
 use crate::model::*;
+use crate::setter::{DnsSetter, SetterError, SetterImage, DNS_SETTING_DOH, DNS_SETTING_NAMESERVER};
 use std::ptr;
 use windows_sys::core::{GUID, PWSTR};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, NO_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SUPPORTED, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
@@ -345,4 +357,227 @@ fn os_build() -> String {
     let build = reg_text(key, "CurrentBuild").unwrap_or_default();
     let ubr = reg_text(key, "UBR").unwrap_or_default();
     if ubr.is_empty() { build } else { format!("{build}.{ubr}") }
+}
+
+// ---- qualified setter adapter (U03) ----------------------------------------
+
+/// Setter mask for one family. NAMESERVER|DOH always travel together (the
+/// qualified setter is not field-atomic: a NAMESERVER-only write clears DoH
+/// properties). IPv6 adds the family selector only on builds >=
+/// MIN_SELECTOR_BUILD; below the gate the call is refused as unsupported —
+/// never silently downgraded to an IPv4-masked write.
+fn setter_mask_for(family: Family, build: &str) -> Result<u64, SetterError> {
+    let mut mask = DNS_SETTING_NAMESERVER | DNS_SETTING_DOH;
+    if family == Family::Ipv6 {
+        let major = build
+            .split('.')
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .ok_or_else(|| SetterError {
+                status: ERROR_NOT_SUPPORTED,
+                message: format!("cannot establish OS build from {build:?}; refusing IPv6 setter selector"),
+            })?;
+        if major < MIN_SELECTOR_BUILD {
+            return Err(SetterError {
+                status: ERROR_NOT_SUPPORTED,
+                message: format!(
+                    "IPv6 setter selector requires build >= {MIN_SELECTOR_BUILD}; OS build {major}"
+                ),
+            });
+        }
+        mask |= DNS_SETTING_IPV6;
+    }
+    Ok(mask)
+}
+
+/// Owned property arrays for one setter call. The template buffers and DoH
+/// settings must outlive the property array (which points into them); the
+/// caller keeps all three alive across the API call.
+fn property_arrays(
+    image: &SetterImage,
+) -> (Vec<Vec<u16>>, Vec<DNS_DOH_SERVER_SETTINGS>, Vec<DNS_SERVER_PROPERTY>) {
+    let n = image.properties.len();
+    let mut templates: Vec<Vec<u16>> = Vec::with_capacity(n);
+    let mut doh: Vec<DNS_DOH_SERVER_SETTINGS> = Vec::with_capacity(n);
+    for p in &image.properties {
+        let buf = p.doh.template.as_deref().map(wide).unwrap_or_default();
+        let template_ptr = if p.doh.template.is_some() {
+            buf.as_ptr() as PWSTR
+        } else {
+            ptr::null_mut()
+        };
+        templates.push(buf);
+        doh.push(DNS_DOH_SERVER_SETTINGS { Template: template_ptr, Flags: p.doh.flags });
+    }
+    let mut props: Vec<DNS_SERVER_PROPERTY> = Vec::with_capacity(n);
+    for (i, p) in image.properties.iter().enumerate() {
+        props.push(DNS_SERVER_PROPERTY {
+            Version: p.version,
+            ServerIndex: p.server_index,
+            Type: p.prop_type as i32,
+            Property: DNS_SERVER_PROPERTY_TYPES { DohSettings: &mut doh[i] },
+        });
+    }
+    (templates, doh, props)
+}
+
+/// Qualified Windows setter adapter. One interface-scoped
+/// SetInterfaceDnsSettings call per journaled intent; the request ID is the
+/// engine's idempotency key (the OS API itself has none — a lost reply is
+/// settled by configured readback, never by a duplicate call).
+pub struct WinSetter {
+    os_build: String,
+}
+
+impl Default for WinSetter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WinSetter {
+    /// Reads the OS build from the registry at runtime for the IPv6 gate.
+    pub fn new() -> Self {
+        Self { os_build: os_build() }
+    }
+}
+
+impl DnsSetter for WinSetter {
+    fn set(
+        &self,
+        request_id: &str,
+        guid: &str,
+        family: Family,
+        image: &SetterImage,
+    ) -> Result<(), SetterError> {
+        let mask = setter_mask_for(family, &self.os_build)?;
+        let g = parse_guid(guid).ok_or_else(|| SetterError {
+            status: ERROR_INVALID_PARAMETER,
+            message: format!("bad adapter GUID {guid:?}"),
+        })?;
+        // Empty automatic NameServer is a pointer to an empty wide string,
+        // never null (Q1-EVIDENCE.md qualification 1/2).
+        let ns = wide(&image.name_server);
+        let (_templates, _doh, mut props) = property_arrays(image);
+        let mut s: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
+        s.Version = SETTINGS_VERSION3;
+        s.Flags = mask;
+        s.NameServer = ns.as_ptr() as PWSTR;
+        if !props.is_empty() {
+            s.cServerProperties = props.len() as u32;
+            s.ServerProperties = props.as_mut_ptr();
+        }
+        let st = unsafe { SetInterfaceDnsSettings(g, (&s as *const DNS_INTERFACE_SETTINGS3).cast()) };
+        if st != NO_ERROR {
+            return Err(SetterError {
+                status: st,
+                message: format!(
+                    "SetInterfaceDnsSettings {guid} {} mask={mask} request={request_id}",
+                    family.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod setter_tests {
+    use super::*;
+    use crate::model::{DohSettings, ServerProperty};
+
+    #[test]
+    fn mask_v4_is_nameserver_plus_doh_only() {
+        let mask = setter_mask_for(Family::Ipv4, "26300.9974").unwrap();
+        assert_eq!(mask, DNS_SETTING_NAMESERVER | DNS_SETTING_DOH);
+        assert_eq!(mask & DNS_SETTING_IPV6, 0);
+    }
+
+    #[test]
+    fn mask_v6_adds_selector_above_gate() {
+        let mask = setter_mask_for(Family::Ipv6, "26300.9974").unwrap();
+        assert_eq!(mask, DNS_SETTING_NAMESERVER | DNS_SETTING_DOH | DNS_SETTING_IPV6);
+        assert_eq!(setter_mask_for(Family::Ipv6, "20348").unwrap(), mask);
+    }
+
+    #[test]
+    fn mask_v6_refused_below_gate_or_unknown_build() {
+        for build in ["19045", "20347.1", ""] {
+            let e = setter_mask_for(Family::Ipv6, build).unwrap_err();
+            assert_eq!(e.status, ERROR_NOT_SUPPORTED);
+            assert!(!e.retryable());
+        }
+        // IPv4 never needs the selector gate.
+        assert!(setter_mask_for(Family::Ipv4, "19045").is_ok());
+    }
+
+    #[test]
+    fn empty_name_server_is_empty_wide_not_null() {
+        let w = wide("");
+        assert_eq!(w, vec![0], "one terminator element: a real buffer, never NULL");
+    }
+
+    #[test]
+    fn property_arrays_preserve_index_type_flags_and_templates() {
+        let image = SetterImage {
+            name_server: "1.1.1.1,1.0.0.1".into(),
+            properties: vec![
+                ServerProperty {
+                    version: 1,
+                    server_index: 0,
+                    prop_type: 1,
+                    doh: DohSettings { template: Some("https://cloudflare-dns.com/dns-query".into()), flags: 2 },
+                },
+                ServerProperty {
+                    version: 1,
+                    server_index: 1,
+                    prop_type: 1,
+                    doh: DohSettings { template: None, flags: 1 },
+                },
+            ],
+        };
+        let (templates, doh, props) = property_arrays(&image);
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].ServerIndex, 0);
+        assert_eq!(props[1].ServerIndex, 1);
+        assert_eq!(props[0].Version, 1);
+        assert_eq!(props[0].Type, DOH_PROPERTY_TYPE);
+        assert_eq!(doh[0].Flags, 2);
+        assert_eq!(doh[1].Flags, 1);
+        assert!(!doh[0].Template.is_null());
+        assert!(doh[1].Template.is_null());
+        let decoded = unsafe { wstr(doh[0].Template) }.unwrap();
+        assert_eq!(decoded, "https://cloudflare-dns.com/dns-query");
+        assert_eq!(templates.len(), 2);
+    }
+
+    #[test]
+    fn automatic_image_is_empty_string_zero_properties() {
+        let snap = Snapshot {
+            schema_version: 1,
+            family: Family::Ipv4,
+            provenance: Provenance::Automatic,
+            name_server_raw: Some(String::new()),
+            ordered_servers: vec![],
+            provenance_evidence: ProvenanceEvidence {
+                registry_path: String::new(),
+                value_exists: true,
+                value_type: Some(1),
+                raw_value_base64: None,
+                api_flags: 0,
+                captured_at_utc: "2026-11-14T00:00:00Z".into(),
+            },
+            server_properties: vec![],
+            context: DnsContext::default(),
+            capability: Capability {
+                os_build: "26300.9974".into(),
+                reader_revision: 1,
+                api_version: 3,
+                family_supported: true,
+            },
+        };
+        let image = SetterImage::from_target(&snap);
+        assert_eq!(image.name_server, "");
+        assert!(image.properties.is_empty());
+    }
 }

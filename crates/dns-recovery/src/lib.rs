@@ -1,5 +1,20 @@
-//! Yeager DNS recovery — units U01 + U01b + U02: model, original capture,
-//! Windows API qualification and the durable journal (SPEC-DNS-FIX.md §12).
+//! Yeager DNS recovery — units U01 + U01b + U02 + U03: model, original
+//! capture, Windows API qualification, the durable journal and the
+//! apply/reconfigure/restore transaction engine (SPEC-DNS-FIX.md §12).
+//!
+//! # U03: transaction engine
+//!
+//! [`transaction`] implements takeover T0–T7, reconfigure C0–C4 and restore
+//! R0–R6 with §5.4 image classification: durable before/target intent before
+//! every setter call, request-ID idempotency (lost replies settle by readback,
+//! never by duplicate calls), configured-readback verification, whole-
+//! transaction rollback to immutable originals on any family failure, and
+//! admission closure on persistence failure. [`setter`] is the mutation
+//! contract (qualified by Q1-EVIDENCE.md), [`plan`] builds source-compatible
+//! target images, [`clock`] provides the deterministic virtual clock, and
+//! [`fake::FakeOs`] is the mutable fake OS. The qualified Windows setter
+//! adapter is `windows::WinSetter`. Still no GUI activation and no production
+//! takeover wiring.
 //!
 //! Library-only deliverable behind development-only gating: no production
 //! mutation integration and no wiring into the app's takeover path. The
@@ -54,14 +69,18 @@
 
 pub mod backend;
 pub mod canonical;
+pub mod clock;
 pub mod codec;
 pub mod fake;
 pub mod fs;
 pub mod journal;
 pub mod lock;
 pub mod model;
+pub mod plan;
 pub mod security;
+pub mod setter;
 pub mod store;
+pub mod transaction;
 
 #[cfg(windows)]
 pub mod fs_windows;
@@ -72,6 +91,8 @@ pub mod windows;
 mod tests;
 #[cfg(test)]
 mod tests_u02;
+#[cfg(test)]
+mod tests_u03;
 
 pub use backend::{
     capture_family, capture_family_with_effective, capture_stable, capture_two_families,
@@ -80,9 +101,19 @@ pub use backend::{
     DNS_SETTING_IPV6, MIN_SELECTOR_BUILD,
 };
 pub use canonical::{canonical_json, canonical_value, fingerprint};
+pub use clock::{utc_string, Clock, SystemClock, VirtualClock};
 pub use model::*;
+pub use plan::{automatic_image, plan_image, provider_spec, setter_mask, ProviderSpec};
+pub use setter::{
+    DnsSetter, SetterError, SetterImage, DNS_SETTING_DOH, DNS_SETTING_NAMESERVER, DOH_ENABLE,
+    DOH_ENABLE_AUTO, DOH_ENABLE_DDR, DOH_FALLBACK_TO_UDP,
+};
+pub use transaction::{
+    background_delay_ms, DeathPoint, EngineError, EngineReport, FamilyError, Outcome,
+    TransactionEngine,
+};
 
 #[cfg(windows)]
 pub use fs_windows::{WindowsFs, WindowsLock};
 #[cfg(windows)]
-pub use windows::{WinProbe, WinRegistry, WinSettingsApi, WindowsDnsBackend};
+pub use windows::{WinProbe, WinRegistry, WinSettingsApi, WinSetter, WindowsDnsBackend};

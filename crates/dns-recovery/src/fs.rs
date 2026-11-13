@@ -14,6 +14,7 @@ use crate::security::{
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FsError {
@@ -254,6 +255,13 @@ impl FakeFs {
         let mut i = self.inner.borrow_mut();
         i.faults.clear();
         i.once.clear();
+    }
+
+    /// Model process death: the OS closes every open handle. File data,
+    /// security and directory state survive; exclusive-open checks no longer
+    /// see the dead process's handles.
+    pub fn close_all_handles(&self) {
+        self.inner.borrow_mut().handles.clear();
     }
 
     pub fn counters(&self) -> Counters {
@@ -629,5 +637,64 @@ impl JournalFs for FakeFs {
         validate_journal_security(&f.security, ObjectKind::File)?;
         i.counters.file_flushes += 1;
         Ok(())
+    }
+}
+
+/// Shared-filesystem delegation: a new engine incarnation after simulated
+/// process death reuses the same durable state through `Rc<FakeFs>`.
+impl<F: JournalFs> JournalFs for Rc<F> {
+    fn ensure_directory(&self, dir: &str) -> Result<(), FsError> {
+        (**self).ensure_directory(dir)
+    }
+    fn directory_security(&self, dir: &str) -> Result<SecurityInfo, FsError> {
+        (**self).directory_security(dir)
+    }
+    fn storage_kind(&self, dir: &str) -> Result<StorageKind, FsError> {
+        (**self).storage_kind(dir)
+    }
+    fn list_candidates(&self, dir: &str) -> Result<Vec<String>, FsError> {
+        (**self).list_candidates(dir)
+    }
+    fn create_new(&self, path: &str) -> Result<u64, FsError> {
+        (**self).create_new(path)
+    }
+    fn write_all(&self, h: u64, data: &[u8]) -> Result<(), FsError> {
+        (**self).write_all(h, data)
+    }
+    fn flush_file(&self, h: u64) -> Result<(), FsError> {
+        (**self).flush_file(h)
+    }
+    fn close(&self, h: u64) -> Result<(), FsError> {
+        (**self).close(h)
+    }
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        (**self).read_file(path)
+    }
+    fn file_security(&self, path: &str) -> Result<SecurityInfo, FsError> {
+        (**self).file_security(path)
+    }
+    fn replace(&self, primary: &str, stage: &str, backup: &str) -> Result<(), FsError> {
+        (**self).replace(primary, stage, backup)
+    }
+    fn move_write_through(&self, from: &str, to: &str) -> Result<(), FsError> {
+        (**self).move_write_through(from, to)
+    }
+    fn delete(&self, path: &str) -> Result<(), FsError> {
+        (**self).delete(path)
+    }
+    fn flush_volume(&self, path: &str) -> Result<(), FsError> {
+        (**self).flush_volume(path)
+    }
+    fn flush_file_at(&self, path: &str) -> Result<(), FsError> {
+        (**self).flush_file_at(path)
+    }
+    fn read_stage_back(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        (**self).read_stage_back(path)
+    }
+    fn reopen_primary(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        (**self).reopen_primary(path)
+    }
+    fn flush_volume_post_cleanup(&self, path: &str) -> Result<(), FsError> {
+        (**self).flush_volume_post_cleanup(path)
     }
 }
