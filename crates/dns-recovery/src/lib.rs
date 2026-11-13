@@ -1,10 +1,23 @@
-//! Yeager DNS recovery — units U01 + U01b: model, original capture and Windows
-//! API qualification (SPEC-DNS-FIX.md §12).
+//! Yeager DNS recovery — units U01 + U01b + U02: model, original capture,
+//! Windows API qualification and the durable journal (SPEC-DNS-FIX.md §12).
 //!
 //! Library-only deliverable behind development-only gating: no production
 //! mutation integration and no wiring into the app's takeover path. The
-//! guarded Q1 experiment harness lives in `examples/q1_experiment.rs` and is
-//! only built with the opt-in `dev-experiment` feature.
+//! guarded experiment/evidence harnesses live in `examples/` and are only
+//! built with the opt-in `dev-experiment` feature.
+//!
+//! # U02: protected journal, shared lock, durable replacement
+//!
+//! [`journal`] defines the schema and semantic validation, [`codec`] the
+//! strict canonical codec (digest + canonical-byte equality), [`security`]
+//! the exact protected-DACL contract, [`lock`] the cross-session named mutex
+//! (fail-closed against wrong-type/security squatting, WAIT_ABANDONED mandates
+//! a rescan), [`fs`] the fault-injectable filesystem abstraction and [`store`]
+//! the durable replacement pipeline (CREATE_NEW stage → file flush → verified
+//! readback → ReplaceFileW/MoveFileExW → primary reopen/verify → primary flush
+//! → volume flush) with reconciliation and clean-tombstone cleanup. No
+//! optimistic rename durability anywhere. The real Windows implementations
+//! are [`WindowsFs`] / [`WindowsLock`] (`fs_windows`).
 //!
 //! # Capture contract and the Q1 ruling
 //!
@@ -41,14 +54,24 @@
 
 pub mod backend;
 pub mod canonical;
+pub mod codec;
 pub mod fake;
+pub mod fs;
+pub mod journal;
+pub mod lock;
 pub mod model;
+pub mod security;
+pub mod store;
 
+#[cfg(windows)]
+pub mod fs_windows;
 #[cfg(windows)]
 pub mod windows;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_u02;
 
 pub use backend::{
     capture_family, capture_stable, capture_two_families, system_clock, DnsBackend, FamilyProbe,
@@ -58,5 +81,7 @@ pub use backend::{
 pub use canonical::{canonical_json, canonical_value, fingerprint};
 pub use model::*;
 
+#[cfg(windows)]
+pub use fs_windows::{WindowsFs, WindowsLock};
 #[cfg(windows)]
 pub use windows::{WinProbe, WinRegistry, WinSettingsApi, WindowsDnsBackend};
