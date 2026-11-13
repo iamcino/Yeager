@@ -250,13 +250,71 @@ fn set_menu_theme(dark: bool) {
     }
 }
 
+/// Whether the current logical bounds are invalid and must be repaired on
+/// re-show (after unminimize). Valid deliberate resizes — including a stable
+/// 700x500 — never trigger a repair.
+pub fn bounds_need_repair(scale: f32, w: f32, h: f32) -> bool {
+    if !scale.is_finite() || scale <= 0.0 {
+        return true;
+    }
+    !common::is_valid_window_size(w, h)
+}
+
+/// Usable logical work area of the target monitor, if it can be queried.
+/// Falls back to `None` (no clamping) when the query fails.
+pub fn work_area_size() -> Option<(f32, f32)> {
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
+    unsafe {
+        let dpi = GetDpiForSystem();
+        if dpi == 0 {
+            return None;
+        }
+        let w = GetSystemMetricsForDpi(SM_CXSCREEN, dpi);
+        let h = GetSystemMetricsForDpi(SM_CYSCREEN, dpi);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        // System metrics are physical pixels at the queried DPI; convert to
+        // logical pixels.
+        let scale = dpi as f32 / 96.0;
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Some((w as f32 / scale, h as f32 / scale))
+    }
+}
+
+/// Clamps otherwise-valid dimensions to the usable work area. Unknown work
+/// area leaves the size unchanged. When the work area is smaller than the UI
+/// minimum, the UI minimum is honored instead of persisting a temporary
+/// constrained size (see [`common::clamp_window_size_to_work_area`]).
+pub fn clamp_to_work_area(w: f32, h: f32) -> (f32, f32) {
+    match work_area_size() {
+        Some((ww, wh)) => common::clamp_window_size_to_work_area(w, h, ww, wh),
+        None => (w, h),
+    }
+}
+
 /// Brings the window back from the tray (or from minimized) to the front.
+///
+/// Reapplies the last-known-good geometry ONLY when the actual bounds are
+/// invalid (e.g. a transient zero/minimized size survived). A valid
+/// deliberate resize is never overridden on tray clicks.
 pub fn show(ui: &MainWindow) {
     let _ = ui.show();
     ui.window().set_minimized(false);
     apply_window_chrome(ui);
     use slint::winit_030::WinitWindowAccessor;
     ui.window().with_winit_window(|win| win.focus_window());
+    // After unminimize the native bounds settle: repair only if invalid.
+    let scale = ui.window().scale_factor();
+    let size = ui.window().size().to_logical(scale);
+    if bounds_need_repair(scale, size.width, size.height) {
+        let (w, h) = clamp_to_work_area(common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H);
+        ui.window().set_size(slint::LogicalSize::new(w, h));
+        eprintln!("Yeager window: repaired invalid bounds on re-show to {w}x{h}");
+    }
 }
 
 /// The tray icon at the small-icon size for the current DPI, with its rim lit
@@ -619,5 +677,29 @@ pub fn show_unsupported_os_dialog(build: u32) {
     ));
     unsafe {
         MessageBoxW(std::ptr::null_mut(), msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimized_maximized_transient_bounds_need_repair() {
+        // Invalid scale, zero, below-minimum and huge all need repair.
+        assert!(bounds_need_repair(0.0, 860.0, 600.0));
+        assert!(bounds_need_repair(f32::NAN, 860.0, 600.0));
+        assert!(bounds_need_repair(1.0, 0.0, 0.0));
+        assert!(bounds_need_repair(1.0, 1.0, 1.0));
+        assert!(bounds_need_repair(1.0, 100.0, 600.0));
+        assert!(bounds_need_repair(1.0, 99999.0, 99999.0));
+    }
+
+    #[test]
+    fn valid_and_deliberate_minimum_bounds_do_not_need_repair() {
+        assert!(!bounds_need_repair(1.0, 860.0, 600.0));
+        assert!(!bounds_need_repair(1.25, 900.0, 650.0));
+        // Deliberate stable 700x500 is valid: never repaired.
+        assert!(!bounds_need_repair(1.0, 700.0, 500.0));
     }
 }

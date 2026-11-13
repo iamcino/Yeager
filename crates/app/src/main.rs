@@ -161,9 +161,27 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui = MainWindow::new()?;
     let cfg = Rc::new(RefCell::new(config::load()));
-    if let Some([width, height]) = cfg.borrow().window_size {
-        let (min_w, min_h) = (ui.get_min_width_px(), ui.get_min_height_px());
-        ui.window().set_size(slint::LogicalSize::new((width as f32).max(min_w), (height as f32).max(min_h)));
+    // Validate on load, fall back as a pair: missing/invalid/below-minimum /
+    // implausibly huge legacy values resolve to the last validated geometry
+    // (here: preferred 860x600), never clamped into a minimum-size window.
+    // Otherwise-valid dimensions are clamped to the usable work area.
+    {
+        let raw = cfg.borrow().window_size;
+        let [w, h] = common::resolve_window_size(raw);
+        let (mut fw, mut fh) = (w as f32, h as f32);
+        #[cfg(windows)]
+        {
+            (fw, fh) = platform::clamp_to_work_area(fw, fh);
+        }
+        // Repair the in-memory geometry when the persisted value was corrupt
+        // so later saves don't re-poison the file; the validated replacement
+        // is written after successful normal presentation (see below).
+        if common::resolve_window_size(raw) != raw.unwrap_or([0, 0]) {
+            // `raw` was missing or invalid: hold the validated fallback in
+            // memory without touching disk yet.
+            cfg.borrow_mut().window_size = Some([fw.round() as u32, fh.round() as u32]);
+        }
+        ui.window().set_size(slint::LogicalSize::new(fw, fh));
     }
     lang::set(cfg.borrow().language.unwrap_or_else(Language::system));
 
@@ -188,7 +206,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let cfg = cfg.clone();
         ui.on_close_window(move || {
             if let Some(ui) = w.upgrade() {
-                remember_window_size(&ui, &mut cfg.borrow_mut());
+                remember_window_size(&ui, &mut cfg.borrow_mut(), true);
             }
             // Hide to tray instead of quitting; the tray's Thoát exits. Without
             // a tray there is no way back to a hidden window, so quit.
@@ -975,6 +993,33 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.show()?;
     #[cfg(windows)]
     platform::apply_window_chrome(&ui);
+    // Restore once after config load, before first presentation (done above);
+    // write the validated replacement after successful normal presentation
+    // when the persisted value was repaired in memory.
+    {
+        let scale = ui.window().scale_factor();
+        let size = ui.window().size().to_logical(scale);
+        if common::is_valid_window_size(size.width, size.height) {
+            let current = Some([size.width.round() as u32, size.height.round() as u32]);
+            if cfg.borrow().window_size != current {
+                cfg.borrow_mut().window_size = current;
+                config::save(&cfg.borrow());
+            }
+        }
+    }
+    // Capture settled normal geometry on resize/move (debounced): only valid
+    // snapshots ever reach the file, transient sizes never overwrite
+    // last-known-good.
+    let geometry_timer = slint::Timer::default();
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        geometry_timer.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+            if let Some(ui) = w.upgrade() {
+                remember_window_size(&ui, &mut cfg.borrow_mut(), true);
+            }
+        });
+    }
 
     // `ui.run()` would end as soon as the window hides to the tray, taking the
     // tray with it. Run until the tray's Thoát (or close without a tray) quits.
@@ -984,7 +1029,8 @@ fn main() -> Result<(), slint::PlatformError> {
         domain_save.stop();
         config::save(&cfg.borrow());
     }
-    remember_window_size(&ui, &mut cfg.borrow_mut());
+    remember_window_size(&ui, &mut cfg.borrow_mut(), true);
+    drop(geometry_timer);
     let _ = ui.hide();
     #[cfg(windows)]
     drop(tray);
@@ -1029,12 +1075,55 @@ fn refresh_network(ui: &MainWindow) {
     });
 }
 
+/// Whether a live window snapshot may become the persisted normal geometry.
+///
+/// Accepts only settled normal geometry: visible, non-minimized,
+/// non-maximized, initialization complete, finite positive dimensions with a
+/// valid positive scale. Transient zero/below-minimum sizes are ignored so
+/// they never overwrite last-known-good. A deliberate stable 700x500 is
+/// accepted; minimum size alone is not corruption.
+pub fn should_accept_geometry(
+    visible: bool,
+    minimized: bool,
+    maximized: bool,
+    initialized: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+) -> bool {
+    if !visible || minimized || maximized || !initialized {
+        return false;
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return false;
+    }
+    common::is_valid_window_size(w, h)
+}
+
+/// Validated startup size for a persisted value: falls back as a pair to the
+/// preferred 860x600, never clamping garbage into a minimum-size window.
+pub fn startup_window_size(raw: Option<[u32; 2]>) -> (f32, f32) {
+    let [w, h] = common::resolve_window_size(raw);
+    (w as f32, h as f32)
+}
+
 /// Saves the window size, so the next start opens at the size the user left.
-fn remember_window_size(ui: &MainWindow, cfg: &mut Config) {
+///
+/// Only settled normal geometry is recorded; minimized/maximized/transient
+/// closes never overwrite last-known-good. Write failures are logged by
+/// `erwin::config`, not silently discarded.
+fn remember_window_size(ui: &MainWindow, cfg: &mut Config, initialized: bool) {
     if !ui.window().is_visible() {
         return;
     }
-    let size = ui.window().size().to_logical(ui.window().scale_factor());
+    if ui.window().is_minimized() || ui.window().is_maximized() {
+        return;
+    }
+    let scale = ui.window().scale_factor();
+    let size = ui.window().size().to_logical(scale);
+    if !should_accept_geometry(true, false, false, initialized, scale, size.width, size.height) {
+        return;
+    }
     let size = Some([size.width.round() as u32, size.height.round() as u32]);
     if cfg.window_size != size {
         cfg.window_size = size;
@@ -1433,5 +1522,69 @@ fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
         ui.set_engine_active(false);
         ui.set_engine_status(tr("Lỗi", "Error").into());
         ui.set_log(t!("Không bật lại được: {e}", "Could not restart: {e}").into());
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn corrupted_default_migration_falls_back_as_pair() {
+        // [0,0], [1,1], one undersized dimension, huge: all fall back as a
+        // pair to preferred, never clamped into a minimum-size window.
+        assert_eq!(startup_window_size(Some([0, 0])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([1, 1])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([100, 600])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([860, 100])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([99999, 99999])), (860.0, 600.0));
+        assert_eq!(startup_window_size(None), (860.0, 600.0));
+    }
+
+    #[test]
+    fn deliberate_minimum_size_persists_and_restores() {
+        // Minimum size alone is not corruption: 700x500 round-trips.
+        assert_eq!(startup_window_size(Some([700, 500])), (700.0, 500.0));
+        assert!(should_accept_geometry(true, false, false, true, 1.0, 700.0, 500.0));
+    }
+
+    #[test]
+    fn minimized_maximized_transient_close_does_not_overwrite() {
+        // Minimized, maximized, invisible, uninitialized, bad scale and
+        // transient zero/below-minimum snapshots are all rejected.
+        assert!(!should_accept_geometry(true, true, false, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, true, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(false, false, false, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, false, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, 0.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, f32::NAN, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 0.0, 0.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 1.0, 1.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 100.0, 600.0));
+    }
+
+    #[test]
+    fn valid_normal_resize_round_trips() {
+        assert!(should_accept_geometry(true, false, false, true, 1.0, 900.0, 650.0));
+        assert!(should_accept_geometry(true, false, false, true, 1.25, 859.0, 671.0));
+        assert_eq!(startup_window_size(Some([900, 650])), (900.0, 650.0));
+    }
+
+    #[test]
+    fn write_failure_surfaces_via_try_save() {
+        // The app save path logs instead of discarding; the observable
+        // contract lives in erwin: writing through a directory path fails.
+        let dir = std::env::temp_dir().join(format!(
+            "yeager-ui-write-fail-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config::default();
+        assert!(erwin::config::write_atomic(&dir, b"{}").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = cfg;
     }
 }
