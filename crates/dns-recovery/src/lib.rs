@@ -74,9 +74,10 @@ mod tests;
 mod tests_u02;
 
 pub use backend::{
-    capture_family, capture_stable, capture_two_families, system_clock, DnsBackend, FamilyProbe,
-    FamilySelectorPolicy, RawProperty, RawSettings, ReaderDnsBackend, RegistryProvenance,
-    RegistryValue, SettingsApi, SettingsGuard, DNS_SETTING_IPV6, MIN_SELECTOR_BUILD,
+    capture_family, capture_family_with_effective, capture_stable, capture_two_families,
+    system_clock, DnsBackend, EffectiveDnsProbe, FamilyProbe, FamilySelectorPolicy, RawProperty,
+    RawSettings, ReaderDnsBackend, RegistryProvenance, RegistryValue, SettingsApi, SettingsGuard,
+    DNS_SETTING_IPV6, MIN_SELECTOR_BUILD,
 };
 pub use canonical::{canonical_json, canonical_value, fingerprint};
 pub use model::*;

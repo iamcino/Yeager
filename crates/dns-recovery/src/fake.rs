@@ -3,8 +3,11 @@
 //! freed handles (use-after-free detection) and can inject errors or a
 //! changing-state sequence.
 
-use crate::backend::{FamilyProbe, RawProperty, RawSettings, RegistryProvenance, RegistryValue, SettingsApi};
-use crate::model::{CaptureError, Family};
+use crate::backend::{
+    EffectiveDnsProbe, FamilyProbe, RawProperty, RawSettings, RegistryProvenance, RegistryValue,
+    SettingsApi,
+};
+use crate::model::{CanonicalServer, CaptureError, Family};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -52,6 +55,16 @@ pub fn absent_value(guid: &str, family: Family) -> RegistryValue {
         raw: None,
         text: None,
     }
+}
+
+/// IP address assignment for one interface (fixture input): DHCP-assigned or
+/// static. Models the adapter's IP provenance that exists alongside the DNS
+/// configuration. The reader's provenance rule follows the NameServer-plus-
+/// getter DNS override and never consults this (SPEC-DNS-FIX.md §12 U01).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpAssignment {
+    Dhcp,
+    Static,
 }
 
 /// Convenience RawSettings with a server list and DoH properties.
@@ -192,6 +205,7 @@ impl SettingsApi for FakeSettingsApi {
 #[derive(Default)]
 struct FakeRegInner {
     values: HashMap<(String, Family), RegistryValue>,
+    ip_assignments: HashMap<(String, Family), IpAssignment>,
     error: Option<CaptureError>,
     reads: u64,
 }
@@ -215,6 +229,13 @@ impl FakeRegistry {
     pub fn reads(&self) -> u64 {
         self.inner.borrow().reads
     }
+    /// Fixture input: the interface's IP address assignment (DHCP vs static).
+    pub fn set_ip_assignment(&self, guid: &str, family: Family, assignment: IpAssignment) {
+        self.inner.borrow_mut().ip_assignments.insert((guid.to_string(), family), assignment);
+    }
+    pub fn ip_assignment(&self, guid: &str, family: Family) -> Option<IpAssignment> {
+        self.inner.borrow().ip_assignments.get(&(guid.to_string(), family)).copied()
+    }
 }
 
 impl RegistryProvenance for FakeRegistry {
@@ -229,6 +250,34 @@ impl RegistryProvenance for FakeRegistry {
             .get(&(guid.to_string(), family))
             .cloned()
             .unwrap_or_else(|| absent_value(guid, family)))
+    }
+}
+
+/// Fake effective-address observation source. Models the adapter's currently
+/// effective DNS servers (e.g. DHCP-lease-assigned), distinct from the
+/// configured baseline. `set_effective` is the lease-change input.
+#[derive(Default)]
+pub struct FakeEffectiveDns {
+    inner: RefCell<HashMap<(String, Family), Vec<CanonicalServer>>>,
+}
+
+impl FakeEffectiveDns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Lease-change input: replace the adapter's effective DNS servers.
+    pub fn set_effective(&self, guid: &str, family: Family, servers: &[&str]) {
+        let parsed = servers.iter().map(|s| CanonicalServer::parse(s).unwrap()).collect();
+        self.inner.borrow_mut().insert((guid.to_string(), family), parsed);
+    }
+    pub fn effective(&self, guid: &str, family: Family) -> Vec<CanonicalServer> {
+        self.inner.borrow().get(&(guid.to_string(), family)).cloned().unwrap_or_default()
+    }
+}
+
+impl EffectiveDnsProbe for FakeEffectiveDns {
+    fn effective_servers(&self, guid: &str, family: Family) -> Result<Vec<CanonicalServer>, CaptureError> {
+        Ok(self.effective(guid, family))
     }
 }
 

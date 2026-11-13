@@ -112,6 +112,14 @@ pub trait FamilyProbe {
     fn family_supported(&self, guid: &str, family: Family) -> Result<bool, CaptureError>;
 }
 
+/// Effective-address observation source: the adapter's currently effective
+/// DNS servers (e.g. from the active DHCP lease), distinct from the configured
+/// baseline. Read-only evidence recorded alongside the snapshot; it never
+/// feeds the configured fingerprint (SPEC-DNS-FIX.md §12 U01).
+pub trait EffectiveDnsProbe {
+    fn effective_servers(&self, guid: &str, family: Family) -> Result<Vec<CanonicalServer>, CaptureError>;
+}
+
 /// Which getter family-selector contract the reader may use.
 ///
 /// Q1 (SPEC-DNS-FIX.md §4/§13) was settled by the coordinator ruling (Garen,
@@ -248,6 +256,26 @@ pub fn capture_family<A: SettingsApi, R: RegistryProvenance>(
     let snapshot = build_snapshot(family, flags, &rv, reg_servers, &raw, capability, captured_at_utc)?;
     drop(guard);
     Ok(snapshot)
+}
+
+/// Capture one family and record the adapter's effective DNS observation
+/// alongside the configured snapshot (SPEC-DNS-FIX.md §12 U01). The
+/// observation is evidence only: a lease change may alter the effective
+/// addresses while the configured baseline fingerprint stays unchanged.
+/// Read-only; performs no writes.
+pub fn capture_family_with_effective<A: SettingsApi, R: RegistryProvenance, E: EffectiveDnsProbe>(
+    api: &A,
+    reg: &R,
+    effective: &E,
+    guid: &str,
+    family: Family,
+    policy: &FamilySelectorPolicy,
+    capability: Capability,
+    captured_at_utc: &str,
+) -> Result<(Snapshot, EffectiveDns), CaptureError> {
+    let snapshot = capture_family(api, reg, guid, family, policy, capability, captured_at_utc)?;
+    let servers = effective.effective_servers(guid, family)?;
+    Ok((snapshot, EffectiveDns { servers }))
 }
 
 /// Repeat capture until two consecutive configured fingerprints agree, at most

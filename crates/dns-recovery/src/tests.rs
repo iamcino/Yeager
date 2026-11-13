@@ -66,6 +66,14 @@ fn snap(family: Family, servers: &[&str], props: Vec<ServerProperty>) -> Snapsho
         capability: cap(),
     }
 }
+/// Snapshot whose ordered servers come from `parse_servers` on a raw
+/// NameServer string (separator normalization included), not single tokens.
+fn snap_parsed(family: Family, raw: &str) -> Snapshot {
+    let mut s = snap(family, &[], vec![]);
+    s.provenance = Provenance::Static;
+    s.ordered_servers = parse_servers(raw).unwrap();
+    s
+}
 fn prop(index: u32, template: Option<&str>, flags: u64) -> ServerProperty {
     ServerProperty { version: 1, server_index: index, prop_type: 1, doh: DohSettings { template: template.map(String::from), flags } }
 }
@@ -94,6 +102,57 @@ fn fingerprint_equivalent_formatting_equal() {
     let b = snap(Family::Ipv6, &["2001:0db8:0000:0000:0000:0000:0000:0001"], vec![]);
     assert_eq!(a.fingerprint(), b.fingerprint());
     assert!(a.configured_eq(&b));
+}
+
+/// §12 U01: equivalent separator formatting yields equal fingerprints. These
+/// route the raw NameServer forms through `parse_servers` (comma/space split,
+/// empty tokens dropped) — not single-token `CanonicalServer::parse`.
+#[test]
+fn fingerprint_separator_equivalence_through_parse_servers() {
+    let forms = [
+        "9.9.9.9,149.112.112.112",
+        "9.9.9.9, 149.112.112.112",
+        "9.9.9.9 149.112.112.112",
+        "9.9.9.9 , 149.112.112.112",
+        "9.9.9.9,,149.112.112.112",
+        " 9.9.9.9,149.112.112.112 ",
+    ];
+    let reference = snap_parsed(Family::Ipv4, forms[0]);
+    for raw in forms {
+        let s = snap_parsed(Family::Ipv4, raw);
+        assert_eq!(s.ordered_servers, reference.ordered_servers, "raw {raw:?}");
+        assert_eq!(s.fingerprint(), reference.fingerprint(), "raw {raw:?}");
+        assert!(s.configured_eq(&reference), "raw {raw:?}");
+    }
+    // Order still matters through parse_servers.
+    let reversed = snap_parsed(Family::Ipv4, "149.112.112.112,9.9.9.9");
+    assert_ne!(reversed.fingerprint(), reference.fingerprint());
+    assert!(!reversed.configured_eq(&reference));
+}
+
+/// The same separator equivalence end-to-end: each form enters the reader's
+/// registry+getter parse path (`build_snapshot` -> `parse_servers`) and must
+/// capture to the same configured fingerprint.
+#[test]
+fn fingerprint_separator_equivalence_through_capture() {
+    let forms = [
+        "9.9.9.9,149.112.112.112",
+        "9.9.9.9, 149.112.112.112",
+        "9.9.9.9 149.112.112.112",
+    ];
+    let reference = snap_parsed(Family::Ipv4, forms[0]).fingerprint();
+    for raw in forms {
+        let api = FakeSettingsApi::new();
+        let reg = FakeRegistry::new();
+        static_v4(&api, &reg, raw, vec![]);
+        let s = cv4(&api, &reg, &documented()).unwrap();
+        assert_eq!(
+            s.ordered_servers.iter().map(|c| c.canonical()).collect::<Vec<_>>(),
+            vec!["9.9.9.9", "149.112.112.112"],
+            "raw {raw:?}"
+        );
+        assert_eq!(s.fingerprint(), reference, "raw {raw:?}");
+    }
 }
 
 #[test]
@@ -166,11 +225,14 @@ fn static_v4_automatic_v6() {
 #[test]
 fn dhcp_ip_with_static_dns_is_static() {
     // Provenance comes from registry NameServer corroborated by the getter,
-    // never from DHCP IP assignment (the fake models no DHCP field by design).
+    // never from DHCP IP assignment. The fixture supplies the IP-assignment
+    // input (DHCP) alongside the static DNS override (§12 U01).
     let api = FakeSettingsApi::new();
     let reg = FakeRegistry::new();
+    reg.set_ip_assignment(GUID, Family::Ipv4, IpAssignment::Dhcp);
     static_v4(&api, &reg, "9.9.9.9", vec![]);
     let s = cv4(&api, &reg, &documented()).unwrap();
+    assert_eq!(reg.ip_assignment(GUID, Family::Ipv4), Some(IpAssignment::Dhcp));
     assert_eq!(s.provenance, Provenance::Static);
     assert_eq!(s.ordered_servers[0].canonical(), "9.9.9.9");
 }
@@ -179,33 +241,83 @@ fn dhcp_ip_with_static_dns_is_static() {
 fn static_ip_with_automatic_dns_is_automatic() {
     let api = FakeSettingsApi::new();
     let reg = FakeRegistry::new();
+    reg.set_ip_assignment(GUID, Family::Ipv4, IpAssignment::Static);
     // Present-but-empty REG_SZ (raw "0000") + empty getter => automatic.
     reg.set_value(GUID, Family::Ipv4, empty_value(GUID, Family::Ipv4));
     api.set_response(GUID, 0, raw_settings(Some(""), vec![]));
     let s = cv4(&api, &reg, &documented()).unwrap();
+    assert_eq!(reg.ip_assignment(GUID, Family::Ipv4), Some(IpAssignment::Static));
     assert_eq!(s.provenance, Provenance::Automatic);
     assert!(s.ordered_servers.is_empty());
     assert!(s.provenance_evidence.value_exists);
     assert_eq!(s.provenance_evidence.raw_value_base64.as_deref(), Some("AAA="));
 }
 
+/// §12 U01: provenance follows the DNS override, not the IP assignment. The
+/// full 2x2 matrix — flipping the IP-assignment input while holding the DNS
+/// configuration fixed must never change the provenance outcome.
+#[test]
+fn ip_assignment_never_changes_dns_provenance() {
+    for assignment in [IpAssignment::Dhcp, IpAssignment::Static] {
+        // Static DNS override => Static under either IP assignment.
+        let api = FakeSettingsApi::new();
+        let reg = FakeRegistry::new();
+        reg.set_ip_assignment(GUID, Family::Ipv4, assignment);
+        static_v4(&api, &reg, "9.9.9.9", vec![]);
+        assert_eq!(cv4(&api, &reg, &documented()).unwrap().provenance, Provenance::Static, "{assignment:?}");
+        // Automatic DNS => Automatic under either IP assignment.
+        let api = FakeSettingsApi::new();
+        let reg = FakeRegistry::new();
+        reg.set_ip_assignment(GUID, Family::Ipv4, assignment);
+        auto_v4(&api, &reg);
+        assert_eq!(cv4(&api, &reg, &documented()).unwrap().provenance, Provenance::Automatic, "{assignment:?}");
+    }
+}
+
+/// §12 U01: a lease change alters the adapter's effective DNS addresses while
+/// the automatic configured baseline stays unchanged. The effective addresses
+/// are a real observation input to the capture model (distinct from the
+/// configured baseline); the lease change mutates that observation, and the
+/// test requires the baseline fingerprint to be equal while the observation
+/// itself differs. If the observation ever leaked into the fingerprint, or
+/// failed to change with the lease, this test fails.
 #[test]
 fn lease_churn_does_not_change_automatic_baseline() {
     let api = FakeSettingsApi::new();
     let reg = FakeRegistry::new();
+    let eff = FakeEffectiveDns::new();
     reg.set_value(GUID, Family::Ipv4, absent_value(GUID, Family::Ipv4));
+    // Automatic baseline: no static override; the effective servers come from
+    // the active DHCP lease (observation, not configuration).
+    eff.set_effective(GUID, Family::Ipv4, &["10.0.0.1"]);
     let mut a = raw_settings(Some(""), vec![]);
     a.domain = Some("lease-one.test".into());
     a.flags_returned = 0;
     api.set_response(GUID, 0, a);
-    let first = cv4(&api, &reg, &documented()).unwrap();
+    let (first, eff1) =
+        capture_family_with_effective(&api, &reg, &eff, GUID, Family::Ipv4, &documented(), cap(), NOW).unwrap();
+    assert_eq!(first.provenance, Provenance::Automatic);
+    assert!(first.ordered_servers.is_empty());
+
+    // Lease change: the DHCP lease now hands out different effective DNS
+    // servers (and a different connection-specific domain). The configured
+    // baseline is untouched.
+    eff.set_effective(GUID, Family::Ipv4, &["10.0.0.2", "10.0.0.3"]);
     let mut b = raw_settings(Some(""), vec![]);
     b.domain = Some("lease-two.test".into());
     b.flags_returned = 0;
     api.set_response(GUID, 0, b);
-    let second = cv4(&api, &reg, &documented()).unwrap();
+    let (second, eff2) =
+        capture_family_with_effective(&api, &reg, &eff, GUID, Family::Ipv4, &documented(), cap(), NOW).unwrap();
+
+    // Automatic baseline fingerprint unchanged...
     assert_eq!(first.fingerprint(), second.fingerprint());
     assert!(first.configured_eq(&second));
+    assert_eq!(second.provenance, Provenance::Automatic);
+    // ...while the effective observation itself changed with the lease.
+    assert_ne!(eff1, eff2);
+    assert_eq!(eff1.servers.iter().map(|c| c.canonical()).collect::<Vec<_>>(), vec!["10.0.0.1"]);
+    assert_eq!(eff2.servers.iter().map(|c| c.canonical()).collect::<Vec<_>>(), vec!["10.0.0.2", "10.0.0.3"]);
 }
 
 // ---- (c) properties: template / AUTO-null / fallback / flags --------------

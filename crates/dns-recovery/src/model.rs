@@ -189,6 +189,16 @@ pub struct TwoFamilySnapshot {
     pub ipv6: Snapshot,
 }
 
+/// The adapter's currently effective DNS servers as observed (e.g. assigned
+/// by the active DHCP lease), distinct from the configured baseline.
+/// Observation/evidence only: it never participates in the configured
+/// fingerprint (SPEC-DNS-FIX.md §12 U01: lease changes alter effective
+/// addresses without changing the automatic baseline).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveDns {
+    pub servers: Vec<CanonicalServer>,
+}
+
 /// Adapter identity. Hints detect reincarnation; the GUID is authoritative.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterIdentity {
