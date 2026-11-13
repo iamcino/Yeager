@@ -8,6 +8,8 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-11-13
+
 ### Changed
 - **GitHub mirrors GitLab:** GitLab is the main repository; GitHub carries the same commits and tags, and its releases carry the same signed files as GitLab's, copied and checked by `tools/release-github.ps1` instead of being built and signed again. `tools/sync-github.ps1` keeps the two in step.
 

@@ -6,7 +6,7 @@
 
 #define AppName "Yeager"
 #ifndef AppVersion
-  #define AppVersion "1.1.5"
+  #define AppVersion "1.1.6"
 #endif
 #ifndef NumericVersion
   #define NumericVersion "0.0.0.0"
