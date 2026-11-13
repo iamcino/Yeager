@@ -1,0 +1,35 @@
+[package]
+name = "dns-recovery"
+description = "Yeager DNS takeover: exact original capture, durable journal and recovery service (U01: model, capture, API qualification)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dns_recovery"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Development-only opt-in for the guarded Q1 Windows experiment harness.
+# Never enabled by default; plain `cargo test`/`cargo check` skip the example.
+dev-experiment = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Registry",
+] }
+
+[[example]]
+name = "q1_experiment"
+path = "examples/q1_experiment.rs"
+required-features = ["dev-experiment"]
