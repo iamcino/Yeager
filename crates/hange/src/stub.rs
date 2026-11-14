@@ -6,7 +6,7 @@
 //! user has visited keep opening through a short outage.
 
 use crate::pool::Pool;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use lru::LruCache;
 use std::io;
@@ -43,6 +43,97 @@ pub struct Stub {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Stub {
+    /// Whether the serving thread is still running. A finished thread means
+    /// the listener task panicked or exited — the supervisor must treat that
+    /// as terminal listener-task loss (quiesce/restore), never as a quiet
+    /// no-op.
+    pub fn is_alive(&self) -> bool {
+        !self
+            .thread
+            .as_ref()
+            .is_some_and(|t| t.is_finished())
+    }
+
+    /// Bounded local self-probe: one query against the first bound address.
+    /// ANY well-formed reply — including SERVFAIL — proves the listener is
+    /// responsive. SERVFAIL is upstream failure, never listener death.
+    pub fn responds(&self) -> bool {
+        let Some(addr) = self.addrs.first() else {
+            return false;
+        };
+        let query = {
+            let mut q = Message::query();
+            q.metadata.id = 0x55AA;
+            q.metadata.recursion_desired = true;
+            q.add_query(Query::query(
+                std::str::FromStr::from_str("example.com.").expect("static name parses"),
+                RecordType::A,
+            ));
+            q
+        };
+        let bytes = match query.to_vec() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let socket = match std::net::UdpSocket::bind(SocketAddr::new(addr.ip(), 0)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if socket.set_read_timeout(Some(Duration::from_secs(3))).is_err() {
+            return false;
+        }
+        if socket.send_to(&bytes, addr).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 4096];
+        match socket.recv(&mut buf) {
+            Ok(len) => Message::from_vec(&buf[..len]).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Explicit stop with a bounded wait: signals the serving thread and
+    /// waits at most `timeout` for it. A stuck join returns [`TimedOut`](ShutdownOutcome::TimedOut)
+    /// WITHOUT blocking — a reaper thread reaps the handle later — so a
+    /// stuck Stub join can never precede or block DNS restore.
+    pub fn shutdown_bounded(mut self, timeout: Duration) -> ShutdownOutcome {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let Some(thread) = self.thread.take() else {
+            return ShutdownOutcome::Stopped;
+        };
+        reap_bounded(thread, timeout)
+    }
+}
+
+/// How an explicit listener stop finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// The serving thread exited within the bound.
+    Stopped,
+    /// The serving thread did not exit in time; it is reaped in the
+    /// background. The caller must NOT wait again.
+    TimedOut,
+}
+
+/// Waits at most `timeout` for `thread`, reaping it on a background thread
+/// when it sticks so the caller is never blocked.
+fn reap_bounded(thread: std::thread::JoinHandle<()>, timeout: Duration) -> ShutdownOutcome {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("hange-stub-reap".into())
+        .spawn(move || {
+            let _ = thread.join();
+            let _ = tx.send(());
+        })
+        .expect("reaper thread spawns");
+    match rx.recv_timeout(timeout) {
+        Ok(()) => ShutdownOutcome::Stopped,
+        Err(_) => ShutdownOutcome::TimedOut,
+    }
+}
 impl Stub {
     /// Binds every address in `addrs` (port 0 picks a free port) and serves
     /// them on a background runtime. Fails if any address cannot be bound.
@@ -94,11 +185,14 @@ impl Stub {
 
 impl Drop for Stub {
     fn drop(&mut self) {
+        // Last-resort path only: explicit `shutdown_bounded` is the normal
+        // stop. Even here the join is bounded (2 s) — dropping a Stub must
+        // never hang DNS restore behind an unbounded join.
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let _ = reap_bounded(thread, Duration::from_secs(2));
         }
     }
 }
