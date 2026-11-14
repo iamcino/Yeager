@@ -51,6 +51,18 @@ pub struct Stub {
 }
 
 impl Stub {
+    /// Retarget the serving forwarder to a new provider while the sockets
+    /// stay bound. The loopback ports are never released; only the upstream
+    /// [`Pool`] members rotate (U06-REV2 item 1).
+    pub fn retarget(&self, choice: crate::pool::Choice) {
+        self.pool.retarget(choice);
+    }
+
+    /// The provider the serving forwarder actually uses right now.
+    pub fn effective_provider(&self) -> common::DohProvider {
+        self.pool.status().provider
+    }
+
     /// Whether the serving thread AND the supervised UDP/TCP serve tasks are
     /// still running. A finished thread means the listener task panicked or
     /// exited; a finished serve-task handle means `serve_udp` or `serve_tcp`

@@ -51,6 +51,13 @@ pub trait ManagedListener {
     /// Bounded self-probe. ANY well-formed reply — including SERVFAIL —
     /// counts as responsive; SERVFAIL is upstream failure, not death.
     fn responds(&self) -> bool;
+    /// Retarget the serving forwarder to a new provider while the sockets
+    /// stay bound. A reused listener must forward the NEW provider before
+    /// `Active` is reported (U06-REV2 item 1).
+    fn retarget(&self, choice: Choice);
+    /// The provider the serving forwarder actually uses right now. `None`
+    /// for script stubs without a real pool.
+    fn effective_provider(&self) -> Option<common::DohProvider>;
     /// Explicit stop with a bounded wait. Must never block past `timeout`.
     fn shutdown_bounded(self: Box<Self>, timeout: Duration) -> crate::stub::ShutdownOutcome;
 }
@@ -64,6 +71,12 @@ impl ManagedListener for crate::stub::Stub {
     }
     fn responds(&self) -> bool {
         self.responds()
+    }
+    fn retarget(&self, choice: Choice) {
+        crate::stub::Stub::retarget(self, choice);
+    }
+    fn effective_provider(&self) -> Option<common::DohProvider> {
+        Some(crate::stub::Stub::effective_provider(self))
     }
     fn shutdown_bounded(self: Box<Self>, timeout: Duration) -> crate::stub::ShutdownOutcome {
         (*self).shutdown_bounded(timeout)
@@ -246,6 +259,19 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             self.refresh_lease_epoch();
             self.install(choice, plan, listener, readiness, creds, reused);
             Ok(self.status_local())
+        } else if report.outcome == SvcOutcome::VerifiedRestored {
+            // Verified restore means the engine rolled the attempt back to
+            // the pre-takeover original: loopback is no longer the configured
+            // reference, so the previous listener must stop (bounded). The
+            // server released the lease on the clean restore (U06-REV2 item
+            // 3), so the client drops its copy too — the next call
+            // re-registers instead of failing stale. Pending/Conflict keep
+            // the listener; only VerifiedRestored stops it.
+            self.abandon_candidate(listener);
+            self.stop_active_bounded();
+            self.active = None;
+            self.lease = None;
+            self.fail(&report, "enable rolled back to pre-takeover original; listener stopped")
         } else {
             self.abandon_candidate(listener);
             self.fail(&report, "enable rejected; previous configuration retained")
@@ -278,6 +304,15 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             self.refresh_lease_epoch();
             self.install(choice, plan, listener, readiness, creds, reused);
             Ok(self.status_local())
+        } else if report.outcome == SvcOutcome::VerifiedRestored {
+            // Same as enable: the pre-takeover original is back, loopback is
+            // no longer the reference, so stop the previous listener
+            // (bounded) and drop the released lease. Pending/Conflict keep it.
+            self.abandon_candidate(listener);
+            self.stop_active_bounded();
+            self.active = None;
+            self.lease = None;
+            self.fail(&report, "change rolled back to pre-takeover original; listener stopped")
         } else {
             self.abandon_candidate(listener);
             self.fail(&report, "change rejected; original configuration retained")
@@ -374,19 +409,49 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
         let alive = listener.alive();
         let responding = alive && listener.responds();
         let Some(creds) = self.lease.clone() else {
-            self.pending = Some("supervision without a lease".into());
+            // A prior restore outcome (e.g. task-loss Pending that dropped
+            // the lease) is more truthful than a generic note: never
+            // overwrite it with "supervision without a lease" (U06-REV2
+            // item 3).
+            if self.pending.is_none() {
+                self.pending = Some("supervision without a lease".into());
+            }
             return Supervision::EpochRevoked;
         };
         if !alive {
-            // Terminal listener-task loss: restore while the lease is valid.
-            // Quiesce first would revoke the lease and make this restore
-            // refused; engine.restore closes admission itself.
+            // Terminal listener-task loss: restore while the lease is valid
+            // (no quiesce first: quiesce would revoke the lease and make this
+            // restore refused; engine.restore closes admission itself). This
+            // is the truthful route that releases the server lease on a
+            // clean restore (U06-REV2 item 3) — never quiesce-then-restore
+            // with the same token.
             let restore = self.service.restore(&creds);
-            self.lease = None;
-            self.pending = Some(format!(
-                "listener task lost; restore {:?}: {}",
-                restore.outcome, restore.message
-            ));
+            if restore.outcome == SvcOutcome::VerifiedRestored {
+                // Verified: the pre-takeover original is back. Stop the
+                // (dead) listener only now (bounded) and clear it from
+                // active; the server released the lease, so drop the client
+                // copy too. The next tick is Idle and preserves this pending
+                // text instead of overwriting it.
+                self.stop_active_bounded();
+                self.active = None;
+                self.lease = None;
+                self.pending = Some(format!(
+                    "listener task lost; restore verified: {}",
+                    restore.message
+                ));
+            } else {
+                // Not verified: keep the listener slot and the pending
+                // outcome; the dead stub is NOT stopped here. Drop the
+                // client lease copy (the journal epoch advanced inside
+                // restore) but keep the restore outcome text so a later
+                // tick does not replace it with "supervision without a
+                // lease".
+                self.lease = None;
+                self.pending = Some(format!(
+                    "listener task lost; restore {:?}: {}",
+                    restore.outcome, restore.message
+                ));
+            }
             return Supervision::TaskLost;
         }
         let health = self.service.health(&creds, responding, readiness);
@@ -602,6 +667,13 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     ) {
         if reused {
             if let Some(entry) = self.active.as_mut() {
+                // The sockets stay bound; the forwarder must use the NEW
+                // provider before `Active` is reported (U06-REV2 item 1).
+                // Windows already names the new provider via the committed
+                // plan, so queries through loopback must forward to it too.
+                if let Some(serving) = entry.listener.as_ref() {
+                    serving.retarget(choice);
+                }
                 entry.choice = choice;
                 entry.plan = plan;
                 entry.readiness = readiness;
@@ -715,6 +787,7 @@ mod tests {
     enum FakeCall {
         Bind(ListenerMode),
         Shutdown(Vec<SocketAddr>),
+        Retarget(String),
         Register,
         Apply,
         Reconfigure,
@@ -728,6 +801,7 @@ mod tests {
         addrs: Vec<SocketAddr>,
         alive: bool,
         responding: bool,
+        forwarding: std::cell::Cell<Choice>,
         log: Rc<RefCell<Vec<FakeCall>>>,
     }
 
@@ -740,6 +814,18 @@ mod tests {
         }
         fn responds(&self) -> bool {
             self.responding
+        }
+        fn retarget(&self, choice: Choice) {
+            self.forwarding.set(choice);
+            self.log
+                .borrow_mut()
+                .push(FakeCall::Retarget(format!("{choice:?}")));
+        }
+        fn effective_provider(&self) -> Option<common::DohProvider> {
+            match self.forwarding.get() {
+                Choice::Fixed(p) => Some(p),
+                Choice::Auto => Some(crate::pool::AUTO_PROVIDERS[0]),
+            }
         }
         fn shutdown_bounded(self: Box<Self>, _timeout: Duration) -> ShutdownOutcome {
             self.log.borrow_mut().push(FakeCall::Shutdown(self.addrs.clone()));
@@ -766,6 +852,9 @@ mod tests {
                 addrs: plan.addrs.clone(),
                 alive: self.alive,
                 responding: self.responding,
+                forwarding: std::cell::Cell::new(Choice::Fixed(
+                    common::DohProvider::Cloudflare,
+                )),
                 log: Rc::clone(&self.log),
             }))
         }
@@ -982,19 +1071,8 @@ mod tests {
             .count();
         assert_eq!(shutdowns, 0, "serving listener never stopped for failed change");
 
-        // A failed change that rolls back server-side reports failure too:
-        // verified_restored means the new plan is NOT in effect.
-        co.service_mut().reconfigure_outcome = SvcOutcome::VerifiedRestored;
-        let err = co
-            .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
-            .unwrap_err();
-        assert_eq!(err.outcome, SvcOutcome::VerifiedRestored);
-        let status = co.status_local();
-        assert_eq!(status.addrs, first.addrs, "rollback keeps old sockets");
-        assert!(co.pending().is_some());
-
-        // A later successful change commits atomically on the reused
-        // listener: same sockets, provider rotates, no stop.
+        // A successful change commits atomically on the reused listener:
+        // same sockets, forwarder retargeted to the new provider, no stop.
         co.service_mut().reconfigure_outcome = SvcOutcome::Active;
         let log_len = log.borrow().len();
         let status = co
@@ -1002,11 +1080,46 @@ mod tests {
             .unwrap();
         assert!(status.enabled && status.serving_local);
         assert_eq!(status.addrs, first.addrs, "reused listener keeps sockets");
-        let tail = &log.borrow()[log_len..];
+        let tail: Vec<FakeCall> = log.borrow()[log_len..].to_vec();
         assert!(tail.contains(&FakeCall::Reconfigure), "commit through service: {tail:?}");
         assert!(
             !tail.iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
             "reused listener never stops on provider change: {tail:?}"
+        );
+        // The forwarder must now use the NEW provider while the sockets stay
+        // bound (U06-REV2 item 1): a script stub that only stores addresses
+        // would not catch a stale pool.
+        let serving = co.active.as_ref().unwrap().listener.as_ref().unwrap();
+        assert_eq!(
+            serving.effective_provider(),
+            Some(common::DohProvider::Google),
+            "reused listener forwards the new provider"
+        );
+        assert!(
+            tail.iter().any(|c| matches!(c, FakeCall::Retarget(_))),
+            "reuse retargets the forwarder: {tail:?}"
+        );
+
+        // A failed change that rolls back server-side reports failure AND
+        // stops the previous listener (bounded): verified_restored means the
+        // pre-takeover original is back and loopback is no longer the
+        // configured reference (U06-REV2 item 2). Pending/Conflict keep the
+        // listener; only VerifiedRestored stops it.
+        co.service_mut().reconfigure_outcome = SvcOutcome::VerifiedRestored;
+        let err = co
+            .reconfigure(Choice::Fixed(common::DohProvider::AdGuard), true)
+            .unwrap_err();
+        assert_eq!(err.outcome, SvcOutcome::VerifiedRestored);
+        let status = co.status_local();
+        assert!(
+            !status.serving_local,
+            "verified restore stops the listener: loopback is no longer the reference"
+        );
+        assert!(status.addrs.is_empty(), "no sockets serving after verified restore");
+        assert!(co.pending().is_some());
+        assert!(
+            log.borrow().iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
+            "verified restore stops the previous listener (bounded)"
         );
     }
 
@@ -1102,6 +1215,7 @@ mod tests {
             addrs,
             alive: false,
             responding: false,
+            forwarding: std::cell::Cell::new(Choice::Fixed(common::DohProvider::Cloudflare)),
             log: Rc::clone(&log),
         }));
         let verdict = co.supervise_tick();
@@ -1132,6 +1246,10 @@ mod tests {
             }
             fn responds(&self) -> bool {
                 true
+            }
+            fn retarget(&self, _choice: Choice) {}
+            fn effective_provider(&self) -> Option<common::DohProvider> {
+                None
             }
             fn shutdown_bounded(self: Box<Self>, _timeout: Duration) -> ShutdownOutcome {
                 // A stuck join: record the attempt AFTER the restore below,
@@ -1398,6 +1516,9 @@ mod tests {
                     addrs: plan.addrs.clone(),
                     alive: true,
                     responding: true,
+                    forwarding: std::cell::Cell::new(Choice::Fixed(
+                        common::DohProvider::Cloudflare,
+                    )),
                     log: Rc::clone(&self.log),
                 }))
             } else {
@@ -1484,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn reconfigure_verified_restored_reports_failure_and_retains_listener() {
+    fn reconfigure_verified_restored_reports_failure_and_stops_listener() {
         let world = StackWorld::new();
         world.seed();
         let mut host = stack_host(&world);
@@ -1505,7 +1626,11 @@ mod tests {
         // External divergence back to the pre-takeover original on v4: the
         // engine must detect the committed-image mismatch, roll the
         // reconfigure back (already-original v4 verifies, v6 restores) and
-        // report VerifiedRestored instead of applying Google.
+        // report VerifiedRestored instead of applying Google. That outcome
+        // is the pre-takeover original and loopback is no longer the
+        // configured reference, so the previous listener stops (bounded) —
+        // U06-REV2 item 2. This test FAILS if the listener is still serving
+        // while the fake OS shows the original nameserver.
         world
             .os
             .set_configured(GUID_A, Family::Ipv4, "192.0.2.53", vec![]);
@@ -1518,8 +1643,11 @@ mod tests {
             "rollback is failure, never success: {err:?}"
         );
         let status = co.status_local();
-        assert!(status.serving_local, "previous listener retained");
-        assert_eq!(status.addrs, first.addrs, "same sockets keep serving");
+        assert!(
+            !status.serving_local,
+            "verified restore stops the listener: fake OS is back on the original"
+        );
+        assert!(status.addrs.is_empty(), "no sockets serving after verified restore");
         assert!(co.pending().is_some(), "pending visible, never success");
         let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
         assert!(
@@ -1527,6 +1655,10 @@ mod tests {
             "fake OS rolled back to pre-takeover original, not Google: {ns}"
         );
         assert!(!ns.contains("8.8.8.8"), "Google never applied: {ns}");
+        assert!(
+            log.borrow().iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
+            "verified restore stops the previous listener (bounded)"
+        );
     }
 
     #[test]
@@ -1641,5 +1773,167 @@ mod tests {
             ns.contains("1.1.1.1"),
             "quiesce does not restore; committed image stays: {ns}"
         );
+    }
+
+    // ---- U06-REV2: retarget, verified-stop, lease release --------------------
+
+    /// A binder that binds a REAL [`crate::stub::Stub`] (real [`Pool`]
+    /// forwarder) on an ephemeral loopback port. The pool is the
+    /// production forwarder — `effective_provider` observes it — while the
+    /// ephemeral port keeps the test hermetic (no port-53 bind).
+    struct RealStubBinder {
+        initial: Choice,
+        log: Rc<RefCell<Vec<FakeCall>>>,
+    }
+
+    impl ListenerBinder for RealStubBinder {
+        fn bind(&self, plan: &ListenerPlan) -> Result<Box<dyn ManagedListener>, BindError> {
+            self.log.borrow_mut().push(FakeCall::Bind(plan.mode));
+            let pool = crate::pool::Pool::new(self.initial);
+            crate::stub::Stub::start(pool, &["127.0.0.1:0".parse().unwrap()])
+                .map(|s| Box::new(s) as Box<dyn ManagedListener>)
+                .map_err(|e| BindError(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn reused_listener_forwards_new_provider_before_active() {
+        let (svc, _) = ScriptService::ok();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut svc2 = svc;
+        svc2.log = Rc::clone(&log);
+        let mut co = Coordinator::new(
+            svc2,
+            RealStubBinder {
+                initial: Choice::Fixed(common::DohProvider::Cloudflare),
+                log: Rc::clone(&log),
+            },
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        let first = co
+            .enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        assert!(first.serving_local, "real stub serves");
+        let before = co
+            .active
+            .as_ref()
+            .unwrap()
+            .listener
+            .as_ref()
+            .unwrap()
+            .effective_provider();
+        assert_eq!(
+            before,
+            Some(common::DohProvider::Cloudflare),
+            "forwarder starts on the old provider"
+        );
+        // A local Cloudflare -> Google change reuses the live listener (no
+        // second bind). The serving stub must retarget its upstream to the
+        // NEW choice before `Active` is reported — Windows already names the
+        // new provider. A script stub that only stores addresses would not
+        // catch a stale pool; this observes the real forwarder.
+        let status = co
+            .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
+            .unwrap();
+        assert_eq!(status.addrs, first.addrs, "same sockets stay bound");
+        let after = co
+            .active
+            .as_ref()
+            .unwrap()
+            .listener
+            .as_ref()
+            .unwrap()
+            .effective_provider();
+        assert_eq!(
+            after,
+            Some(common::DohProvider::Google),
+            "reused listener forwards the NEW provider before Active"
+        );
+        let binds = log
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::Bind(_)))
+            .count();
+        assert_eq!(binds, 1, "no second bind while serving");
+    }
+
+    #[test]
+    fn task_loss_verified_restored_stops_listener_and_clears_active() {
+        let (mut svc, _) = ScriptService::ok();
+        svc.restore_outcome = SvcOutcome::VerifiedRestored;
+        let (mut co, log) = scripted_coordinator(vec![], svc);
+        co.enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        // Simulate runtime task death: the serving stub reports dead.
+        let addrs = co.status_local().addrs.clone();
+        co.active.as_mut().unwrap().listener = Some(Box::new(ScriptStub {
+            addrs,
+            alive: false,
+            responding: false,
+            forwarding: std::cell::Cell::new(Choice::Fixed(common::DohProvider::Cloudflare)),
+            log: Rc::clone(&log),
+        }));
+        let verdict = co.supervise_tick();
+        assert_eq!(verdict, Supervision::TaskLost);
+        // Verified: the (dead) listener stops (bounded) and clears from
+        // active; the lease is dropped. A later tick must NOT overwrite the
+        // restore outcome with "supervision without a lease" and must NOT
+        // leave the dead stub as active.
+        let status = co.status_local();
+        assert!(
+            !status.serving_local,
+            "dead listener cleared after verified restore"
+        );
+        assert!(!co.is_enabled(), "active cleared after verified restore");
+        let pending = co.pending().unwrap_or_default().to_string();
+        assert!(
+            pending.contains("verified"),
+            "pending keeps the verified restore outcome: {pending}"
+        );
+        assert!(
+            log.borrow().iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
+            "dead listener stopped (bounded) after verified restore"
+        );
+        let verdict2 = co.supervise_tick();
+        assert_eq!(verdict2, Supervision::Idle, "no active left to supervise");
+        assert_eq!(
+            co.pending().unwrap_or_default(),
+            pending,
+            "later tick preserves the restore outcome"
+        );
+    }
+
+    #[test]
+    fn disable_releases_lease_so_reregister_succeeds() {
+        let world = StackWorld::new();
+        world.seed();
+        let peer = world.peer();
+        let mut host = stack_host(&world);
+        {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut co = Coordinator::new(
+                HostClient::new(&mut host, peer.clone()),
+                stack_binder(log),
+                OWNER,
+                vec![GUID_A.to_string()],
+            );
+            co.enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+                .unwrap();
+            let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+            assert!(ns.contains("1.1.1.1"), "Cloudflare committed: {ns}");
+            // Clean disable: verified restore. The service lease must not
+            // still occupy the owner id once the journal transaction is
+            // gone — otherwise the next register answers `busy` forever.
+            let status = co.disable().unwrap();
+            assert!(!status.enabled);
+        }
+        // Same long-lived ServiceHost, same owner: register again. Must
+        // succeed; fails with `busy` if the clean restore left the lease.
+        let mut client = HostClient::new(&mut host, peer);
+        match client.register_owner(OWNER, 0, Some(&"a".repeat(64)), Some("fileid-1")) {
+            Ok(reg) => assert!(!reg.token.is_empty(), "re-register mints a fresh lease"),
+            Err(e) => panic!("register after verified disable must succeed, got {e:?} (lease not released)"),
+        }
     }
 }

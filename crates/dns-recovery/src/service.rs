@@ -994,6 +994,17 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
         let reply = self.reply(req, report.generation, outcome_str(report.outcome),
             serde_json::json!({"errors": report.errors.len()}));
         self.dedup_store(req.request_id.clone(), reply.clone());
+        // Clean restore releases the lease: the journal transaction is gone
+        // (tombstone), so the next `register_owner` for the same owner id
+        // must succeed instead of answering `busy` forever (U06-REV2 item
+        // 3). Mirrors the `health(responding == false)` path, which removes
+        // the lease before restoring. Pending/Conflict keep the lease: the
+        // transaction (and its debt) is still recorded.
+        if matches!(report.outcome, Outcome::VerifiedRestored) {
+            if let Some(owner_id) = req.owner_id.clone() {
+                self.leases.remove(&owner_id);
+            }
+        }
         reply
     }
 
