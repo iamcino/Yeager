@@ -107,12 +107,15 @@ impl SvcReport {
         }
     }
 
-    /// Success-like outcomes: the requested state holds.
+    /// Success-like outcomes: the requested plan is in effect.
+    ///
+    /// Only `Active` means the new plan holds. `verified_restored` means the
+    /// engine rolled the attempt back to the pre-takeover original, so the
+    /// new plan is NOT in effect and callers must report failure with the
+    /// previous listener kept. `success` (health/quiesce) never carries a
+    /// plan, so it is not `is_ok` here — match those outcomes explicitly.
     pub fn is_ok(&self) -> bool {
-        matches!(
-            self.outcome,
-            SvcOutcome::Success | SvcOutcome::Active | SvcOutcome::VerifiedRestored
-        )
+        matches!(self.outcome, SvcOutcome::Active)
     }
 }
 
@@ -147,6 +150,14 @@ pub trait DnsService {
     fn quiesce(&mut self, creds: &LeaseCreds) -> SvcReport;
     fn restore(&mut self, creds: &LeaseCreds) -> SvcReport;
     fn status(&mut self) -> SvcReport;
+    /// Current journal transaction epoch, if the service reports one.
+    /// After a successful takeover the journal epoch advances (0 -> 1) while
+    /// the lease still carries the registration epoch; the coordinator
+    /// refreshes from here so the next mutating call is not stale. Scripted
+    /// fakes return `None` (no real journal; epoch checks are mocked).
+    fn journal_epoch(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// Fresh request id (idempotency key) for one IPC call.
@@ -347,17 +358,31 @@ impl<F: dns_recovery::fs::JournalFs + 'static> DnsService for HostClient<'_, F> 
         );
         SvcReport::from_reply(&self.roundtrip(req))
     }
+
+    fn journal_epoch(&mut self) -> Option<u64> {
+        let req = Request::new(
+            new_request_id(),
+            Operation::Status,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        let reply = self.roundtrip(req);
+        reply.body.get("epoch").and_then(|v| v.as_u64())
+    }
 }
 
 /// Production Windows named-pipe client: one frame per call with a real
-/// overall deadline. A stalled peer is dropped at the deadline — the worker
-/// that runs the watchdog and the stop path is never blocked by a partial
-/// frame.
+/// 5 s framing deadline covering the bytes actually in flight. A stalled
+/// peer is dropped at the deadline — the worker that runs the watchdog and
+/// the stop path is never blocked by a partial frame.
 ///
-/// Scope: framing, deadline, request-id echo and outcome mapping. SCM-PID
-/// and protected-image pinning of the server end rides with the app-wiring
-/// pass that owns the SCM handle (U07/U08); until then this transport
-/// refuses to guess and reports `Unavailable` off Windows.
+/// Server identity (§8.2) is checked before any frame is written: the pipe
+/// server PID (via `GetNamedPipeServerProcessId`) must match the SCM service
+/// PID, and the server process image must match the protected service image.
+/// Fails closed: without a proven SCM PID the call reports `Unavailable`.
+/// Off Windows every call reports `Unavailable` so no test or non-Windows
+/// build can mistake a missing service for success.
 pub struct PipeClient {
     _private: (),
 }
@@ -513,125 +538,46 @@ impl DnsService for PipeClient {
         );
         self.call(req)
     }
+
+    fn journal_epoch(&mut self) -> Option<u64> {
+        let req = Request::new(
+            new_request_id(),
+            Operation::Status,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        self.roundtrip(req)
+            .ok()
+            .and_then(|reply| reply.body.get("epoch").and_then(|v| v.as_u64()))
+    }
 }
 
 #[cfg(windows)]
 impl PipeClient {
     fn pipe_roundtrip(&self, req: Request) -> Result<Reply, SvcError> {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
-            OPEN_EXISTING,
-        };
-        use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
-
         let unavailable = |message: String| SvcError {
             outcome: SvcOutcome::Unavailable,
             message,
         };
         let frame = dns_recovery::protocol::encode_frame(&req)
             .map_err(|e| unavailable(format!("IPC encode failed: {e}")))?;
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Reply, String>>();
-        std::thread::Builder::new()
-            .name("hange-ipc".into())
-            .spawn(move || {
-                let result: Result<Reply, String> = (|| {
-                    let mut name: Vec<u16> =
-                        dns_recovery::protocol::PIPE_NAME.encode_utf16().chain(Some(0)).collect();
-                    let waited = unsafe {
-                        WaitNamedPipeW(name.as_mut_ptr(), IPC_DEADLINE.as_millis() as u32)
-                    };
-                    if waited == 0 {
-                        return Err("service pipe not available".to_string());
-                    }
-                    let handle = unsafe {
-                        CreateFileW(
-                            name.as_ptr(),
-                            0xC0000000, // GENERIC_READ | GENERIC_WRITE
-                            FILE_SHARE_NONE,
-                            std::ptr::null(),
-                            OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if handle == INVALID_HANDLE_VALUE {
-                        return Err("could not open service pipe".to_string());
-                    }
-                    // OwnedHandle closes exactly once, even on early return.
-                    let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
-                    let raw = owned.as_raw_handle() as _;
-                    let mut written = 0u32;
-                    let ok = unsafe {
-                        WriteFile(
-                            raw,
-                            frame.as_ptr(),
-                            frame.len() as u32,
-                            &mut written,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if ok == 0 || written as usize != frame.len() {
-                        return Err("IPC write failed".to_string());
-                    }
-                    let mut len_buf = [0u8; 4];
-                    let mut read = 0u32;
-                    let ok = unsafe {
-                        ReadFile(
-                            raw,
-                            len_buf.as_mut_ptr(),
-                            4,
-                            &mut read,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if ok == 0 || read != 4 {
-                        return Err("IPC reply length read failed".to_string());
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    if len > dns_recovery::protocol::MAX_FRAME_BYTES {
-                        return Err("IPC reply exceeds 1 MiB".to_string());
-                    }
-                    let mut payload = vec![0u8; len];
-                    let mut got = 0usize;
-                    while got < len {
-                        let mut n = 0u32;
-                        let ok = unsafe {
-                            ReadFile(
-                                raw,
-                                payload.as_mut_ptr().add(got),
-                                (len - got) as u32,
-                                &mut n,
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        if ok == 0 || n == 0 {
-                            return Err("IPC reply body read failed".to_string());
-                        }
-                        got += n as usize;
-                    }
-                    let mut full = len.to_le_bytes().to_vec();
-                    full.extend_from_slice(&payload);
-                    dns_recovery::protocol::decode_reply(&full)
-                        .map_err(|e| format!("IPC decode failed: {e}"))
-                })();
-                let _ = tx.send(result);
-            })
-            .map_err(|e| unavailable(format!("IPC thread spawn failed: {e}")))?;
-        match rx.recv_timeout(IPC_DEADLINE) {
-            Ok(Ok(reply)) => {
-                if reply.request_id != req.request_id {
-                    return Err(unavailable("IPC reply request id mismatch".into()));
-                }
-                Ok(reply)
-            }
-            Ok(Err(message)) => Err(unavailable(message)),
-            Err(_) => Err(unavailable(format!(
-                "service call exceeded {}s deadline",
-                IPC_DEADLINE.as_secs()
-            ))),
+        // §8.2 server identity before any byte is written: the SCM record is
+        // the expected PID; a missing SCM PID fails closed (no guess).
+        let expected = dns_recovery::service_os::scm_service_pid()
+            .map_err(|e| unavailable(format!("SCM service PID unavailable: {e}")))?
+            .ok_or_else(|| unavailable("DNS recovery service is not running".into()))?;
+        // The U05 transport carries the real 5 s framing budget on the reads
+        // and writes actually in flight (overlapped I/O + CancelIoEx), not
+        // just the caller's wait: a stalled reply is dropped at the deadline.
+        let raw = dns_recovery::service_os::pipe_roundtrip(&frame, Some(expected))
+            .map_err(unavailable)?;
+        let reply = dns_recovery::protocol::decode_reply(&raw)
+            .map_err(|e| unavailable(format!("IPC decode failed: {e}")))?;
+        if reply.request_id != req.request_id {
+            return Err(unavailable("IPC reply request id mismatch".into()));
         }
+        Ok(reply)
     }
 }
 
@@ -655,11 +601,15 @@ mod tests {
     }
 
     #[test]
-    fn success_like_reports_are_ok_pending_is_not() {
-        for outcome in [SvcOutcome::Success, SvcOutcome::Active, SvcOutcome::VerifiedRestored] {
-            assert!(SvcReport { outcome, generation: 1, message: String::new() }.is_ok());
-        }
+    fn success_means_active_only() {
+        // Enable/reconfigure succeed only on Active. VerifiedRestored means
+        // the engine rolled back to the pre-takeover original (new plan NOT
+        // in effect); Success carries no plan (health/quiesce). Neither is
+        // a plan commit.
+        assert!(SvcReport { outcome: SvcOutcome::Active, generation: 1, message: String::new() }.is_ok());
         for outcome in [
+            SvcOutcome::Success,
+            SvcOutcome::VerifiedRestored,
             SvcOutcome::Pending,
             SvcOutcome::Conflict,
             SvcOutcome::Refused,

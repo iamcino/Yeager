@@ -135,6 +135,10 @@ pub struct CoordError {
     pub message: String,
 }
 
+/// A proven bind: the plan, a fresh listener when one was bound (`None` for
+/// reuse and for Windows-only), and whether the serving listener was reused.
+type ProvenBind = (ListenerPlan, Option<Box<dyn ManagedListener>>, bool);
+
 impl std::fmt::Display for CoordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}: {}", self.outcome, self.message)
@@ -206,6 +210,11 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
         &mut self.service
     }
 
+    #[cfg(test)]
+    pub fn lease_for_test(&self) -> Option<crate::service::LeaseCreds> {
+        self.lease.clone()
+    }
+
     pub fn pending(&self) -> Option<&str> {
         self.pending.as_deref()
     }
@@ -219,18 +228,23 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     /// Transactional enable: prove the new plan, commit it through the
     /// service, and only then swap it in. Failure keeps the old
     /// configuration serving and reports — never half-applied.
+    ///
+    /// Success is `Active` only. `verified_restored` means the engine rolled
+    /// the attempted plan back to the pre-takeover original, so the new plan
+    /// is NOT in effect and the call fails with the previous listener kept.
     pub fn enable(
         &mut self,
         choice: Choice,
         local_requested: bool,
     ) -> Result<ManagedStatus, CoordError> {
-        let (plan, listener) = self.bind_proven(local_requested)?;
-        let readiness = self.next_readiness(listener.is_some());
+        let (plan, listener, reused) = self.bind_proven(local_requested)?;
+        let readiness = self.next_readiness(plan.serves_local());
         let desired = plan::desired_plan(choice, &plan, readiness);
         let creds = self.ensure_lease(readiness)?;
         let report = self.service.apply(&creds, &self.selected, &desired);
-        if report.is_ok() {
-            self.install(choice, plan, listener, readiness, creds);
+        if report.outcome == SvcOutcome::Active {
+            self.refresh_lease_epoch();
+            self.install(choice, plan, listener, readiness, creds, reused);
             Ok(self.status_local())
         } else {
             self.abandon_candidate(listener);
@@ -242,6 +256,8 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     /// serving until the new plan is proven and committed; the old listener
     /// stops only after the commit. Failure restores the original view:
     /// the previous sockets, never a half-mixed state.
+    ///
+    /// Success is `Active` only (see [`Coordinator::enable`]).
     pub fn reconfigure(
         &mut self,
         choice: Choice,
@@ -253,13 +269,14 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
                 message: "no active configuration to change; enable first".into(),
             });
         }
-        let (plan, listener) = self.bind_proven(local_requested)?;
-        let readiness = self.next_readiness(listener.is_some());
+        let (plan, listener, reused) = self.bind_proven(local_requested)?;
+        let readiness = self.next_readiness(plan.serves_local());
         let desired = plan::desired_plan(choice, &plan, readiness);
         let creds = self.ensure_lease(readiness)?;
         let report = self.service.reconfigure(&creds, &self.selected, &desired);
-        if report.is_ok() {
-            self.install(choice, plan, listener, readiness, creds);
+        if report.outcome == SvcOutcome::Active {
+            self.refresh_lease_epoch();
+            self.install(choice, plan, listener, readiness, creds, reused);
             Ok(self.status_local())
         } else {
             self.abandon_candidate(listener);
@@ -270,12 +287,16 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     /// Transactional disable. The journal is the record, not the in-memory
     /// state: with no Active and no lease the coordinator still registers
     /// (reattaching when the same live process owns the record) and runs
-    /// quiesce/restore through the service.
+    /// restore through the service.
     ///
-    /// Ordering is restore-then-stop: the listener stops only after verified
-    /// restore, with a bounded wait. Restore failure retains the healthy
-    /// listener and the pending state; a stuck join can never precede or
-    /// block the restore because the restore already happened.
+    /// The restore runs while the lease is still valid — `engine.restore`
+    /// closes admission itself — never as quiesce-then-restore with the same
+    /// token, because `op_quiesce` deletes the lease and the following
+    /// restore is `refused` by design. Ordering is restore-then-stop: the
+    /// listener stops only after `verified_restored`, with a bounded wait.
+    /// On `pending` or `conflict` the healthy listener and the pending state
+    /// are kept; a stuck join can never precede or block the restore because
+    /// the restore already happened.
     pub fn disable(&mut self) -> Result<ManagedStatus, CoordError> {
         // R0: consult the journal even without in-memory state.
         let _consulted = self.service.status();
@@ -298,22 +319,11 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
                 }
             }
         };
-        // Close admission first; the lease is revoked server-side.
-        let quiesce = self.service.quiesce(&creds);
-        if !matches!(
-            quiesce.outcome,
-            SvcOutcome::Success | SvcOutcome::Active | SvcOutcome::VerifiedRestored
-        ) && quiesce.outcome != SvcOutcome::Pending
-        {
-            self.pending = Some(format!("quiesce refused: {}", quiesce.message));
-            self.lease = None;
-            return Err(CoordError {
-                outcome: quiesce.outcome,
-                message: format!("disable quiesce refused: {}", quiesce.message),
-            });
-        }
+        // Restore while the lease is valid. Quiesce would revoke the lease
+        // server-side and the following restore would be refused; the engine
+        // closes admission inside restore itself.
         let restore = self.service.restore(&creds);
-        if restore.is_ok() {
+        if restore.outcome == SvcOutcome::VerifiedRestored {
             // Verified restore precedes the listener stop; the stop is
             // bounded and cannot undo the restore.
             self.stop_active_bounded();
@@ -323,8 +333,9 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             Ok(self.status_local())
         } else {
             // Retain the healthy listener and the pending state — never drop
-            // the listener to force progress.
-            self.lease = None; // quiesce revoked it server-side
+            // the listener to force progress. The journal epoch advanced
+            // inside restore, so the lease is stale and is dropped.
+            self.lease = None;
             self.pending = Some(format!("restore not verified: {}", restore.message));
             Err(CoordError {
                 outcome: restore.outcome,
@@ -346,7 +357,12 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     // ---- supervision ------------------------------------------------------
 
     /// One supervision pass: probe the listener, report health, and trigger
-    /// quiesce/restore on terminal task loss. Returns what it did.
+    /// restore on terminal task loss. Returns what it did.
+    ///
+    /// Task loss restores while the lease is still valid (no quiesce first:
+    /// quiesce would revoke the lease and the following restore would be
+    /// refused). Health with `listener_responding == false` restores inside
+    /// the service itself and revokes the lease there.
     pub fn supervise_tick(&mut self) -> Supervision {
         let Some(entry) = self.active.as_ref() else {
             return Supervision::Idle;
@@ -362,9 +378,9 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             return Supervision::EpochRevoked;
         };
         if !alive {
-            // Terminal listener-task loss: close admission and restore
-            // through the journal, exactly like a watchdog death path.
-            let _ = self.service.quiesce(&creds);
+            // Terminal listener-task loss: restore while the lease is valid.
+            // Quiesce first would revoke the lease and make this restore
+            // refused; engine.restore closes admission itself.
             let restore = self.service.restore(&creds);
             self.lease = None;
             self.pending = Some(format!(
@@ -379,13 +395,22 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
                 if responding {
                     Supervision::Healthy
                 } else {
-                    // Non-responding health revokes the lease server-side
-                    // and restores; retain pending, never quit silently.
+                    // Scripted health can return Success for a non-responding
+                    // probe; the real service restores inside health(false)
+                    // and never returns Success here. Either way the lease
+                    // is stale and pending is retained, never quit silently.
                     self.lease = None;
                     self.pending =
                         Some("listener non-responding; service restore requested".into());
                     Supervision::NonResponding
                 }
+            }
+            SvcOutcome::VerifiedRestored | SvcOutcome::Pending | SvcOutcome::Conflict => {
+                // Real `health(responding == false)` restores inside the
+                // service and revokes the lease there. Retain pending.
+                self.lease = None;
+                self.pending = Some(format!("health {:?}: {}", health.outcome, health.message));
+                Supervision::NonResponding
             }
             SvcOutcome::Refused | SvcOutcome::Busy | SvcOutcome::Unavailable => {
                 self.lease = None;
@@ -404,14 +429,55 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     /// Bind with fallback (dual → v4-only → windows-only) and prove the
     /// candidate: a bound-but-unresponsive listener degrades to the next
     /// shape, and a tentative bind failure is never a quit.
+    ///
+    /// Prove-before-release: while a local listener is serving, its sockets
+    /// stay bound. Reuse the live listener when the address plan is
+    /// unchanged instead of binding port 53 a second time (`RealBinder`
+    /// cannot bind `127.0.0.1:53` / `[::1]:53` twice — the second bind fails
+    /// with address-in-use). If the retained listener occupies the port so
+    /// the requested local plan cannot be proven, return an error — never
+    /// commit Windows-only because the serving sockets are still held.
+    ///
+    /// Returns `(plan, listener, reused)`: `reused` means no new socket was
+    /// bound and the caller keeps the serving listener; `listener` is `None`
+    /// both for reuse and for Windows-only.
     fn bind_proven(
         &self,
         local_requested: bool,
-    ) -> Result<(ListenerPlan, Option<Box<dyn ManagedListener>>), CoordError> {
+    ) -> Result<ProvenBind, CoordError> {
         if !local_requested {
             let plan = ListenerPlan::for_mode(ListenerMode::WindowsOnly);
-            return Ok((plan, None));
+            return Ok((plan, None, false));
         }
+        // A local listener is serving and holding the loopback ports.
+        if let Some(entry) = self.active.as_ref()
+            && let Some(serving) = entry.listener.as_ref()
+        {
+            // The serving sockets are already proven and still bound. A
+            // second bind of the same loopback port would fail with
+            // address-in-use, so reuse the live listener for the unchanged
+            // address plan instead of rebinding.
+            if serving.alive() && serving.responds() {
+                return Ok((entry.plan.clone(), None, true));
+            }
+            if serving.alive() {
+                // Live thread but the self-probe fails: the requested local
+                // plan cannot be proven while these sockets stay bound.
+                // Fail instead of degrading to Windows-only and stopping a
+                // listener that still occupies the port.
+                return Err(CoordError {
+                    outcome: SvcOutcome::Refused,
+                    message: "local plan cannot be proven: serving listener non-responding while bound".into(),
+                });
+            }
+            // Dead holder below falls through to a fresh bind: the runtime
+            // released the ports, so a new bind may succeed. If it does not,
+            // the held-ports error below applies — never silent Windows-only.
+        }
+        let held = self
+            .active
+            .as_ref()
+            .is_some_and(|e| e.listener.is_some());
         for mode in [ListenerMode::Dual, ListenerMode::V4Only] {
             let plan = ListenerPlan::for_mode(mode);
             if plan::check_plan_rules(&plan).is_err() {
@@ -419,7 +485,7 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             }
             match self.binder.bind(&plan) {
                 Ok(listener) if listener.responds() => {
-                    return Ok((plan, Some(listener)));
+                    return Ok((plan, Some(listener), false));
                 }
                 Ok(listener) => {
                     // Bound but unresponsive: drop the candidate (bounded)
@@ -429,7 +495,17 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
                 Err(_) => {}
             }
         }
-        Ok((ListenerPlan::for_mode(ListenerMode::WindowsOnly), None))
+        if held {
+            // The retained listener still occupies the loopback port, so the
+            // requested local plan cannot be proven on free sockets. Report
+            // failure; committing Windows-only here would stop the healthy
+            // listener and report success for a plan that is not in effect.
+            return Err(CoordError {
+                outcome: SvcOutcome::Refused,
+                message: "local plan cannot be proven while serving sockets stay bound".into(),
+            });
+        }
+        Ok((ListenerPlan::for_mode(ListenerMode::WindowsOnly), None, false))
     }
 
     /// Next readiness generation for a proven plan. Windows-only (nothing
@@ -494,9 +570,27 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
         }
     }
 
+    /// Refresh the lease epoch from the journal after a commit that advances
+    /// it. A fresh takeover moves the journal epoch 0 -> 1 while the lease
+    /// still carries the registration epoch; without this refresh the next
+    /// mutating call is stale and refused. Scripted fakes report no epoch
+    /// (`None`) and keep their mocked value. Reconfigure does not advance
+    /// the epoch, so refreshing here is a no-op for it — harmless.
+    fn refresh_lease_epoch(&mut self) {
+        if let Some(epoch) = self.service.journal_epoch()
+            && let Some(lease) = self.lease.as_mut()
+        {
+            lease.epoch = epoch;
+        }
+    }
+
     /// Install a committed plan: the old listener stops only now, after the
     /// service verified the commit (loopback references already removed
     /// server-side when leaving local mode). Bounded, never blocking.
+    ///
+    /// With `reused` the serving listener stays: the address plan is
+    /// unchanged and the live sockets were never released, so only the
+    /// choice/plan/readiness rotate while the same listener keeps serving.
     fn install(
         &mut self,
         choice: Choice,
@@ -504,7 +598,17 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
         listener: Option<Box<dyn ManagedListener>>,
         readiness: u64,
         _creds: LeaseCreds,
+        reused: bool,
     ) {
+        if reused {
+            if let Some(entry) = self.active.as_mut() {
+                entry.choice = choice;
+                entry.plan = plan;
+                entry.readiness = readiness;
+            }
+            self.pending = None;
+            return;
+        }
         let old = self.active.take();
         self.active = Some(ActiveEntry {
             listener,
@@ -513,14 +617,16 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
             readiness,
         });
         self.pending = None;
-        if let Some(mut previous) = old {
-            if let Some(stub) = previous.listener.take() {
-                let _ = stub.shutdown_bounded(STOP_BOUND);
-            }
+        if let Some(mut previous) = old
+            && let Some(stub) = previous.listener.take()
+        {
+            let _ = stub.shutdown_bounded(STOP_BOUND);
         }
     }
 
     /// Drop a rejected candidate without touching the serving configuration.
+    /// A reused (`None`) candidate holds no new socket, so there is nothing
+    /// to drop and the serving listener is untouched.
     fn abandon_candidate(&mut self, candidate: Option<Box<dyn ManagedListener>>) {
         if let Some(stub) = candidate {
             let _ = stub.shutdown_bounded(STOP_BOUND);
@@ -529,10 +635,10 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
 
     /// Stop the serving listener after verified restore. Bounded.
     fn stop_active_bounded(&mut self) {
-        if let Some(mut entry) = self.active.take() {
-            if let Some(stub) = entry.listener.take() {
-                let _ = stub.shutdown_bounded(STOP_BOUND);
-            }
+        if let Some(mut entry) = self.active.take()
+            && let Some(stub) = entry.listener.take()
+        {
+            let _ = stub.shutdown_bounded(STOP_BOUND);
         }
     }
 
@@ -843,8 +949,15 @@ mod tests {
             .enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
             .unwrap();
         assert_eq!(first.addrs, vec![plan::v4_loopback(), plan::v6_loopback()]);
+        let binds_after_enable = log
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::Bind(_)))
+            .count();
 
-        // Fail the change server-side: old sockets stay, candidate drops.
+        // Fail the change server-side: the serving sockets stay bound (prove-
+        // before-release reuses the live listener, no second port-53 bind),
+        // the failure reports and the previous configuration keeps serving.
         co.service_mut().reconfigure_outcome = SvcOutcome::Pending;
         let err = co
             .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
@@ -854,32 +967,46 @@ mod tests {
         assert!(status.enabled && status.serving_local);
         assert_eq!(status.addrs, first.addrs, "old sockets retained");
         assert!(co.pending().is_some(), "pending is visible, never success");
-        // Candidate for the failed change was bound then dropped; the
-        // serving listener was never stopped for the failed change.
+        // Reuse means no second bind and no listener stop for the failed
+        // change: the serving listener was never released.
+        let binds_now = log
+            .borrow()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::Bind(_)))
+            .count();
+        assert_eq!(binds_now, binds_after_enable, "no second port-53 bind while serving");
         let shutdowns: usize = log
             .borrow()
             .iter()
             .filter(|c| matches!(c, FakeCall::Shutdown(_)))
             .count();
-        assert_eq!(shutdowns, 1, "only the rejected candidate stopped");
+        assert_eq!(shutdowns, 0, "serving listener never stopped for failed change");
 
-        // A later successful change swaps atomically: new serving, old (the
-        // retained original) stops only after the commit.
+        // A failed change that rolls back server-side reports failure too:
+        // verified_restored means the new plan is NOT in effect.
+        co.service_mut().reconfigure_outcome = SvcOutcome::VerifiedRestored;
+        let err = co
+            .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
+            .unwrap_err();
+        assert_eq!(err.outcome, SvcOutcome::VerifiedRestored);
+        let status = co.status_local();
+        assert_eq!(status.addrs, first.addrs, "rollback keeps old sockets");
+        assert!(co.pending().is_some());
+
+        // A later successful change commits atomically on the reused
+        // listener: same sockets, provider rotates, no stop.
         co.service_mut().reconfigure_outcome = SvcOutcome::Active;
         let log_len = log.borrow().len();
         let status = co
             .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
             .unwrap();
         assert!(status.enabled && status.serving_local);
+        assert_eq!(status.addrs, first.addrs, "reused listener keeps sockets");
         let tail = &log.borrow()[log_len..];
-        let reconfig_at = tail.iter().position(|c| *c == FakeCall::Reconfigure).unwrap();
-        let shutdown_at = tail
-            .iter()
-            .position(|c| matches!(c, FakeCall::Shutdown(_)))
-            .unwrap();
+        assert!(tail.contains(&FakeCall::Reconfigure), "commit through service: {tail:?}");
         assert!(
-            reconfig_at < shutdown_at,
-            "commit precedes old-listener stop: {tail:?}"
+            !tail.iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
+            "reused listener never stops on provider change: {tail:?}"
         );
     }
 
@@ -980,9 +1107,13 @@ mod tests {
         let verdict = co.supervise_tick();
         assert_eq!(verdict, Supervision::TaskLost);
         let calls = log.borrow();
-        let quiesce_at = calls.iter().position(|c| *c == FakeCall::Quiesce).unwrap();
-        let restore_at = calls.iter().position(|c| *c == FakeCall::Restore).unwrap();
-        assert!(quiesce_at < restore_at, "quiesce precedes restore: {calls:?}");
+        // Task loss restores while the lease is valid — no quiesce first.
+        // Quiesce would revoke the lease and make the restore refused.
+        assert!(
+            !calls.contains(&FakeCall::Quiesce),
+            "no quiesce before restore on task loss: {calls:?}"
+        );
+        assert!(calls.contains(&FakeCall::Restore), "restore requested: {calls:?}");
         assert!(co.pending().is_some());
     }
 
@@ -1244,5 +1375,271 @@ mod tests {
         assert_eq!(err.outcome, SvcOutcome::Refused);
         assert!(co.lease.is_none(), "dead lease is dropped");
         assert!(co.pending().is_some());
+    }
+
+    // ---- U06-REV real-seam tests (fail if the production seams are wrong) --
+
+    /// A binder that succeeds once, then fails every later bind with the OS
+    /// address-in-use error — exactly what `RealBinder` sees when it tries to
+    /// bind `127.0.0.1:53` / `[::1]:53` a second time while the serving
+    /// listener still holds the ports.
+    struct AddressInUseBinder {
+        log: Rc<RefCell<Vec<FakeCall>>>,
+        calls: Rc<RefCell<usize>>,
+    }
+
+    impl ListenerBinder for AddressInUseBinder {
+        fn bind(&self, plan: &ListenerPlan) -> Result<Box<dyn ManagedListener>, BindError> {
+            self.log.borrow_mut().push(FakeCall::Bind(plan.mode));
+            let mut n = self.calls.borrow_mut();
+            if *n == 0 {
+                *n += 1;
+                Ok(Box::new(ScriptStub {
+                    addrs: plan.addrs.clone(),
+                    alive: true,
+                    responding: true,
+                    log: Rc::clone(&self.log),
+                }))
+            } else {
+                Err(BindError(
+                    "Only one usage of each socket address is normally permitted".into(),
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn local_provider_change_reuses_live_listener_without_second_bind() {
+        let (svc, _) = ScriptService::ok();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(RefCell::new(0usize));
+        let mut svc2 = svc;
+        svc2.log = Rc::clone(&log);
+        let mut co = Coordinator::new(
+            svc2,
+            AddressInUseBinder {
+                log: Rc::clone(&log),
+                calls: Rc::clone(&calls),
+            },
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        let first = co
+            .enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        assert!(first.serving_local);
+        assert_eq!(*calls.borrow(), 1, "first enable binds once");
+        // A local Cloudflare -> Google change keeps the same loopback
+        // addresses. Prove-before-release reuses the live listener instead
+        // of binding port 53 a second time: no second bind is attempted, so
+        // the OS address-in-use error never fires and the same sockets stay
+        // serving.
+        let status = co
+            .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
+            .unwrap();
+        assert!(status.serving_local, "provider change stays local");
+        assert_eq!(status.addrs, first.addrs, "same sockets reused");
+        assert_eq!(*calls.borrow(), 1, "no second port-53 bind while serving");
+        assert!(
+            !log.borrow().iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
+            "reused listener never stops on provider change"
+        );
+        assert!(log.borrow().contains(&FakeCall::Reconfigure));
+    }
+
+    fn stack_host(world: &StackWorld) -> ServiceHost<Rc<FakeFs>> {
+        let os_b = world.os.clone();
+        let os_s = world.os.clone();
+        let lock_base = world.lock.peer(7000, 0);
+        let clock = world.clock.clone();
+        let clock_b = world.clock.clone();
+        let fs = Rc::clone(&world.fs);
+        let probe = Rc::clone(&world.probe);
+        ServiceHost::new(
+            Rc::new(move || Box::new(os_b.clone()) as Box<dyn dns_recovery::backend::DnsBackend>),
+            Rc::new(move || Box::new(os_s.clone()) as Box<dyn dns_recovery::setter::DnsSetter>),
+            Rc::new(move || Box::new(lock_base.peer(7000, 0)) as Box<dyn MachineLock>),
+            Box::new(clock_b),
+            Rc::new(move || Box::new(clock.clone()) as Box<dyn dns_recovery::clock::Clock>),
+            Rc::new(move || Rc::clone(&fs)),
+            Rc::new(move || {
+                let p: FakeOwnerProbe = (*probe).clone();
+                Box::new(p) as Box<dyn dns_recovery::replay::OwnerProbe>
+            }),
+            ServiceConfig {
+                dir: DIR.to_string(),
+                machine_id: MACHINE.to_string(),
+                service_instance_id: SERVICE.to_string(),
+            },
+        )
+    }
+
+    fn stack_binder(log: Rc<RefCell<Vec<FakeCall>>>) -> ScriptBinder {
+        ScriptBinder {
+            fail_modes: vec![],
+            alive: true,
+            responding: true,
+            log,
+        }
+    }
+
+    #[test]
+    fn reconfigure_verified_restored_reports_failure_and_retains_listener() {
+        let world = StackWorld::new();
+        world.seed();
+        let mut host = stack_host(&world);
+        let peer = world.peer();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut co = Coordinator::new(
+            HostClient::new(&mut host, peer),
+            stack_binder(Rc::clone(&log)),
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        let first = co
+            .enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        assert!(first.serving_local);
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(ns.contains("1.1.1.1"), "Cloudflare committed: {ns}");
+        // External divergence back to the pre-takeover original on v4: the
+        // engine must detect the committed-image mismatch, roll the
+        // reconfigure back (already-original v4 verifies, v6 restores) and
+        // report VerifiedRestored instead of applying Google.
+        world
+            .os
+            .set_configured(GUID_A, Family::Ipv4, "192.0.2.53", vec![]);
+        let err = co
+            .reconfigure(Choice::Fixed(common::DohProvider::Google), true)
+            .unwrap_err();
+        assert_eq!(
+            err.outcome,
+            SvcOutcome::VerifiedRestored,
+            "rollback is failure, never success: {err:?}"
+        );
+        let status = co.status_local();
+        assert!(status.serving_local, "previous listener retained");
+        assert_eq!(status.addrs, first.addrs, "same sockets keep serving");
+        assert!(co.pending().is_some(), "pending visible, never success");
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(
+            ns.contains("192.0.2.53"),
+            "fake OS rolled back to pre-takeover original, not Google: {ns}"
+        );
+        assert!(!ns.contains("8.8.8.8"), "Google never applied: {ns}");
+    }
+
+    #[test]
+    fn disable_with_active_lease_restores_and_stops() {
+        let world = StackWorld::new();
+        world.seed();
+        let mut host = stack_host(&world);
+        let peer = world.peer();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut co = Coordinator::new(
+            HostClient::new(&mut host, peer),
+            stack_binder(Rc::clone(&log)),
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        co.enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(ns.contains("1.1.1.1"), "Cloudflare committed: {ns}");
+        // Restore runs while the lease is valid (no quiesce first: quiesce
+        // would revoke the lease and make this restore refused). Verified
+        // restore stops the listener.
+        let status = co.disable().unwrap();
+        assert!(!status.enabled && !status.serving_local);
+        assert!(co.pending().is_none());
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(
+            ns.contains("192.0.2.53"),
+            "fake OS shows pre-takeover original after disable: {ns}"
+        );
+    }
+
+    #[test]
+    fn disable_without_active_consults_journal_and_restores() {
+        let world = StackWorld::new();
+        world.seed();
+        // First owner enables: the journal now records an Active transaction
+        // and the fake OS shows Cloudflare.
+        let mut host1 = stack_host(&world);
+        let peer = world.peer();
+        {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut co1 = Coordinator::new(
+                HostClient::new(&mut host1, peer.clone()),
+                stack_binder(log),
+                OWNER,
+                vec![GUID_A.to_string()],
+            );
+            co1.enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+                .unwrap();
+        }
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(ns.contains("1.1.1.1"), "Cloudflare committed: {ns}");
+        // Simulate a restart: new service host over the same journal/files,
+        // new coordinator with no Active and no lease. Disable must still
+        // consult the journal (status), reattach to the live owner record,
+        // and restore — never no-op. The fake-OS rollback below proves the
+        // journal was consulted: without it the Cloudflare image would stay.
+        let mut host2 = stack_host(&world);
+        let log2 = Rc::new(RefCell::new(Vec::new()));
+        let mut co2 = Coordinator::new(
+            HostClient::new(&mut host2, peer),
+            stack_binder(log2),
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        assert!(!co2.is_enabled());
+        let status = co2.disable().unwrap();
+        assert!(!status.enabled);
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(
+            ns.contains("192.0.2.53"),
+            "journal transaction restored to original: {ns}"
+        );
+    }
+
+    #[test]
+    fn supervise_tick_after_quiesce_reports_epoch_revoked_and_retains_listener() {
+        let world = StackWorld::new();
+        world.seed();
+        let mut host = stack_host(&world);
+        let peer = world.peer();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut co = Coordinator::new(
+            HostClient::new(&mut host, peer),
+            stack_binder(Rc::clone(&log)),
+            OWNER,
+            vec![GUID_A.to_string()],
+        );
+        let first = co
+            .enable(Choice::Fixed(common::DohProvider::Cloudflare), true)
+            .unwrap();
+        // Revoke the lease server-side with a real quiesce (no restore:
+        // quiesce only closes admission). The coordinator still holds the
+        // now-stale client lease, exactly like a watchdog death path before
+        // the next tick.
+        let creds = co.lease_for_test().expect("enable holds a lease");
+        let quiesce = co.service_mut().quiesce(&creds);
+        assert_eq!(quiesce.outcome, SvcOutcome::Success);
+        // The next tick must not call restore with the revoked token (that
+        // restore is refused by design). It reports the revoked epoch and
+        // retains the serving listener; the fake OS still shows the committed
+        // image because quiesce never restores.
+        let verdict = co.supervise_tick();
+        assert_eq!(verdict, Supervision::EpochRevoked);
+        let status = co.status_local();
+        assert!(status.serving_local, "listener retained after quiesce");
+        assert_eq!(status.addrs, first.addrs);
+        assert!(co.pending().is_some());
+        let (ns, _) = world.os.configured(GUID_A, Family::Ipv4);
+        assert!(
+            ns.contains("1.1.1.1"),
+            "quiesce does not restore; committed image stays: {ns}"
+        );
     }
 }

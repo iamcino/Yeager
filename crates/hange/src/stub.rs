@@ -41,18 +41,51 @@ pub struct Stub {
     pub addrs: Vec<SocketAddr>,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Supervised serve-task handles (one UDP + one TCP per bound address).
+    /// A panic or exit in `serve_tcp` finishes its handle, so `is_alive`
+    /// sees the death even while the runtime thread and the UDP probe stay
+    /// up. The per-query/per-connection tasks spawned inside the loops are
+    /// short-lived by design and are never tracked here — only the accept /
+    /// recv loops are.
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Stub {
-    /// Whether the serving thread is still running. A finished thread means
-    /// the listener task panicked or exited — the supervisor must treat that
-    /// as terminal listener-task loss (quiesce/restore), never as a quiet
-    /// no-op.
+    /// Whether the serving thread AND the supervised UDP/TCP serve tasks are
+    /// still running. A finished thread means the listener task panicked or
+    /// exited; a finished serve-task handle means `serve_udp` or `serve_tcp`
+    /// died even while the runtime thread stays up — the supervisor must
+    /// treat either as terminal listener-task loss (quiesce/restore), never
+    /// as a quiet no-op.
     pub fn is_alive(&self) -> bool {
-        !self
+        let thread_done = self
             .thread
             .as_ref()
-            .is_some_and(|t| t.is_finished())
+            .is_some_and(|t| t.is_finished());
+        if thread_done {
+            return false;
+        }
+        match self.tasks.lock() {
+            Ok(guard) => !guard.iter().any(|h| h.is_finished()),
+            Err(_) => false,
+        }
+    }
+
+    /// Test seam: abort the supervised serve tasks (simulates a `serve_tcp`
+    /// panic/exit). `is_alive` must observe the death even while the runtime
+    /// thread stays up — otherwise task loss is invisible to supervision.
+    #[cfg(test)]
+    pub fn abort_serve_tasks_for_test(&self) {
+        if let Ok(guard) = self.tasks.lock() {
+            for h in guard.iter() {
+                h.abort();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn serve_task_count_for_test(&self) -> usize {
+        self.tasks.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     /// Bounded local self-probe: one query against the first bound address.
@@ -160,14 +193,23 @@ impl Stub {
 
         let (stop, stopped) = oneshot::channel::<()>();
         let served = pool.clone();
+        let tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tasks_in = Arc::clone(&tasks);
         let thread = std::thread::Builder::new()
             .name("hange-stub".into())
             .spawn(move || {
                 runtime.block_on(async move {
                     tokio::spawn(served.clone().keep_warm());
                     for (udp, tcp) in sockets {
-                        tokio::spawn(serve_udp(Arc::new(udp), served.clone(), cache.clone()));
-                        tokio::spawn(serve_tcp(tcp, served.clone(), cache.clone()));
+                        tasks_in.lock().map(|mut g| {
+                            g.push(tokio::spawn(serve_udp(
+                                Arc::new(udp),
+                                served.clone(),
+                                cache.clone(),
+                            )));
+                            g.push(tokio::spawn(serve_tcp(tcp, served.clone(), cache.clone())));
+                        }).ok();
                     }
                     let _ = stopped.await;
                 });
@@ -179,6 +221,7 @@ impl Stub {
             addrs: bound,
             stop: Some(stop),
             thread: Some(thread),
+            tasks,
         })
     }
 }
@@ -533,5 +576,45 @@ mod tests {
             Some(MAX_TTL)
         );
         assert_eq!(cache_ttl(&answer("short.example.", 5)), Some(MIN_TTL));
+    }
+
+    /// Supervision sees a dead serve task even while the runtime thread stays
+    /// up: aborting the tracked UDP/TCP loops (simulating a `serve_tcp`
+    /// panic) makes `is_alive` report loss. A thread-only check plus a UDP
+    /// probe would miss a dead TCP accept loop.
+    #[test]
+    fn serve_task_death_is_visible_to_supervision() {
+        let dead = || {
+            Arc::new(Upstream::with_addrs(
+                DohProvider::Cloudflare,
+                vec!["127.0.0.1:1".parse().unwrap()],
+            ))
+        };
+        let pool = Pool::from_upstreams([dead(), dead()], false);
+        let stub = Stub::start(pool, &["127.0.0.1:0".parse().unwrap()]).unwrap();
+        // The serve loops are spawned inside the runtime thread: wait until
+        // both the UDP and TCP handles are tracked before killing them,
+        // otherwise the abort races an empty handle list.
+        let mut tracked = false;
+        for _ in 0..100 {
+            if stub.serve_task_count_for_test() >= 2 {
+                tracked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tracked, "serve tasks must be tracked");
+        assert!(stub.is_alive(), "fresh stub is alive");
+        stub.abort_serve_tasks_for_test();
+        let mut gone = false;
+        for _ in 0..100 {
+            if !stub.is_alive() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone, "aborted serve tasks must read as task loss");
+        let _ = stub.shutdown_bounded(Duration::from_secs(5));
     }
 }
