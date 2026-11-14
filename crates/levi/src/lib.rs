@@ -3,6 +3,7 @@
 
 pub mod adaptive;
 pub mod adaptive_emit;
+pub mod driver_store;
 pub mod engine;
 pub mod packet;
 pub mod raw;
@@ -13,7 +14,6 @@ use engine::ResilienceEngine;
 use packet::{PacketMetadata, ParsedPacket};
 use raw::{SafeHandle, WinDivertAddress, WinDivertApi, WINDIVERT_LAYER_NETWORK};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -409,29 +409,17 @@ struct ResilienceTask {
     addr: WinDivertAddress,
 }
 
-pub fn get_driver_dir() -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push("Yeager_bin");
-    dir
+/// Protected driver directory (`%ProgramData%\Yeager\driver`). Fails closed when
+/// `%ProgramData%` is missing: there is no fallback to a user-writable location.
+pub fn get_driver_dir() -> Result<PathBuf, String> {
+    driver_store::get_driver_dir()
 }
 
+/// Extracts (or SHA-256 re-verifies) the embedded driver files into the
+/// protected directory and returns the DLL path to load. Honors the
+/// `YEAGER_WINDIVERT_PATH` override. See [`driver_store`].
 pub fn ensure_driver_extracted() -> Result<PathBuf, String> {
-    let bin_dir = get_driver_dir();
-    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
-
-    let files: [(&str, &[u8]); 2] = [
-        ("WinDivert.dll", WINDIVERT_DLL),
-        ("WinDivert64.sys", WINDIVERT_SYS),
-    ];
-
-    for (name, bytes) in files.iter() {
-        let dest = bin_dir.join(name);
-        if !dest.exists() || fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == 0 {
-            fs::write(&dest, bytes).map_err(|e| format!("Failed writing {}: {}", name, e))?;
-        }
-    }
-
-    Ok(bin_dir.join("WinDivert.dll"))
+    driver_store::ensure_driver_extracted(WINDIVERT_DLL, WINDIVERT_SYS)
 }
 
 /// Starts the native Levi connection resilience engine with default Auto profile.
