@@ -462,6 +462,28 @@ pub fn start_with_profile_and_driver_dir(
     );
 
     let dll_path = ensure_driver_extracted_with_override(driver_dir.as_deref())?;
+    // Stale-record guard: the SCM service record decides which `.sys` the
+    // kernel loads, regardless of which DLL was just hash-verified — so this
+    // runs on BOTH the protected-store and the `--driver-dir` paths, with the
+    // expected `.sys` taken as the file next to the DLL actually being
+    // loaded. A foreign record is deleted when stopped (the DLL recreates it
+    // from the correct directory); a running/undeletable one fails closed.
+    {
+        let expected_sys = dll_path.parent().map(|d| {
+            d.join(driver_store::WINDIVERT_SYS_NAME)
+        });
+        match expected_sys {
+            Some(expected_sys) => {
+                driver_store::ensure_windivert_service_record(&expected_sys)?
+            }
+            None => {
+                return Err(format!(
+                    "Refusing to start the engine: driver path {} has no parent directory",
+                    dll_path.display()
+                ));
+            }
+        }
+    }
     let api = Arc::new(WinDivertApi::load(&dll_path)?);
 
     // Surgical WinDivert filter:

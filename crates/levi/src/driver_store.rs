@@ -378,10 +378,11 @@ pub fn verify_protected_dir(dir: &Path) -> Result<(), String> {
     // 2. Owner must be Administrators or SYSTEM.
     if !sid_is_trusted_owner(owner) {
         return Err(format!(
-            "Refusing to use driver directory {}: unexpected owner (not Administrators or SYSTEM); \
+            "Refusing to use driver directory {}: unexpected owner {} (not Administrators or SYSTEM); \
              it may have been pre-created by a lower-privilege user. \
              As an administrator, remove the directory and restart Yeager so it is recreated protected.",
-            dir.display()
+            dir.display(),
+            describe_owner_sid(owner)
         ));
     }
 
@@ -395,6 +396,66 @@ pub fn verify_protected_dir(dir: &Path) -> Result<(), String> {
         "Protected driver directory {} requires Windows security APIs",
         dir.display()
     ))
+}
+
+/// Names the SID actually found on a directory for the owner-mismatch error:
+/// `DOMAIN\name` when the account resolves, else the `S-1-...` string form,
+/// else a placeholder. Never fails — diagnosis must not become a new refusal.
+#[cfg(windows)]
+fn describe_owner_sid(sid: *mut std::ffi::c_void) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::LookupAccountSidW;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    if sid.is_null() {
+        return "none".to_string();
+    }
+    unsafe {
+        // Account name, two-call sizing first.
+        let mut name_len: u32 = 0;
+        let mut domain_len: u32 = 0;
+        let mut use_kind: i32 = 0;
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            std::ptr::null_mut(),
+            &mut name_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut use_kind,
+        );
+        if name_len > 0 && domain_len > 0 {
+            let mut name = vec![0u16; name_len as usize];
+            let mut domain = vec![0u16; domain_len as usize];
+            if LookupAccountSidW(
+                std::ptr::null(),
+                sid,
+                name.as_mut_ptr(),
+                &mut name_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut use_kind,
+            ) != 0
+            {
+                let trim_nul = |v: &[u16]| {
+                    let n = v.iter().position(|&c| c == 0).unwrap_or(v.len());
+                    String::from_utf16_lossy(&v[..n])
+                };
+                return format!("{}\\{}", trim_nul(&domain), trim_nul(&name));
+            }
+        }
+        // Fallback: the SID string form.
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut text) != 0 && !text.is_null() {
+            let mut len = 0;
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text as *mut std::ffi::c_void);
+            return s;
+        }
+        "unresolvable SID".to_string()
+    }
 }
 
 /// True when `sid` is Administrators or SYSTEM — the only acceptable owners
@@ -654,12 +715,16 @@ fn ensure_one_protected_dir(path: &Path) -> Result<(), String> {
         .chain(std::iter::once(0))
         .collect();
 
-    // Create with SECURITY_ATTRIBUTES carrying the protected DACL, so the
-    // directory is never momentarily left to inherited permissions. The
+    // Create with SECURITY_ATTRIBUTES carrying the protected DACL and an
+    // explicit Administrators owner, so the directory is never momentarily
+    // left to inherited permissions or the token's default owner. The
     // descriptor only needs to outlive the creation call.
     let created = {
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-        let sd = build_protected_security_descriptor(new_acl)?;
+        let sd = build_protected_security_descriptor(
+            new_acl,
+            admin_sid.as_mut_ptr() as *mut std::ffi::c_void,
+        )?;
         let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.as_ptr() as *mut std::ffi::c_void,
@@ -711,17 +776,22 @@ fn ensure_one_protected_dir(path: &Path) -> Result<(), String> {
     verify_protected_dir(path)
 }
 
-/// Builds a self-relative SECURITY_DESCRIPTOR holding `acl` as its DACL and
-/// marked `SE_DACL_PROTECTED`, for use in SECURITY_ATTRIBUTES at creation.
-/// Returned as bytes that only need to outlive the creation call.
+/// Builds a self-relative SECURITY_DESCRIPTOR holding `acl` as its DACL,
+/// marked `SE_DACL_PROTECTED`, with the owner set EXPLICITLY to
+/// `owner_sid` (Administrators) — never the creating token's default owner,
+/// which is the user SID rather than Administrators on some account classes
+/// (notably the built-in Administrator, RID 500). For use in
+/// SECURITY_ATTRIBUTES at creation. Returned as bytes that only need to
+/// outlive the creation call.
 #[cfg(windows)]
 fn build_protected_security_descriptor(
     acl: *mut windows_sys::Win32::Security::ACL,
+    owner_sid: *mut std::ffi::c_void,
 ) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Security::{
         InitializeSecurityDescriptor, MakeSelfRelativeSD, SE_DACL_PROTECTED,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
     };
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
     // Absolute SD on the stack, then converted to self-relative for the SA.
@@ -745,6 +815,19 @@ fn build_protected_security_descriptor(
     if ok == 0 {
         let code = unsafe { GetLastError() };
         return Err(format!("SetSecurityDescriptorDacl failed (code {})", code));
+    }
+    // Explicit owner, NOT defaulted: creation must not depend on the token's
+    // default owner (bOwnerDefaulted = FALSE).
+    let ok = unsafe {
+        SetSecurityDescriptorOwner(
+            absolute.as_mut_ptr() as *mut std::ffi::c_void,
+            owner_sid,
+            0,
+        )
+    };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!("SetSecurityDescriptorOwner failed (code {})", code));
     }
     let ok = unsafe {
         SetSecurityDescriptorControl(
@@ -796,6 +879,328 @@ fn ensure_one_protected_dir(dir: &Path) -> Result<(), String> {
         "Protected driver directory {} requires Windows security APIs",
         dir.display()
     ))
+}
+
+/// Name of the kernel service the vendored WinDivert installer manages. An
+/// existing record is started as-is by the DLL (no reconfiguration), so a
+/// record left by a pre-fix crash still points at the old temp `.sys`.
+pub const WINDIVERT_SERVICE_NAME: &str = "WinDivert";
+
+/// Normalizes a service binary path for comparison with the verified `.sys`.
+///
+/// Kernel ImagePath forms vary in the wild; handled here:
+/// - surrounding double quotes (and any trailing arguments past the path);
+/// - NT object-manager prefixes `\??\` and `\\?\`;
+/// - `%SystemRoot%` (any ASCII case) expanded from the live environment
+///   (fallback `C:\Windows`), and a leading `\SystemRoot\` mapped the same way;
+/// - forward slashes, and ASCII case (Windows paths compare insensitively).
+pub fn normalize_service_binary_path(raw: &str) -> String {
+    // Service binary paths take no arguments, but defensively take only the
+    // path token: the quoted span, or the first whitespace-delimited token.
+    let token = {
+        let s = raw.trim();
+        if let Some(rest) = s.strip_prefix('"') {
+            match rest.find('"') {
+                Some(end) => rest[..end].to_string(),
+                None => rest.to_string(),
+            }
+        } else {
+            s.split_whitespace().next().unwrap_or("").to_string()
+        }
+    };
+    let mut s = token;
+    for prefix in [r"\\?\", r"\??\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    let system_root = std::env::var_os("SystemRoot")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "C:\\Windows".to_string());
+    s = replace_ascii_case_insensitive(&s, "%SystemRoot%", &system_root);
+    let sysroot_prefix = r"\SystemRoot\";
+    if s.len() >= sysroot_prefix.len()
+        && s[..sysroot_prefix.len()].eq_ignore_ascii_case(sysroot_prefix)
+    {
+        s = format!("{}{}", system_root, &s[sysroot_prefix.len() - 1..]);
+    }
+    s.replace('/', "\\").to_lowercase()
+}
+
+/// ASCII case-insensitive substring replacement on bytes (safe: the ASCII
+/// needle can never match inside a multi-byte UTF-8 sequence).
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(hb.len());
+    let mut i = 0;
+    while i + nb.len() <= hb.len() {
+        if hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+            out.extend_from_slice(replacement.as_bytes());
+            i += nb.len();
+        } else {
+            out.push(hb[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&hb[i..]);
+    String::from_utf8(out).unwrap_or_else(|_| haystack.to_string())
+}
+
+/// True when the recorded service binary path resolves to exactly
+/// `expected_sys` (the `.sys` next to the DLL about to be loaded).
+fn service_paths_match(recorded: &str, expected_sys: &Path) -> bool {
+    normalize_service_binary_path(recorded)
+        == normalize_service_binary_path(&expected_sys.to_string_lossy())
+}
+
+/// What the SCM seam observed for one service record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceRecord {
+    /// No record: the DLL creates one from the loaded DLL's directory.
+    Absent,
+    /// A record exists. `running` is true unless the service is confirmed
+    /// STOPPED — any other state (running, pending, unknown) is fail-closed.
+    Present {
+        binary_path: String,
+        running: bool,
+    },
+}
+
+/// SCM read/delete operations behind a seam so the stale-record decision is
+/// unit-testable with faked records (absent / matching / foreign-stopped /
+/// foreign-running / query-error).
+pub trait ServiceControl {
+    /// Reads the service record: `Absent`, or `Present` with its binary path
+    /// and whether it is anything but STOPPED. Any failure is `Err`.
+    fn query(&self, service_name: &str) -> Result<ServiceRecord, String>;
+    /// Deletes a STOPPED record; the DLL recreates it from the correct
+    /// directory on the next install.
+    fn delete(&self, service_name: &str) -> Result<(), String>;
+}
+
+/// Rejects a stale `WinDivert` service record before the DLL load step.
+///
+/// - No record → proceed (the DLL creates it from the loaded DLL's directory).
+/// - Record resolves to exactly `expected_sys` → proceed.
+/// - Record points anywhere else: if the service is STOPPED, delete the
+///   record and proceed; if it is RUNNING (or its state/deletion fails),
+///   fail closed naming the recorded path. The engine never starts against a
+///   foreign record.
+pub fn ensure_service_record(
+    scm: &impl ServiceControl,
+    service_name: &str,
+    expected_sys: &Path,
+) -> Result<(), String> {
+    let record = scm.query(service_name).map_err(|e| {
+        format!(
+            "Refusing to start the engine: the {service_name} service record cannot be read ({e}); \
+             a stale record could load a planted driver as SYSTEM. \
+             Inspect the record with `sc.exe qc {service_name}` and remove it, then restart."
+        )
+    })?;
+    match record {
+        ServiceRecord::Absent => Ok(()),
+        ServiceRecord::Present {
+            binary_path,
+            running,
+        } => {
+            if service_paths_match(&binary_path, expected_sys) {
+                return Ok(());
+            }
+            if running {
+                return Err(format!(
+                    "Refusing to start the engine: the {service_name} service record points at \
+                     {binary_path} instead of the verified driver at {}; the old driver is still \
+                     running from that path. Stop it (or reboot so it stays stopped), remove the \
+                     stale record, then restart — the engine never starts against a foreign record.",
+                    expected_sys.display()
+                ));
+            }
+            scm.delete(service_name).map_err(|e| {
+                format!(
+                    "Refusing to start the engine: the {service_name} service record points at \
+                     {binary_path} instead of the verified driver at {}, and the stale record \
+                     could not be deleted ({e}). Remove it as an administrator, then restart.",
+                    expected_sys.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+/// The live SCM implementation (Windows only).
+#[cfg(windows)]
+pub struct WindowsServiceControl;
+
+/// RAII guard closing an SCM / service handle on drop.
+#[cfg(windows)]
+struct ScmHandleGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for ScmHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::System::Services::CloseServiceHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl ServiceControl for WindowsServiceControl {
+    fn query(&self, service_name: &str) -> Result<ServiceRecord, String> {
+        use windows_sys::Win32::Foundation::{
+            GetLastError, ERROR_SERVICE_DOES_NOT_EXIST,
+        };
+        use windows_sys::Win32::System::Services::{
+            OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatus,
+            SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+            QUERY_SERVICE_CONFIGW, SERVICE_STATUS, SERVICE_STOPPED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+        let name: Vec<u16> = service_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+        if manager.is_null() {
+            let code = unsafe { GetLastError() };
+            return Err(format!("OpenSCManagerW failed (code {code})"));
+        }
+        let _manager_guard = ScmHandleGuard(manager);
+        // QUERY for config/state plus DELETE so a stopped stale record can be
+        // removed in the same decision.
+        let service = unsafe {
+            OpenServiceW(
+                manager,
+                name.as_ptr(),
+                SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | DELETE,
+            )
+        };
+        if service.is_null() {
+            let code = unsafe { GetLastError() };
+            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(ServiceRecord::Absent);
+            }
+            return Err(format!("OpenServiceW({service_name}) failed (code {code})"));
+        }
+        let _service_guard = ScmHandleGuard(service);
+        // Config: two-call sizing, then read the binary path.
+        let mut needed: u32 = 0;
+        unsafe {
+            QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(format!(
+                "QueryServiceConfigW({service_name}) sizing failed (code {code})"
+            ));
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = unsafe {
+            QueryServiceConfigW(
+                service,
+                buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(format!(
+                "QueryServiceConfigW({service_name}) failed (code {code})"
+            ));
+        }
+        let binary_path = unsafe {
+            let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+            pwstr_to_string(cfg.lpBinaryPathName)
+        };
+        // State: anything but confirmed STOPPED counts as running (fail-closed).
+        let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+        let ok = unsafe { QueryServiceStatus(service, &mut status) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(format!(
+                "QueryServiceStatus({service_name}) failed (code {code}); \
+                 the record state cannot be determined"
+            ));
+        }
+        Ok(ServiceRecord::Present {
+            binary_path,
+            running: status.dwCurrentState != SERVICE_STOPPED,
+        })
+    }
+
+    fn delete(&self, service_name: &str) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        use windows_sys::Win32::System::Services::{
+            DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        };
+
+        let name: Vec<u16> = service_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+        if manager.is_null() {
+            let code = unsafe { GetLastError() };
+            return Err(format!("OpenSCManagerW failed (code {code})"));
+        }
+        let _manager_guard = ScmHandleGuard(manager);
+        let service = unsafe { OpenServiceW(manager, name.as_ptr(), DELETE) };
+        if service.is_null() {
+            let code = unsafe { GetLastError() };
+            return Err(format!("OpenServiceW({service_name}) failed (code {code})"));
+        }
+        let _service_guard = ScmHandleGuard(service);
+        let ok = unsafe { DeleteService(service) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(format!("DeleteService({service_name}) failed (code {code})"));
+        }
+        Ok(())
+    }
+}
+
+/// Reads a NUL-terminated UTF-16 Windows string (empty when null).
+#[cfg(windows)]
+fn pwstr_to_string(p: *mut u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let mut len = 0;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+    }
+}
+
+/// Fails closed off-Windows: the SCM check requires Windows service APIs.
+#[cfg(not(windows))]
+pub fn ensure_windivert_service_record(expected_sys: &Path) -> Result<(), String> {
+    Err(format!(
+        "WinDivert service record check for {} requires Windows service APIs",
+        expected_sys.display()
+    ))
+}
+
+/// The production stale-record check on the `WinDivert` service (Windows).
+/// See [`ensure_service_record`] for the decision table.
+#[cfg(windows)]
+pub fn ensure_windivert_service_record(expected_sys: &Path) -> Result<(), String> {
+    ensure_service_record(
+        &WindowsServiceControl,
+        WINDIVERT_SERVICE_NAME,
+        expected_sys,
+    )
 }
 
 /// Extracts (or SHA-256 re-verifies) the embedded driver files into the
@@ -1046,6 +1451,166 @@ mod tests {
         let root = unique_dir("legacy-gone");
         assert_eq!(cleanup_legacy_temp_dir_at(&root), LegacyCleanup::Gone);
         remove_test_tree(&root);
+    }
+
+    /// Fake SCM for the stale-record decision table: canned query result,
+    /// canned delete result, and a log of services it was asked to delete.
+    struct FakeScm {
+        record: Result<ServiceRecord, String>,
+        delete_result: Result<(), String>,
+        deleted: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeScm {
+        fn present(binary_path: &str, running: bool) -> Self {
+            Self {
+                record: Ok(ServiceRecord::Present {
+                    binary_path: binary_path.to_string(),
+                    running,
+                }),
+                delete_result: Ok(()),
+                deleted: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ServiceControl for FakeScm {
+        fn query(&self, _service_name: &str) -> Result<ServiceRecord, String> {
+            self.record.clone()
+        }
+        fn delete(&self, service_name: &str) -> Result<(), String> {
+            self.deleted.borrow_mut().push(service_name.to_string());
+            self.delete_result.clone()
+        }
+    }
+
+    #[test]
+    fn stale_record_absent_proceeds() {
+        let scm = FakeScm {
+            record: Ok(ServiceRecord::Absent),
+            delete_result: Ok(()),
+            deleted: std::cell::RefCell::new(Vec::new()),
+        };
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        assert!(ensure_service_record(&scm, "WinDivert", expected).is_ok());
+        assert!(scm.deleted.borrow().is_empty(), "absent record must not delete");
+    }
+
+    #[test]
+    fn stale_record_matching_path_proceeds() {
+        // Exact, quoted, NT-prefixed and differently-cased records of the
+        // verified .sys all proceed without touching the record.
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        for recorded in [
+            "C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys",
+            "\"C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys\"",
+            "\\??\\C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys",
+            "c:\\programdata\\yeager\\driver\\windivert64.sys",
+        ] {
+            let scm = FakeScm::present(recorded, false);
+            assert!(
+                ensure_service_record(&scm, "WinDivert", expected).is_ok(),
+                "matching record must proceed: {recorded}"
+            );
+            assert!(
+                scm.deleted.borrow().is_empty(),
+                "matching record must not delete: {recorded}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_record_foreign_stopped_is_deleted_and_proceeds() {
+        let foreign = "C:\\Users\\victim\\AppData\\Local\\Temp\\Yeager_bin\\WinDivert64.sys";
+        let scm = FakeScm::present(foreign, false);
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        assert!(
+            ensure_service_record(&scm, "WinDivert", expected).is_ok(),
+            "foreign stopped record must be deleted and proceed"
+        );
+        assert_eq!(
+            scm.deleted.borrow().as_slice(),
+            ["WinDivert"],
+            "foreign stopped record must be deleted exactly once"
+        );
+    }
+
+    #[test]
+    fn stale_record_foreign_running_refuses_without_delete() {
+        let foreign = "\\??\\C:\\Users\\victim\\AppData\\Local\\Temp\\Yeager_bin\\WinDivert64.sys";
+        let scm = FakeScm::present(foreign, true);
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        let err = ensure_service_record(&scm, "WinDivert", expected)
+            .expect_err("foreign running record must fail closed");
+        assert!(
+            err.contains("Yeager_bin\\WinDivert64.sys"),
+            "refusal must name the recorded path, got: {err}"
+        );
+        assert!(
+            scm.deleted.borrow().is_empty(),
+            "running record must never be deleted"
+        );
+    }
+
+    #[test]
+    fn stale_record_query_error_refuses() {
+        let scm = FakeScm {
+            record: Err("OpenServiceW failed (code 5)".to_string()),
+            delete_result: Ok(()),
+            deleted: std::cell::RefCell::new(Vec::new()),
+        };
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        let err = ensure_service_record(&scm, "WinDivert", expected)
+            .expect_err("unreadable record must fail closed");
+        assert!(
+            err.contains("cannot be read"),
+            "refusal must say the record cannot be read, got: {err}"
+        );
+        assert!(
+            scm.deleted.borrow().is_empty(),
+            "unreadable record must not delete"
+        );
+    }
+
+    #[test]
+    fn stale_record_delete_failure_refuses() {
+        let foreign = "C:\\Temp\\Yeager_bin\\WinDivert64.sys";
+        let mut scm = FakeScm::present(foreign, false);
+        scm.delete_result = Err("DeleteService failed (code 5)".to_string());
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        let err = ensure_service_record(&scm, "WinDivert", expected)
+            .expect_err("undeletable foreign record must fail closed");
+        assert!(
+            err.contains("could not be deleted"),
+            "refusal must say the record could not be deleted, got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_binary_path_normalization_handles_kernel_forms() {
+        assert_eq!(
+            normalize_service_binary_path("\"C:\\A\\B\\WinDivert64.sys\""),
+            "c:\\a\\b\\windivert64.sys"
+        );
+        assert_eq!(
+            normalize_service_binary_path("\\??\\C:\\A\\B\\WinDivert64.sys"),
+            "c:\\a\\b\\windivert64.sys"
+        );
+        assert_eq!(
+            normalize_service_binary_path("C:/A/B/WinDivert64.sys"),
+            "c:\\a\\b\\windivert64.sys"
+        );
+        // %SystemRoot% expands from the live environment on the test host.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let expanded = normalize_service_binary_path("%SystemRoot%\\System32\\drivers\\x.sys");
+        assert_eq!(
+            expanded,
+            format!("{}\\system32\\drivers\\x.sys", sysroot.replace('/', "\\").to_lowercase())
+        );
+        assert_eq!(
+            normalize_service_binary_path("\\SystemRoot\\System32\\drivers\\x.sys"),
+            format!("{}\\system32\\drivers\\x.sys", sysroot.replace('/', "\\").to_lowercase())
+        );
     }
 
     #[cfg(windows)]
@@ -1446,6 +2011,79 @@ mod tests {
         ensure_admin_only_dir(&leaf).expect("admin setup must succeed");
         verify_protected_dir(&root.join("Yeager")).expect("parent must verify");
         verify_protected_dir(&leaf).expect("leaf must verify");
+        remove_test_tree(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn created_dir_owner_is_administrators() {
+        // Creation must not depend on the creating token's default owner:
+        // a directory built by the production helper reads back owned by
+        // BUILTIN\Administrators and passes verification.
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION,
+            SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
+        };
+        use windows_sys::core::PCWSTR;
+
+        let root = unique_dir("created-owner");
+        let leaf = root.join("Yeager").join("driver");
+        ensure_admin_only_dir(&leaf).expect("admin setup must succeed");
+
+        let wide: Vec<u16> = leaf
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut owner: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr() as PCWSTR,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS, "owner read-back must succeed");
+        struct Guard(*mut std::ffi::c_void);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        let _guard = Guard(sd);
+        assert!(!owner.is_null(), "created directory must have an owner");
+        let mut admin = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = admin.len() as u32;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    admin.as_mut_ptr() as *mut std::ffi::c_void,
+                    &mut size,
+                )
+            },
+            0,
+            "Administrators SID must be constructible"
+        );
+        assert_ne!(
+            unsafe { EqualSid(owner, admin.as_ptr() as *mut std::ffi::c_void) },
+            0,
+            "created directory owner must be BUILTIN\\Administrators, not the token default"
+        );
+        verify_protected_dir(&leaf).expect("created directory must verify");
         remove_test_tree(&root);
     }
 
