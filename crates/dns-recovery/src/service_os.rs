@@ -6,15 +6,24 @@
 //!   (including non-crash failures) plus a 30 s preshutdown budget.
 //! - Pipe `\\.\pipe\Yeager.DnsRecovery.v1`: first-instance,
 //!   `PIPE_REJECT_REMOTE_CLIENTS`, protected SYSTEM/Administrators DACL,
-//!   byte mode, one u32-LE-framed UTF-8 JSON frame per message, 5 s
-//!   framing/auth budget. The server authenticates every peer by
-//!   impersonation + token inspection and `GetNamedPipeClientProcessId` —
-//!   never from caller-supplied fields — and reverts before privileged I/O.
-//!   The client checks `GetNamedPipeServerProcessId` against the SCM
-//!   service PID.
+//!   byte mode, one u32-LE-framed UTF-8 JSON frame per message, a real 5 s
+//!   framing/auth budget (overlapped reads + worker-thread authentication +
+//!   per-connection budget; `nDefaultTimeOut` alone is not a deadline). The
+//!   server authenticates every peer by impersonation + token inspection
+//!   (logon LUID from `TokenStatistics`) + `GetNamedPipeClientProcessId` +
+//!   server-observed process image (path, file id, SHA-256) — never from
+//!   caller-supplied fields — and reverts before privileged I/O. The client
+//!   checks `GetNamedPipeServerProcessId` against the SCM service PID AND the
+//!   server process image against the protected image path.
 //! - Owner liveness is PID + creation FILETIME over a HELD process handle
-//!   (opened at registration, before the reply). Image fields are
-//!   diagnostics only.
+//!   (opened at registration, before the reply). The service thread polls
+//!   every held handle and the journal's recorded owner about once a second
+//!   (`watchdog_poll`); a dead result restores inside the 1 s target with no
+//!   GUI relaunch. A service restart that sees a live owner holds that handle
+//!   in the monitor before takeover — no blind restore, no mutation lease.
+//!   Adapter arrival additionally subscribes `NotifyIpInterfaceChange`
+//!   (callback only enqueues; `CancelMibChangeNotify2` on the stop path)
+//!   with the 60 s `GetAdaptersAddresses` poll as fallback.
 //!
 //! Pure policy (leases, epochs, dedup, scheduler) stays in the portable
 //! [`crate::service`] host; this module only moves bytes and handles.
@@ -32,8 +41,14 @@ pub const SERVICE_DISPLAY: &str = "Yeager DNS Recovery";
 pub const FAILURE_ACTION_DELAYS_MS: [u32; 3] = [1000, 5000, 30000];
 /// SCM preshutdown budget in ms (§8.1/§8.3).
 pub const PRESHUTDOWN_TIMEOUT_MS: u32 = 30_000;
-/// Per-connection framing/auth budget (§8.2).
+/// Per-connection framing/auth budget (§8.2: 5 s). This is the `CreateNamedPipeW`
+/// `nDefaultTimeOut` value (the `WaitNamedPipe` default) AND the budget the
+/// overlapped reads and `authenticate_peer_deadline` enforce — the former
+/// alone is not a read deadline.
 pub const PIPE_TIMEOUT_MS: u32 = 5_000;
+/// Alias naming the enforced I/O deadline: overlapped `ReadFile`/`WriteFile`
+/// + event wait + `CancelIoEx`, and the worker-thread authentication join.
+pub const PIPE_IO_DEADLINE_MS: u32 = 5_000;
 
 // ---- small Win32 helpers -------------------------------------------------------
 
@@ -94,13 +109,27 @@ pub fn is_elevated() -> bool {
 /// appended to `<ProgramData>\Yeager\dns-recovery-service.log`, which inherits
 /// the protected directory ACL. Never logs lease tokens or request bodies;
 /// failures are silently ignored so diagnostics can never break recovery.
+///
+/// The logger NEVER creates the directory: `std::fs::create_dir_all` would
+/// lay down default (inherited, unprotected) ACLs, and the journal layer
+/// validates existing directories without silent repair — a logger-created
+/// directory would fail closed on every fresh-machine boot. Directory
+/// creation stays with `WindowsFs::ensure_directory` (exact `DIR_SDDL`);
+/// when the directory does not exist yet, logging is skipped.
 pub fn service_log(note: &str) {
     use std::fmt::Write as _;
     let dir = match program_data_dir() {
         Ok(d) => d,
         Err(_) => return,
     };
-    let _ = std::fs::create_dir_all(&dir);
+    let attrs = unsafe {
+        Ws::Storage::FileSystem::GetFileAttributesW(wide(&dir).as_ptr())
+    };
+    if attrs == Ws::Storage::FileSystem::INVALID_FILE_ATTRIBUTES
+        || attrs & Ws::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return;
+    }
     let mut line = String::new();
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -604,6 +633,31 @@ fn token_dword(token: *mut std::ffi::c_void, class: Ws::Security::TOKEN_INFORMAT
     }
 }
 
+fn token_logon_luid(token: *mut std::ffi::c_void) -> Result<u64, String> {
+    // TokenStatistics.AuthenticationId is the logon-session LUID the token
+    // was minted for — server-observed, never the session id and never a
+    // caller-supplied field.
+    unsafe {
+        let mut stats: Ws::Security::TOKEN_STATISTICS = std::mem::zeroed();
+        let mut got = 0u32;
+        if Ws::Security::GetTokenInformation(
+            token,
+            Ws::Security::TokenStatistics,
+            &mut stats as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<Ws::Security::TOKEN_STATISTICS>() as u32,
+            &mut got,
+        ) == 0
+        {
+            return Err(format!(
+                "GetTokenInformation(TokenStatistics) failed: {}",
+                last_error()
+            ));
+        }
+        let luid = stats.AuthenticationId;
+        Ok(((luid.HighPart as u64) << 32) | luid.LowPart as u64)
+    }
+}
+
 fn process_image_and_times(
     pid: u32,
 ) -> Result<(String, u64, u32), String> {
@@ -649,6 +703,107 @@ fn process_image_and_times(
     }
 }
 
+/// Server-observed image identity for a PID: the file id (volume serial +
+/// file index) and SHA-256 of the executable file backing the process.
+/// Never a caller-supplied field.
+fn process_image_identity(pid: u32) -> Result<(String, String), String> {
+    use Ws::Storage::FileSystem as FS;
+    let (image, _, _) = process_image_and_times(pid)?;
+    unsafe {
+        let path = wide(&image);
+        let h = FS::CreateFileW(
+            path.as_ptr(),
+            Ws::Foundation::GENERIC_READ,
+            FS::FILE_SHARE_READ | FS::FILE_SHARE_WRITE | FS::FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FS::OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if h == Ws::Foundation::INVALID_HANDLE_VALUE || h.is_null() {
+            return Err(format!("cannot open image file {image:?}: {}", last_error()));
+        }
+        let mut info: FS::BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if FS::GetFileInformationByHandle(h, &mut info) == 0 {
+            let e = last_error();
+            Ws::Foundation::CloseHandle(h);
+            return Err(format!("GetFileInformationByHandle failed: {e}"));
+        }
+        let file_id = format!(
+            "{:08x}-{:08x}-{:08x}",
+            info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+        );
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest as _;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let mut got = 0u32;
+            if FS::ReadFile(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let e = last_error();
+                Ws::Foundation::CloseHandle(h);
+                return Err(format!("image file read failed: {e}"));
+            }
+            if got == 0 {
+                break;
+            }
+            hasher.update(&buf[..got as usize]);
+        }
+        Ws::Foundation::CloseHandle(h);
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        Ok((file_id, hex))
+    }
+}
+
+/// Protected service image path (`%ProgramFiles%\Yeager\...`), resolved via
+/// the known folder — never from caller input or the `ProgramFiles`
+/// environment variable.
+pub fn protected_service_image() -> Result<String, String> {
+    unsafe {
+        let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let hr = Ws::UI::Shell::SHGetKnownFolderPath(
+            &Ws::UI::Shell::FOLDERID_ProgramFiles,
+            0,
+            std::ptr::null_mut(),
+            &mut path,
+        );
+        if hr != 0 {
+            return Err(format!("SHGetKnownFolderPath(ProgramFiles) failed: HRESULT {hr:#x}"));
+        }
+        let base = pwstr_to_string(path);
+        Ws::Foundation::LocalFree(path as _);
+        if base.is_empty() {
+            return Err("SHGetKnownFolderPath(ProgramFiles) returned an empty path".into());
+        }
+        Ok(format!("{base}\\Yeager\\yeager-dns-recovery.exe"))
+    }
+}
+
+/// Client-side server identity check (after the SCM PID check): the process
+/// behind the observed server PID must be the protected service image.
+/// Fails closed — an unqueryable server process is rejected.
+pub fn verify_server_image(server_pid: u32) -> Result<(), String> {
+    let expected = protected_service_image()?;
+    let (observed, _, _) = process_image_and_times(server_pid)?;
+    if observed.to_lowercase() != expected.to_lowercase() {
+        return Err(format!(
+            "pipe server image {observed:?} is not the protected service image {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Authenticate one connected pipe instance. Runs inside impersonation and
 /// reverts before returning.
 fn authenticate_peer(pipe: *mut std::ffi::c_void) -> Result<PeerAuth, String> {
@@ -674,21 +829,22 @@ fn authenticate_peer(pipe: *mut std::ffi::c_void) -> Result<PeerAuth, String> {
             let sid = token_user_sid(token)?;
             let elevated = token_dword(token, Ws::Security::TokenElevation)? != 0;
             let session = token_dword(token, Ws::Security::TokenSessionId)?;
+            let logon_luid = token_logon_luid(token)?;
             Ws::Foundation::CloseHandle(token);
             let (image, filetime, _) = process_image_and_times(pid)?;
+            // Server-side image identity comes from the process itself, not
+            // the request: a failure here fails the authentication closed.
+            let (image_file_id, image_sha256) = process_image_identity(pid)?;
             Ok(PeerAuth {
                 pid,
                 creation_filetime: filetime,
                 user_sid: sid,
                 elevated,
                 session_id: session,
-                // Logon LUID is not exposed as a scalar token class; the
-                // session id scopes the identity alongside pid+filetime+sid.
-                // The full logon-LUID binding stays recorded from
-                // registration-time token-group inspection in future work —
-                // never defaulted silently: see dispatch-time binding below.
-                logon_luid: session as u64,
+                logon_luid,
                 image_path: image,
+                image_file_id,
+                image_sha256,
                 remote: false,
                 server_pid: None,
                 expected_server_pid: None,
@@ -723,21 +879,87 @@ fn security_attributes_from_sddl() -> Result<(Ws::Security::SECURITY_ATTRIBUTES,
     }
 }
 
-fn read_exact(pipe: *mut std::ffi::c_void, mut n: usize) -> Result<Vec<u8>, String> {
+fn read_exact(pipe: *mut std::ffi::c_void, n: usize) -> Result<Vec<u8>, String> {
+    read_exact_deadline(pipe, n, PIPE_IO_DEADLINE_MS)
+}
+
+/// Real per-read I/O deadline (§8.2: 5 s framing budget): overlapped ReadFile
+/// + event wait against a total budget. A stalled client is dropped at the
+/// deadline instead of pinning the serial worker that also runs the watchdog
+/// and the stop path. `PIPE_TIMEOUT_MS` is `CreateNamedPipeW`'s
+/// `nDefaultTimeOut` (the `WaitNamedPipe` default) — it is NOT a read
+/// deadline, so this function implements an actual one.
+fn read_exact_deadline(
+    pipe: *mut std::ffi::c_void,
+    mut n: usize,
+    deadline_ms: u32,
+) -> Result<Vec<u8>, String> {
+    use Ws::Foundation as F;
+    use Ws::System::IO as IO;
+    use Ws::System::Threading as T;
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(deadline_ms as u64);
     let mut out = Vec::with_capacity(n);
     while n > 0 {
+        let elapsed = start.elapsed();
+        if elapsed >= budget {
+            return Err("pipe read deadline exceeded (5 s framing budget)".into());
+        }
+        let remaining = budget - elapsed;
+        let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+        let event = unsafe { T::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(format!("CreateEventW failed: {}", last_error()));
+        }
         let mut chunk = vec![0u8; n.min(65536)];
         let mut got = 0u32;
-        unsafe {
+        let mut ov: IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = event;
+        let completed = unsafe {
             if Ws::Storage::FileSystem::ReadFile(
                 pipe,
                 chunk.as_mut_ptr(),
                 chunk.len() as u32,
                 &mut got,
-                std::ptr::null_mut(),
-            ) == 0
+                &mut ov,
+            ) != 0
             {
-                return Err(format!("pipe read failed: {}", last_error()));
+                true
+            } else if last_error() != F::ERROR_IO_PENDING {
+                let e = last_error();
+                F::CloseHandle(event);
+                return Err(format!("pipe read failed: {e}"));
+            } else {
+                false
+            }
+        };
+        if !completed {
+            let wait = unsafe { T::WaitForSingleObject(event, wait_ms) };
+            if wait == F::WAIT_OBJECT_0 {
+                let mut transferred = 0u32;
+                let ok = unsafe {
+                    IO::GetOverlappedResult(pipe, &ov, &mut transferred, 0)
+                };
+                unsafe {
+                    F::CloseHandle(event);
+                }
+                if ok == 0 {
+                    return Err(format!(
+                        "pipe overlapped read failed: {}",
+                        last_error()
+                    ));
+                }
+                got = transferred;
+            } else {
+                unsafe {
+                    IO::CancelIoEx(pipe, &ov);
+                    F::CloseHandle(event);
+                }
+                return Err("pipe read deadline exceeded (5 s framing budget)".into());
+            }
+        } else {
+            unsafe {
+                F::CloseHandle(event);
             }
         }
         if got == 0 {
@@ -749,19 +971,106 @@ fn read_exact(pipe: *mut std::ffi::c_void, mut n: usize) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
-fn write_all(pipe: *mut std::ffi::c_void, mut data: &[u8]) -> Result<(), String> {
+/// `authenticate_peer` with a real deadline: the authentication runs on a
+/// short-lived worker thread (impersonation is thread-scoped, so this is
+/// also cleaner than impersonating the service thread) while the service
+/// thread waits at most the remaining framing budget. On expiry the worker
+/// is detached and the connection is dropped — the tick and the stop path
+/// proceed.
+fn authenticate_peer_deadline(
+    pipe: *mut std::ffi::c_void,
+    deadline_ms: u32,
+) -> Result<PeerAuth, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pipe_addr = pipe as usize;
+    std::thread::spawn(move || {
+        let pipe = pipe_addr as *mut std::ffi::c_void;
+        let _ = tx.send(authenticate_peer(pipe));
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(deadline_ms as u64)) {
+        Ok(r) => r,
+        Err(_) => Err("authenticate_peer deadline exceeded (5 s framing budget)".into()),
+    }
+}
+
+/// Milliseconds left in the per-connection 5 s budget (`None` when exhausted).
+fn budget_left_ms(start: std::time::Instant) -> Option<u32> {
+    let elapsed = start.elapsed();
+    let budget = std::time::Duration::from_millis(PIPE_IO_DEADLINE_MS as u64);
+    if elapsed >= budget {
+        None
+    } else {
+        Some((budget - elapsed).as_millis().min(u32::MAX as u128) as u32)
+    }
+}
+
+fn write_all(pipe: *mut std::ffi::c_void, data: &[u8]) -> Result<(), String> {
+    write_all_deadline(pipe, data, PIPE_IO_DEADLINE_MS)
+}
+
+/// Overlapped `WriteFile` with the same 5 s budget (the pipe handles on both
+/// ends are overlapped so reads can carry a real deadline; a blocking write
+/// with a NULL OVERLAPPED would fail on them).
+fn write_all_deadline(
+    pipe: *mut std::ffi::c_void,
+    mut data: &[u8],
+    deadline_ms: u32,
+) -> Result<(), String> {
+    use Ws::Foundation as F;
+    use Ws::System::IO as IO;
+    use Ws::System::Threading as T;
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(deadline_ms as u64);
     while !data.is_empty() {
+        let elapsed = start.elapsed();
+        if elapsed >= budget {
+            return Err("pipe write deadline exceeded (5 s framing budget)".into());
+        }
+        let remaining = budget - elapsed;
+        let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+        let event = unsafe { T::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(format!("CreateEventW failed: {}", last_error()));
+        }
+        let mut ov: IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = event;
         let mut wrote = 0u32;
-        unsafe {
-            if Ws::Storage::FileSystem::WriteFile(
-                pipe,
-                data.as_ptr(),
-                data.len().min(u32::MAX as usize) as u32,
-                &mut wrote,
-                std::ptr::null_mut(),
-            ) == 0
+        let n = data.len().min(u32::MAX as usize) as u32;
+        let completed = unsafe {
+            if Ws::Storage::FileSystem::WriteFile(pipe, data.as_ptr(), n, &mut wrote, &mut ov)
+                != 0
             {
-                return Err(format!("pipe write failed: {}", last_error()));
+                true
+            } else if last_error() != F::ERROR_IO_PENDING {
+                let e = last_error();
+                F::CloseHandle(event);
+                return Err(format!("pipe write failed: {e}"));
+            } else {
+                false
+            }
+        };
+        if !completed {
+            let wait = unsafe { T::WaitForSingleObject(event, wait_ms) };
+            if wait == F::WAIT_OBJECT_0 {
+                let mut transferred = 0u32;
+                let ok = unsafe { IO::GetOverlappedResult(pipe, &ov, &mut transferred, 0) };
+                unsafe {
+                    F::CloseHandle(event);
+                }
+                if ok == 0 {
+                    return Err(format!("pipe overlapped write failed: {}", last_error()));
+                }
+                wrote = transferred;
+            } else {
+                unsafe {
+                    IO::CancelIoEx(pipe, &ov);
+                    F::CloseHandle(event);
+                }
+                return Err("pipe write deadline exceeded (5 s framing budget)".into());
+            }
+        } else {
+            unsafe {
+                F::CloseHandle(event);
             }
         }
         if wrote == 0 {
@@ -776,7 +1085,14 @@ fn serve_one(
     pipe: *mut std::ffi::c_void,
     dispatch: &dyn Fn(&PeerAuth, &Request) -> Reply,
 ) {
-    // One frame: u32 LE length + JSON, bounded by the codec.
+    // One frame: u32 LE length + JSON, bounded by the codec, against a single
+    // 5 s per-connection budget shared by the reads and authenticate_peer. A
+    // partial frame or a stalled peer is dropped at the deadline; the serial
+    // worker (watchdog tick + stop path) is never pinned.
+    let start = std::time::Instant::now();
+    if budget_left_ms(start).is_none() {
+        return;
+    }
     let reply_bytes = match read_exact(pipe, 4) {
         Err(e) => {
             let _ = e;
@@ -789,38 +1105,46 @@ fn serve_one(
             if len > protocol::MAX_FRAME_BYTES {
                 return;
             }
-            match read_exact(pipe, len) {
+            let budget = match budget_left_ms(start) {
+                Some(b) => b,
+                None => return,
+            };
+            match read_exact_deadline(pipe, len, budget) {
                 Err(_) => return,
                 Ok(payload) => {
                     let mut frame = prefix;
                     frame.extend_from_slice(&payload);
                     match protocol::decode_frame(&frame) {
                         Err(_) => return, // unknown version/op: silent refuse
-                        Ok(req) => match authenticate_peer(pipe) {
-                            Err(_) => {
-                                // Auth failure: structured rejection with no
-                                // lease or journal access. The codec needs a
-                                // request id to echo; the frame was already
-                                // validated, so re-decode is infallible.
-                                let rep = Reply::new(
-                                    req.request_id.clone(),
-                                    "yeager-dns-recovery".into(),
-                                    0,
-                                    "auth_rejected",
-                                    serde_json::json!({"error": "peer authentication failed"}),
-                                );
-                                protocol::encode_reply(&rep).unwrap_or_default()
-                            }
-                    Ok(peer) => {
-                        let rep = dispatch(&peer, &req);
-                        service_log(&format!(
-                            "pipe: op={} outcome={} gen={}",
-                            req.operation.as_str(),
-                            rep.outcome,
-                            rep.generation
-                        ));
-                        protocol::encode_reply(&rep).unwrap_or_default()
-                    }
+                        Ok(req) => match budget_left_ms(start) {
+                            None => return,
+                            Some(budget) => match authenticate_peer_deadline(pipe, budget) {
+                                Err(_) => {
+                                    // Auth failure/timeout: structured rejection
+                                    // with no lease or journal access. The codec
+                                    // needs a request id to echo; the frame was
+                                    // already validated, so re-decode is
+                                    // infallible.
+                                    let rep = Reply::new(
+                                        req.request_id.clone(),
+                                        "yeager-dns-recovery".into(),
+                                        0,
+                                        "auth_rejected",
+                                        serde_json::json!({"error": "peer authentication failed"}),
+                                    );
+                                    protocol::encode_reply(&rep).unwrap_or_default()
+                                }
+                                Ok(peer) => {
+                                    let rep = dispatch(&peer, &req);
+                                    service_log(&format!(
+                                        "pipe: op={} outcome={} gen={}",
+                                        req.operation.as_str(),
+                                        rep.outcome,
+                                        rep.generation
+                                    ));
+                                    protocol::encode_reply(&rep).unwrap_or_default()
+                                }
+                            },
                         },
                     }
                 }
@@ -842,6 +1166,11 @@ fn serve_one(
 /// between clients (watchdog/scheduler cadence); it also runs when a wakeup
 /// connection carries no frame (the tick waker). Returns when the stop flag
 /// is observed between clients.
+///
+/// The pipe is created overlapped so reads carry a real 5 s deadline
+/// (overlapped `ReadFile` + event wait + `CancelIoEx`); the connect itself
+/// waits in 1 s slices so a stop request is honored promptly even when no
+/// client arrives.
 pub fn run_pipe_server(
     dispatch: impl Fn(&PeerAuth, &Request) -> Reply,
     mut on_idle: impl FnMut(),
@@ -858,7 +1187,9 @@ pub fn run_pipe_server(
         let pipe = unsafe {
             P::CreateNamedPipeW(
                 name.as_ptr(),
-                FS::PIPE_ACCESS_DUPLEX | FS::FILE_FLAG_FIRST_PIPE_INSTANCE,
+                FS::PIPE_ACCESS_DUPLEX
+                    | FS::FILE_FLAG_FIRST_PIPE_INSTANCE
+                    | FS::FILE_FLAG_OVERLAPPED,
                 P::PIPE_TYPE_BYTE | P::PIPE_READMODE_BYTE | P::PIPE_WAIT | P::PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 65536,
@@ -877,22 +1208,24 @@ pub fn run_pipe_server(
             service_log(&format!("pipe server: {e}"));
             return Err(e);
         }
-        let connected = unsafe { P::ConnectNamedPipe(pipe, std::ptr::null_mut()) };
-        if connected == 0 {
-            let e = last_error();
-            // ERROR_PIPE_CONNECTED (535): client raced us; serve it.
-            // Anything else with the stop flag set: shut down.
-            if e != 535 {
+        match connect_with_stop(pipe, &stop) {
+            ConnectOutcome::Stop => {
                 unsafe {
                     Ws::Foundation::CloseHandle(pipe);
                 }
-            if stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let e = format!("ConnectNamedPipe failed: {e}");
-            service_log(&format!("pipe server: {e}"));
-            return Err(e);
+            ConnectOutcome::Failed(e) => {
+                unsafe {
+                    Ws::Foundation::CloseHandle(pipe);
+                }
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                service_log(&format!("pipe server: {e}"));
+                return Err(e);
             }
+            ConnectOutcome::Connected => {}
         }
         serve_one(pipe, &dispatch);
         unsafe {
@@ -900,6 +1233,73 @@ pub fn run_pipe_server(
             Ws::Foundation::CloseHandle(pipe);
         }
         on_idle();
+    }
+}
+
+enum ConnectOutcome {
+    Connected,
+    Stop,
+    Failed(String),
+}
+
+/// Overlapped `ConnectNamedPipe` with 1 s wait slices: a stop request is
+/// honored promptly without relying on the tick waker. ERROR_PIPE_CONNECTED
+/// (535) means a client raced us — serve it.
+fn connect_with_stop(
+    pipe: *mut std::ffi::c_void,
+    stop: &Arc<AtomicBool>,
+) -> ConnectOutcome {
+    use Ws::Foundation as F;
+    use Ws::System::IO as IO;
+    use Ws::System::Pipes as P;
+    use Ws::System::Threading as T;
+    unsafe {
+        let event = T::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        if event.is_null() {
+            return ConnectOutcome::Failed(format!("CreateEventW failed: {}", last_error()));
+        }
+        let mut ov: IO::OVERLAPPED = std::mem::zeroed();
+        ov.hEvent = event;
+        let result = P::ConnectNamedPipe(pipe, &mut ov);
+        if result != 0 {
+            F::CloseHandle(event);
+            return ConnectOutcome::Connected;
+        }
+        let e = last_error();
+        if e == F::ERROR_PIPE_CONNECTED {
+            F::CloseHandle(event);
+            return ConnectOutcome::Connected;
+        }
+        if e != F::ERROR_IO_PENDING {
+            F::CloseHandle(event);
+            return ConnectOutcome::Failed(format!("ConnectNamedPipe failed: {e}"));
+        }
+        loop {
+            let wait = T::WaitForSingleObject(event, 1000);
+            if wait == F::WAIT_OBJECT_0 {
+                let mut transferred = 0u32;
+                if IO::GetOverlappedResult(pipe, &ov, &mut transferred, 0) == 0 {
+                    let e = last_error();
+                    F::CloseHandle(event);
+                    // A raced client may surface here as already connected.
+                    if e == F::ERROR_PIPE_CONNECTED {
+                        return ConnectOutcome::Connected;
+                    }
+                    return ConnectOutcome::Failed(format!(
+                        "ConnectNamedPipe overlapped wait failed: {e}"
+                    ));
+                }
+                F::CloseHandle(event);
+                return ConnectOutcome::Connected;
+            }
+            if stop.load(Ordering::SeqCst) {
+                IO::CancelIoEx(pipe, &ov);
+                F::CloseHandle(event);
+                return ConnectOutcome::Stop;
+            }
+            // Slice timeout with no client yet: keep waiting. The tick waker
+            // connects once a second and drives the watchdog cadence.
+        }
     }
 }
 
@@ -922,6 +1322,59 @@ pub fn wake_pipe_server() {
         if h != F::INVALID_HANDLE_VALUE && !h.is_null() {
             F::CloseHandle(h);
         }
+    }
+}
+
+/// Adapter-arrival subscription (§7 step 5): `NotifyIpInterfaceChange` fires
+/// on interface add/remove/change. The callback ONLY sets the flag the
+/// service thread polls on its ~1 s tick (it never touches the journal, the
+/// pipe or the host); the tick then runs the 60 s-inventory diff and
+/// `notify_arrival`. The 60 s `GetAdaptersAddresses` poll stays as a
+/// fallback. `CancelMibChangeNotify2` runs on the stop path.
+unsafe extern "system" fn ip_change_callback(
+    caller_context: *const std::ffi::c_void,
+    _row: *const Ws::NetworkManagement::IpHelper::MIB_IPINTERFACE_ROW,
+    _notification_type: Ws::NetworkManagement::IpHelper::MIB_NOTIFICATION_TYPE,
+) {
+    if caller_context.is_null() {
+        return;
+    }
+    let flag = unsafe { &*(caller_context as *const AtomicBool) };
+    flag.store(true, Ordering::SeqCst);
+}
+
+/// Subscribe `NotifyIpInterfaceChange(AF_UNSPEC)` with the flag as context.
+/// Returns the notification handle for `CancelMibChangeNotify2`. A failed
+/// subscription is NOT fatal: the service keeps the 60 s poll fallback and
+/// logs the failure.
+fn subscribe_ip_change(flag: &Arc<AtomicBool>) -> Option<*mut std::ffi::c_void> {
+    use Ws::NetworkManagement::IpHelper as H;
+    use Ws::Networking::WinSock as W;
+    unsafe {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = H::NotifyIpInterfaceChange(
+            W::AF_UNSPEC,
+            Some(ip_change_callback),
+            Arc::as_ptr(flag) as *const std::ffi::c_void,
+            0,
+            &mut handle,
+        );
+        if rc != 0 {
+            service_log(&format!("NotifyIpInterfaceChange subscribe failed: {rc}"));
+            return None;
+        }
+        if handle.is_null() {
+            service_log("NotifyIpInterfaceChange returned a null handle");
+            return None;
+        }
+        Some(handle)
+    }
+}
+
+fn cancel_ip_change(handle: *mut std::ffi::c_void) {
+    use Ws::NetworkManagement::IpHelper as H;
+    unsafe {
+        H::CancelMibChangeNotify2(handle);
     }
 }
 
@@ -983,7 +1436,8 @@ pub fn list_adapter_guids() -> Result<Vec<String>, String> {
 }
 
 /// One framed round-trip as a pipe client. Verifies the server PID against
-/// `expected_server_pid` (SCM record) before trusting the reply.
+/// `expected_server_pid` (SCM record) and the server process image against
+/// the protected service image before trusting the reply.
 pub fn pipe_roundtrip(
     request: &[u8],
     expected_server_pid: Option<u32>,
@@ -1000,7 +1454,9 @@ pub fn pipe_roundtrip(
                 0,
                 std::ptr::null(),
                 FS::OPEN_EXISTING,
-                0,
+                // Overlapped so the reply reads below carry the real 5 s
+                // framing deadline (see read_exact_deadline).
+                FS::FILE_FLAG_OVERLAPPED,
                 std::ptr::null_mut(),
             );
             if h != F::INVALID_HANDLE_VALUE && !h.is_null() {
@@ -1024,6 +1480,12 @@ pub fn pipe_roundtrip(
                 return Err(format!(
                     "pipe server PID {observed} does not match SCM record {expected}"
                 ));
+            }
+            // After the SCM PID check, compare the server process image to
+            // the protected service image. Fails closed.
+            if let Err(e) = verify_server_image(observed) {
+                F::CloseHandle(pipe);
+                return Err(e);
             }
         }
         if let Err(e) = write_all(pipe, request) {
@@ -1268,6 +1730,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         format!("{:?}", r.map(|rep| rep.outcome))
     };
     service_log(&format!("service_main: boot replay done: {boot_outcome}"));
+    // Restart-with-live-owner monitor: when boot replay reports Busy (a live
+    // owner holds the machine lease), hold the recorded owner's handle in the
+    // monitor before accepting takeover — no blind restore, no mutation
+    // lease. The 1 s watchdog poll below keeps watching it until the owner
+    // re-registers (reattach) or dies (restore).
+    if let Some(recorded) = host.recorded_owner() {
+        let _ = probe.check(&recorded);
+    }
     let running = S::SERVICE_STATUS {
         dwServiceType: S::SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: S::SERVICE_RUNNING,
@@ -1284,7 +1754,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     }
     service_log("service_main: RUNNING, entering pipe loop");
 
-    // Tick waker: the pipe loop blocks in ConnectNamedPipe, so a helper
+    // Adapter-arrival subscription (§7 step 5): NotifyIpInterfaceChange fires
+    // on change; its callback only sets `arrival_pending`, which the service
+    // thread polls on its ~1 s tick. The 60 s GetAdaptersAddresses poll below
+    // stays as the fallback. The handle is canceled on the stop path.
+    let arrival_pending = Arc::new(AtomicBool::new(false));
+    let ip_subscription = subscribe_ip_change(&arrival_pending);
+    // Tick waker: the pipe loop waits in ConnectNamedPipe, so a helper
     // thread wakes it once per second (open + close, no frame). The wakeup
     // drives the watchdog/scheduler cadence on the service thread without
     // ever sharing the single-threaded host across threads.
@@ -1311,14 +1787,12 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
             let mut h = host.borrow_mut();
             let rep = h.dispatch(peer, req);
             // Hold the owner handle before the register reply (T0); release
-            // handles whose leases are gone.
+            // handles whose leases are gone. Identity is the
+            // transport-observed peer, never the request body.
             if req.operation == crate::protocol::Operation::RegisterOwner
                 && (rep.outcome == "success")
             {
-                if let (Some(owner_id), Some(image_sha)) = (
-                    rep.body.get("owner_id").and_then(|v| v.as_str()),
-                    req.body.get("image_sha256").and_then(|v| v.as_str()),
-                ) {
+                if let Some(owner_id) = rep.body.get("owner_id").and_then(|v| v.as_str()) {
                     let identity = crate::journal::OwnerIdentity {
                         owner_id: owner_id.to_string(),
                         pid: peer.pid,
@@ -1327,38 +1801,49 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
                         logon_luid: peer.logon_luid,
                         session_id: peer.session_id,
                         image_path: peer.image_path.clone(),
-                        image_file_id: req
-                            .body
-                            .get("image_file_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        image_sha256: image_sha.to_string(),
+                        image_file_id: peer.image_file_id.clone(),
+                        image_sha256: peer.image_sha256.clone(),
                     };
                     let _ = probe.check(&identity);
                 }
             }
             {
-                let live: Vec<u32> =
+                // Retain handles for live leases AND the journal-recorded
+                // owner (restart-with-live-owner monitor): a live owner that
+                // has not re-registered yet must stay monitored without a
+                // blind restore and without a mutation lease.
+                let mut live: Vec<u32> =
                     h.live_owner_ids().iter().map(|(_, pid)| *pid).collect();
+                if let Some(recorded) = h.recorded_owner() {
+                    if !live.contains(&recorded.pid) {
+                        live.push(recorded.pid);
+                    }
+                }
                 probe.release_closed(&live);
             }
             rep
         },
         || {
-            // Watchdog/scheduler cadence (§6/§8.3 scheduling): health sweep,
-            // due background passes, 60 s adapter inventory poll.
+            // Watchdog/scheduler cadence, ~1 s on the service thread (§8.3):
+            // handle-death poll (1 s target), health sweep (6 s expiry),
+            // due background passes, arrival triggers (NotifyIpInterfaceChange
+            // flag plus the 60 s GetAdaptersAddresses poll fallback).
             let mut h = host.borrow_mut();
             ticks += 1;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            // 1 s watchdog: poll every held owner handle and the journal's
+            // recorded owner; a dead result restores inside the target, a
+            // live result keeps the handle. Never relaunches a GUI.
+            let _ = h.watchdog_poll();
             let _ = h.sweep(now);
             if h.next_wake_ms().is_some_and(|w| w <= now) {
                 let _ = h.background_tick();
             }
-            if ticks % 60 == 0 {
+            let arrival_fired = arrival_pending.swap(false, Ordering::SeqCst);
+            if ticks % 60 == 0 || arrival_fired {
                 if let Ok(adapters) = list_adapter_guids() {
                     let added: Vec<String> = match &known_adapters {
                         None => Vec::new(),
@@ -1378,6 +1863,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         Arc::clone(&stop),
     );
     let _ = waker.join();
+    // Stop path: cancel the adapter-arrival subscription first
+    // (CancelMibChangeNotify2), so no callback can fire after the host below
+    // starts tearing down. The callback only ever set a flag, so there is no
+    // in-flight journal or pipe work to drain.
+    if let Some(handle) = ip_subscription {
+        cancel_ip_change(handle);
+    }
     // The stop flag landed: run the SCM stop path on the service thread
     // (quiesce, settle, restore with bounded retry; debt retained) and
     // report STOPPED with a nonzero service-specific exit when recovery is
@@ -1395,6 +1887,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         serde_json::json!({"reason": reason}),
     );
     // The SCM identity authorizes the stop path; it is not an owner lease.
+    // The stop peer carries no owner image identity (PrepareStop is admin,
+    // not owner-bound), so the new fields stay empty here by construction.
     let peer = PeerAuth {
         pid: std::process::id(),
         creation_filetime: 1,
@@ -1405,6 +1899,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
         image_path: std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        image_file_id: String::new(),
+        image_sha256: String::new(),
         remote: false,
         server_pid: None,
         expected_server_pid: None,
@@ -1521,4 +2017,168 @@ pub fn run_service() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ip_change_callback_only_enqueues_flag() {
+        // The NotifyIpInterfaceChange callback must never touch the journal,
+        // the pipe or the host: it only sets the flag the service thread
+        // polls. Invoke it directly and prove nothing else happens.
+        let flag = Arc::new(AtomicBool::new(false));
+        let ctx = Arc::as_ptr(&flag) as *const std::ffi::c_void;
+        unsafe {
+            ip_change_callback(ctx, std::ptr::null(), 0);
+        }
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn notify_ip_interface_subscribe_and_cancel_roundtrips() {
+        // Subscribe AF_UNSPEC, then cancel on the stop path. A failed
+        // subscription is tolerated by the service (60 s poll fallback), but
+        // on this machine it must succeed.
+        let flag = Arc::new(AtomicBool::new(false));
+        let handle = subscribe_ip_change(&flag);
+        assert!(
+            handle.is_some(),
+            "NotifyIpInterfaceChange(AF_UNSPEC) must subscribe"
+        );
+        if let Some(h) = handle {
+            cancel_ip_change(h);
+        }
+    }
+
+    #[test]
+    fn server_image_check_rejects_non_service_image() {
+        // Fail-closed comparison: this test binary is not the protected
+        // service image, so verification of our own PID must refuse.
+        let expected = protected_service_image().expect("program files resolves");
+        assert!(
+            expected.to_lowercase().ends_with("yeager-dns-recovery.exe"),
+            "protected path ends with the service binary: {expected:?}"
+        );
+        assert!(
+            verify_server_image(std::process::id()).is_err(),
+            "a non-service image must never pass the server identity check"
+        );
+    }
+
+    fn test_pipe_name() -> Vec<u16> {
+        // Unique local pipe: never the production service pipe.
+        let name = format!(
+            r"\\.\pipe\Yeager.DnsRecovery.Test.{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        wide(&name)
+    }
+
+    #[test]
+    fn stalled_partial_frame_dropped_at_deadline_while_stop_proceeds() {
+        use Ws::Foundation as F;
+        use Ws::Storage::FileSystem as FS;
+        use Ws::System::Pipes as P;
+        // Server pipe (overlapped, like the service pipe) + a client that
+        // connects, sends a partial frame and then stalls for 5 s. The
+        // server read must drop the client at the 2 s deadline, and a stop
+        // flag set mid-stall must be observed right after — the stop path
+        // proceeds instead of waiting out the stalled client.
+        let name = test_pipe_name();
+        let server = unsafe {
+            P::CreateNamedPipeW(
+                name.as_ptr(),
+                FS::PIPE_ACCESS_DUPLEX | FS::FILE_FLAG_OVERLAPPED,
+                P::PIPE_TYPE_BYTE | P::PIPE_READMODE_BYTE | P::PIPE_WAIT,
+                1,
+                65536,
+                65536,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, F::INVALID_HANDLE_VALUE);
+        assert!(!server.is_null());
+        let client = std::thread::spawn({
+            let name = name.clone();
+            move || unsafe {
+                // Connect and stall: declare a 64-byte frame, deliver 4.
+                let h = FS::CreateFileW(
+                    name.as_ptr(),
+                    F::GENERIC_READ | F::GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    FS::OPEN_EXISTING,
+                    FS::FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, F::INVALID_HANDLE_VALUE);
+                let prefix = 64u32.to_le_bytes();
+                let mut wrote = 0u32;
+                let mut ov: Ws::System::IO::OVERLAPPED = std::mem::zeroed();
+                assert_ne!(
+                    FS::WriteFile(h, prefix.as_ptr(), 4, &mut wrote, &mut ov),
+                    0
+                );
+                let part = [0x7bu8; 4];
+                assert_ne!(
+                    FS::WriteFile(h, part.as_ptr(), 4, &mut wrote, &mut ov),
+                    0
+                );
+                std::thread::sleep(Duration::from_millis(5000));
+                F::CloseHandle(h);
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                std::thread::sleep(Duration::from_millis(500));
+                stop.store(true, Ordering::SeqCst);
+            }
+        });
+        let t0 = Instant::now();
+        match connect_with_stop(server, &stop) {
+            ConnectOutcome::Connected => {}
+            other => panic!("test client connect failed: {}", matches!(other, ConnectOutcome::Stop)),
+        }
+        let err = read_exact_deadline(server, 4 + 64, 2000).expect_err("stall must time out");
+        let elapsed = t0.elapsed();
+        assert!(
+            err.contains("deadline"),
+            "stalled frame dropped at the deadline, got: {err}"
+        );
+        // The deadline (not the 8 s client stall) bounds the read: generous
+        // bounds for loaded CI, but far from the stall duration.
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "deadline respected, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(6000),
+            "dropped at the deadline, elapsed {elapsed:?}"
+        );
+        // The stop set mid-stall is observed right after the drop.
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "stop flag set during the stall is visible after the drop"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(7000),
+            "stop path proceeds without waiting out the stalled client"
+        );
+        unsafe {
+            P::DisconnectNamedPipe(server);
+            F::CloseHandle(server);
+        }
+        let _ = stopper.join();
+        let _ = client.join();
+    }
 }

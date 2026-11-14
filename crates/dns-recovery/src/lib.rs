@@ -132,7 +132,8 @@ pub use model::*;
 pub use plan::{automatic_image, plan_image, provider_spec, setter_mask, ProviderSpec};
 pub use protocol::{
     exit_code_for_outcome, AuthError, DedupCache, Operation, PeerAuth, ProtocolError, Request,
-    Reply, MAX_DEDUP_ENTRIES, MAX_FRAME_BYTES, PIPE_NAME, PIPE_SDDL, PROTOCOL_VERSION,
+    Reply, DEDUP_FILE, MAX_DEDUP_ENTRIES, MAX_FRAME_BYTES, MAX_PERSISTED_DEDUP_ENTRIES,
+    PIPE_NAME, PIPE_SDDL, PROTOCOL_VERSION,
 };
 pub use replay::{FakeOwnerProbe, OwnerLiveness, OwnerProbe, ReplayDriver, ReplayReport};
 pub use service::{

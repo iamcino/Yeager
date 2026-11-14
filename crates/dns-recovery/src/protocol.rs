@@ -23,9 +23,18 @@ pub const PIPE_NAME: &str = r"\\.\pipe\Yeager.DnsRecovery.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum frame: framing + UTF-8 JSON payload, 1 MiB total.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-/// Request-ID dedup retention: results live for the transaction lifetime;
-/// the in-memory table is bounded so a flooding client cannot grow it.
+/// Request-ID dedup retention: results live for the transaction lifetime (the
+/// host enforces this by matching the stored reply's journal generation
+/// against the current generation); the in-memory table is bounded so a
+/// flooding client cannot grow it, and overflow is journaled to a durable
+/// dedup file so a replayed id is still answered from the stored reply after
+/// the in-memory eviction.
 pub const MAX_DEDUP_ENTRIES: usize = 512;
+/// Durable dedup overflow cap: replayed ids stay answerable from the stored
+/// reply long past the 512-entry in-memory eviction.
+pub const MAX_PERSISTED_DEDUP_ENTRIES: usize = 10_000;
+/// Durable dedup file name inside the service directory.
+pub const DEDUP_FILE: &str = "dedup-v1.json";
 /// Protected pipe DACL (SYSTEM + Administrators full control). The transport
 /// applies this SDDL when creating the pipe instance.
 pub const PIPE_SDDL: &str = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
@@ -182,8 +191,9 @@ struct WireReply {
 
 /// One result. The transport echoes `request_id` verbatim; `generation` is
 /// the journal generation the reply was computed against (0 when no journal
-/// state was consulted).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// state was consulted). Replies are serializable so the host can persist
+/// the dedup table and answer replayed ids from the stored reply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
     pub request_id: String,
     pub service_instance: String,
@@ -544,18 +554,39 @@ pub fn parse_selected(body: &serde_json::Value) -> Result<Vec<String>, ProtocolE
 
 /// Bounded idempotency table: a duplicate request ID replays the stored
 /// reply and MUST NOT repeat the mutation (§8.2). Results are retained while
-/// the host lives (the transaction-lifetime rule is enforced by keying
-/// mutation replies on the journal generation — see service.rs).
+/// the host lives (the transaction-lifetime rule is enforced by the host's
+/// generation check — see service.rs).
 pub struct DedupCache {
     map: HashMap<String, Reply>,
     order: VecDeque<String>,
+    cap: usize,
 }
 
 impl DedupCache {
     pub fn new() -> Self {
+        Self::with_cap(MAX_DEDUP_ENTRIES)
+    }
+
+    /// Custom bound (tests force eviction with a small table; production
+    /// uses [`MAX_DEDUP_ENTRIES`]).
+    pub fn with_cap(cap: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Resize the bound, evicting oldest-first past the new cap.
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+        while self.map.len() > self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
         }
     }
 
@@ -567,7 +598,7 @@ impl DedupCache {
         if self.map.contains_key(&request_id) {
             return;
         }
-        if self.map.len() >= MAX_DEDUP_ENTRIES {
+        if self.map.len() >= self.cap {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
             }
@@ -583,6 +614,24 @@ impl DedupCache {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Ordered snapshot for durable persistence (oldest first).
+    pub fn entries(&self) -> Vec<(String, Reply)> {
+        self.order
+            .iter()
+            .filter_map(|k| self.map.get(k).map(|r| (k.clone(), r.clone())))
+            .collect()
+    }
+
+    /// Rebuild from persisted entries, oldest first; the memory bound still
+    /// applies (newest entries win past the cap).
+    pub fn restore(entries: Vec<(String, Reply)>) -> Self {
+        let mut d = Self::new();
+        for (k, r) in entries {
+            d.store(k, r);
+        }
+        d
+    }
 }
 
 impl Default for DedupCache {
@@ -594,8 +643,9 @@ impl Default for DedupCache {
 // ---- peer authentication -------------------------------------------------------
 
 /// Transport-authenticated caller identity. The pipe server derives this from
-/// impersonation + token inspection and `GetNamedPipeClientProcessId` — never
-/// from caller-supplied fields. The client derives `server_pid` from
+/// impersonation + token inspection, `GetNamedPipeClientProcessId` and the
+/// *server-side* process image (path, file id, SHA-256 of the image file) —
+/// never from caller-supplied fields. The client derives `server_pid` from
 /// `GetNamedPipeServerProcessId` and compares it against the SCM service PID
 /// plus the protected image identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -607,6 +657,12 @@ pub struct PeerAuth {
     pub session_id: u32,
     pub logon_luid: u64,
     pub image_path: String,
+    /// Server-observed file id of the caller process image (never caller
+    /// supplied). Empty only on non-owner paths that never bind identity.
+    pub image_file_id: String,
+    /// Server-observed SHA-256 of the caller process image (never caller
+    /// supplied). Empty only on non-owner paths that never bind identity.
+    pub image_sha256: String,
     /// True when the transport detected a remote (network) client. The pipe
     /// is created with PIPE_REJECT_REMOTE_CLIENTS, so this is defense in
     /// depth: remote is always rejected.
@@ -660,6 +716,17 @@ impl PeerAuth {
             return Err(AuthError::BadIdentity(
                 "owner operations require a creation FILETIME".into(),
             ));
+        }
+        // Owner identity binds to the server-observed process image: a peer
+        // that would bind a lease (registration or an owner operation) must
+        // carry the process-derived file id and image hash. The server never
+        // accepts these from the request body.
+        if op.requires_owner() || op == Operation::RegisterOwner {
+            if self.image_file_id.is_empty() || !journal::is_sha256_hex(&self.image_sha256) {
+                return Err(AuthError::BadIdentity(
+                    "owner identity requires a server-observed image file id and SHA-256".into(),
+                ));
+            }
         }
         if let (Some(observed), Some(expected)) = (self.server_pid, self.expected_server_pid)
         {

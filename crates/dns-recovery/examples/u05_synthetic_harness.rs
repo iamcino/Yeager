@@ -12,8 +12,10 @@
 //! kill-service-then-owner replay, health timeout with a live process, late
 //! heartbeat/apply rejection, responding-SERVFAIL liveness, the full IPC
 //! auth matrix, request-ID dedup, STOP/PRESHUTDOWN behavior and the offline
-//! guard. Machine-readable evidence goes to
-//! `C:\projects\yeager-dns-pkg\u05-harness-evidence.json`.
+//! guard. Debug runs 17 cases; release runs the 10 that execute in optimized
+//! builds and honestly lists the 7 panic-unwind barrier crashes as skipped
+//! (covered in release by the barrier unit test). Machine-readable evidence
+//! goes to `C:\projects\yeager-dns-pkg\u05-harness-evidence.json`.
 
 use dns_recovery::clock::{Clock, VirtualClock};
 use dns_recovery::fake::FakeOs;
@@ -99,6 +101,8 @@ impl World {
             session_id: 0,
             logon_luid: 999,
             image_path: "C:\\Program Files\\Yeager\\yeager.exe".to_string(),
+            image_file_id: "fileid-1".to_string(),
+            image_sha256: "a".repeat(64),
             remote: false,
             server_pid: None,
             expected_server_pid: None,
@@ -182,7 +186,7 @@ fn main() {
     // the scenarios run on a dedicated 16 MiB thread. This is harness-only
     // scaffolding: the product path is identical and also covered by unit
     // tests (which run on big test-thread stacks in both profiles).
-    let cases = std::thread::Builder::new()
+    let (cases, skipped) = std::thread::Builder::new()
         .name("u05-harness".into())
         .stack_size(16 << 20)
         .spawn(run_cases)
@@ -204,6 +208,7 @@ fn main() {
         "cases": cases.iter().map(|c| serde_json::json!({
             "name": c.name, "pass": c.pass, "detail": c.detail,
         })).collect::<Vec<_>>(),
+        "skipped_in_this_profile": skipped,
     });
     std::fs::write(
         EVIDENCE_PATH,
@@ -216,11 +221,14 @@ fn main() {
     }
 }
 
-fn run_cases() -> Vec<Case> {
+fn run_cases() -> (Vec<Case>, Vec<serde_json::Value>) {
     // Harness self-guard: this binary only ever drives FakeOs with synthetic
     // GUIDs. It performs no NIC mutation, no SCM installation and no real
     // journal I/O by construction (FakeFs lives in memory).
     let mut cases: Vec<Case> = Vec::new();
+    // Cases that do not run in this profile (release skips the panic-unwind
+    // barrier crashes; they are not counted in passed/total).
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
 
     // 1. TerminateProcess simulation: 1 s restoration target, exact originals.
     // "Begins restoration" = the R0 epoch/admission barrier commit
@@ -265,9 +273,10 @@ fn run_cases() -> Vec<Case> {
     // The panic-unwind crash injection runs on debug builds: under release
     // optimization the example's dispatch call inlines the whole engine and
     // unwinding the injected panic through it fastfails in this scaffolding
-    // context (unit test `barrier_crash_same_host_watchdog_restores` covers
-    // the identical product path in release and stays green). Debug runs all
-    // seven points; release records the honest skip below.
+    // context. Release therefore does NOT run or count these seven cases
+    // here (honest evidence); the identical product path is covered in
+    // release by unit test `barrier_crash_same_host_watchdog_restores`,
+    // which stays green. Debug runs all seven points.
     let barrier_points = [
         DeathPoint::TransactionCommitted,
         DeathPoint::ApplyIntentFlushed,
@@ -279,10 +288,11 @@ fn run_cases() -> Vec<Case> {
     ];
     if !cfg!(debug_assertions) {
         for point in barrier_points {
-            cases.push(case("death_at_barrier_restores", true, json!({
+            skipped.push(json!({
+                "name": "death_at_barrier_restores",
                 "point": format!("{point:?}"),
-                "release_note": "panic-unwind injection skipped in optimized example builds; covered in release by unit test barrier_crash_same_host_watchdog_restores",
-            })));
+                "reason": "panic-unwind injection skipped in optimized example builds (fastfail); runs in full in debug evidence and is covered in release by unit test barrier_crash_same_host_watchdog_restores",
+            }));
         }
     }
     if cfg!(debug_assertions) {
@@ -534,5 +544,5 @@ fn run_cases() -> Vec<Case> {
         cases.push(case("offline_guard_states", pass, json!({})));
     }
 
-    cases
+    (cases, skipped)
 }

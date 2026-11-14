@@ -93,6 +93,8 @@ impl SvcWorld {
             session_id: 0,
             logon_luid: 999,
             image_path: "C:\\Program Files\\Yeager\\yeager.exe".to_string(),
+            image_file_id: "fileid-1".to_string(),
+            image_sha256: "a".repeat(64),
             remote: false,
             server_pid: None,
             expected_server_pid: None,
@@ -334,6 +336,8 @@ fn peer_auth_gates_remote_unelevated_spoofed_and_anonymous() {
         session_id: 0,
         logon_luid: 999,
         image_path: "C:\\Program Files\\Yeager\\yeager.exe".into(),
+        image_file_id: "fileid-1".into(),
+        image_sha256: "a".repeat(64),
         remote: false,
         server_pid: Some(100),
         expected_server_pid: Some(100),
@@ -1106,4 +1110,316 @@ fn unknown_version_and_oversized_frames_never_reach_dispatch() {
         protocol::decode_frame(&huge),
         Err(ProtocolError::OversizedFrame(MAX_FRAME_BYTES + 4))
     );
+}
+
+// ---- U05b fidelity: service-loop watchdog, process identity, durable dedup ----
+
+#[test]
+fn watchdog_poll_restores_dead_owner_on_service_thread_without_gui_relaunch() {
+    // Drives the real loop path (watchdog_poll), not on_owner_death directly:
+    // the service thread's ~1 s tick polls every held owner handle and the
+    // journal's recorded owner. A dead result starts restore inside the
+    // target; restoration runs through the engine only and never relaunches
+    // a GUI (no process is ever spawned — the journal ends as a clean
+    // tombstone with exact originals).
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let apply = host.dispatch(
+        &peer,
+        &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+    );
+    assert_eq!(apply.outcome, "active");
+    let began: std::rc::Rc<StdMutex<Option<Instant>>> =
+        std::rc::Rc::new(StdMutex::new(None));
+    let began_hook = std::rc::Rc::clone(&began);
+    host.set_hook(std::rc::Rc::new(move |p| {
+        if p == crate::transaction::DeathPoint::RestoreEpochFlushed {
+            *began_hook.lock().unwrap() = Some(Instant::now());
+        }
+    }));
+    w.probe.kill(PID);
+    let t0 = Instant::now();
+    let reports = host.watchdog_poll();
+    assert_eq!(reports.len(), 1, "one dead owner restores");
+    assert_eq!(reports[0].outcome, Outcome::VerifiedRestored);
+    let start_us = began
+        .lock()
+        .unwrap()
+        .map(|t| t.duration_since(t0).as_micros())
+        .unwrap_or(u128::MAX);
+    assert!(
+        start_us < 1_000_000,
+        "restore starts inside the 1 s target, took {start_us}us"
+    );
+    assert_eq!(os_configured(&w, Family::Ipv4).0, V4_ORIG);
+    assert_eq!(os_configured(&w, Family::Ipv6).0, V6_ORIG);
+    assert_eq!(w.journal_state(), Some(JournalState::Clean));
+    assert_eq!(host.lease_count(), 0);
+    // A repeated poll after the restore is quiet: no second restore.
+    assert!(host.watchdog_poll().is_empty());
+}
+
+#[test]
+fn watchdog_poll_with_live_probe_keeps_lease_and_handle() {
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let apply = host.dispatch(
+        &peer,
+        &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+    );
+    assert_eq!(apply.outcome, "active");
+    // Owner still alive: the poll keeps the handle and the lease, restores
+    // nothing, leaves the Yeager plan in place.
+    let reports = host.watchdog_poll();
+    assert!(reports.is_empty());
+    assert_eq!(host.lease_count(), 1);
+    assert_eq!(w.journal_state(), Some(JournalState::Owned));
+    assert_ne!(os_configured(&w, Family::Ipv4).0, V4_ORIG);
+}
+
+#[test]
+fn on_owner_death_with_live_or_unknown_probe_keeps_lease_in_place() {
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let apply = host.dispatch(
+        &peer,
+        &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+    );
+    assert_eq!(apply.outcome, "active");
+    // Live probe: not dead, so the lease stays in place and nothing restores.
+    assert!(host.on_owner_death(OWNER_ID).is_none());
+    assert_eq!(host.lease_count(), 1);
+    assert_eq!(w.journal_state(), Some(JournalState::Owned));
+    // Unknown probe (access denied): also not dead, lease stays.
+    w.probe.set_access_denied(PID, true);
+    assert!(host.on_owner_death(OWNER_ID).is_none());
+    assert_eq!(host.lease_count(), 1);
+    assert_ne!(os_configured(&w, Family::Ipv4).0, V4_ORIG);
+}
+
+#[test]
+fn restart_with_live_owner_stays_monitored_with_no_lease_or_restore() {
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let apply = host.dispatch(
+        &peer,
+        &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+    );
+    assert_eq!(apply.outcome, "active");
+    let (v4_active, _) = os_configured(&w, Family::Ipv4);
+    assert_ne!(v4_active, V4_ORIG);
+    // Fresh host incarnation over the same durable state (service restart).
+    // The owner process is still alive: boot replay leaves it untouched.
+    drop(host);
+    let mut restarted = w.host();
+    let replay = restarted.boot_replay().expect("boot replay runs");
+    assert_eq!(replay.outcome, Outcome::Busy);
+    // The service loop's first tick: the live recorded owner stays monitored
+    // (handle held) with no blind restore and no mutation lease minted.
+    let reports = restarted.watchdog_poll();
+    assert!(reports.is_empty());
+    assert_eq!(restarted.lease_count(), 0);
+    assert_eq!(w.journal_state(), Some(JournalState::Owned));
+    assert_eq!(os_configured(&w, Family::Ipv4).0, v4_active);
+    // Re-registration still reattaches without rewriting DNS.
+    let reg2 = restarted.dispatch(
+        &peer,
+        &request(Operation::RegisterOwner, None, None, w.register_body(OWNER_ID)),
+    );
+    assert_eq!(reg2.outcome, "success");
+    assert_eq!(reg2.body["reattached"], json!(true));
+    assert_eq!(os_configured(&w, Family::Ipv4).0, v4_active);
+}
+
+#[test]
+fn server_rejects_caller_claimed_image_hash_and_file_id() {
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    // A claimed hash that differs from the process-observed image is a spoof
+    // attempt: rejected with no lease.
+    let mut bad = w.register_body(OWNER_ID);
+    bad["image_sha256"] = json!("b".repeat(64));
+    let r = host.dispatch(&peer, &request(Operation::RegisterOwner, None, None, bad));
+    assert_eq!(r.outcome, "auth_rejected");
+    assert_eq!(host.lease_count(), 0);
+    // Same for a forged file id.
+    let mut bad2 = w.register_body(OWNER_ID);
+    bad2["image_file_id"] = json!("forged-file-id");
+    let r2 = host.dispatch(
+        &peer,
+        &request(Operation::RegisterOwner, None, None, bad2),
+    );
+    assert_eq!(r2.outcome, "auth_rejected");
+    assert_eq!(host.lease_count(), 0);
+    // Matching claims bind the process identity.
+    let ok = w.register(&mut host, OWNER_ID);
+    assert_eq!(ok.outcome, "success");
+}
+
+#[test]
+fn register_binds_process_observed_identity_not_request_body() {
+    // The body carries no image fields at all: registration still succeeds,
+    // and the journaled owner records the transport-observed process
+    // identity — never a caller-supplied hash.
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = host.dispatch(
+        &peer,
+        &request(Operation::RegisterOwner, None, None, json!({"owner_id": OWNER_ID})),
+    );
+    assert_eq!(reg.outcome, "success");
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let apply = host.dispatch(
+        &peer,
+        &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+    );
+    assert_eq!(apply.outcome, "active");
+    let store = JournalStore::open(Rc::clone(&w.fs), DIR).expect("open store");
+    let tx = store
+        .reconcile()
+        .expect("reconcile")
+        .current
+        .expect("transaction")
+        .env
+        .payload
+        .transaction
+        .expect("transaction");
+    assert_eq!(tx.owner.image_sha256, "a".repeat(64));
+    assert_eq!(tx.owner.image_file_id, "fileid-1");
+    assert_eq!(
+        tx.owner.image_path,
+        "C:\\Program Files\\Yeager\\yeager.exe"
+    );
+    assert_eq!(tx.owner.logon_luid, 999);
+}
+
+#[test]
+fn dedup_replay_after_forced_eviction_does_not_call_setter() {
+    // The production memory bound is 512 entries (covered at the protocol
+    // level by dedup_replays_reply_and_bounds_table); forcing a 512-entry
+    // flood through full dispatches is prohibitively slow in debug (each
+    // dispatch reconciles the journal), so this host test shrinks only the
+    // in-memory bound — the eviction, durable-overflow and
+    // generation-checked replay path is identical.
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host().with_dedup_cap(8);
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    let first_id = journal::new_uuid();
+    let body = w.apply_body(&token, 7);
+    let first = host.dispatch(
+        &peer,
+        &Request::new(
+            first_id.clone(),
+            Operation::Apply,
+            Some(OWNER_ID.into()),
+            None,
+            body.clone(),
+        ),
+    );
+    assert_eq!(first.outcome, "active");
+    let reply_gen = first.generation;
+    let calls_after_first = w.os.setter_call_count();
+    assert!(calls_after_first > 0);
+    // Flood past the small in-memory cap: each follow-up apply is a new
+    // logical id on an already-owned transaction, so each stores a Busy reply
+    // and evicts older entries (the original id falls out of memory but
+    // persists in the durable overflow).
+    for _ in 0..16u32 {
+        let id = journal::new_uuid();
+        let r = host.dispatch(
+            &peer,
+            &Request::new(id, Operation::Apply, Some(OWNER_ID.into()), None, body.clone()),
+        );
+        assert_eq!(r.outcome, "busy");
+    }
+    assert_eq!(host.dedup_len(), 8);
+    // The original id was evicted from memory but persists durably: the
+    // replay is answered from the stored reply — same outcome and generation
+    // — and the setter is never reached.
+    let replay = host.dispatch(
+        &peer,
+        &Request::new(first_id, Operation::Apply, Some(OWNER_ID.into()), None, body),
+    );
+    assert_eq!(replay.outcome, "active");
+    assert_eq!(replay.generation, reply_gen);
+    assert_eq!(w.os.setter_call_count(), calls_after_first);
 }

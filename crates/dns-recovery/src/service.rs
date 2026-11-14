@@ -35,7 +35,7 @@
 
 use crate::clock::Clock;
 use crate::codec;
-use crate::fs::JournalFs;
+use crate::fs::{join, JournalFs};
 use crate::journal::{
     self, Admission, JournalState, Maintenance, OwnerIdentity, Phase, MAINTENANCE_LEASE_SECS,
 };
@@ -132,6 +132,14 @@ type FsFactory<F> = Rc<dyn Fn() -> F>;
 /// The privileged-service host. Generic over the journal filesystem so the
 /// full state machine — including the synthetic-owner harness — runs
 /// against fakes without touching real adapters or the SCM.
+///
+/// Dedup discipline: mutating replies are memoized in the bounded in-memory
+/// table AND in a durable overflow file (`dedup-v1.json` in the service
+/// directory, up to [`protocol::MAX_PERSISTED_DEDUP_ENTRIES`] entries). A
+/// replayed request id is answered from the stored reply even after the
+/// in-memory eviction, and a hit only counts when the stored reply's journal
+/// generation matches the current generation (results are retained for the
+/// transaction lifetime, never across it).
 pub struct ServiceHost<F: JournalFs> {
     backend_factory: BackendFactory,
     setter_factory: SetterFactory,
@@ -143,6 +151,10 @@ pub struct ServiceHost<F: JournalFs> {
     config: ServiceConfig,
     leases: HashMap<String, Lease>,
     dedup: DedupCache,
+    /// Durable overflow: request id → stored reply, oldest-first order.
+    durable_dedup: HashMap<String, Reply>,
+    durable_order: std::collections::VecDeque<String>,
+    durable_loaded: bool,
     control: ControlState,
     hook: Rc<dyn Fn(crate::transaction::DeathPoint)>,
 }
@@ -170,6 +182,9 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             config,
             leases: HashMap::new(),
             dedup: DedupCache::new(),
+            durable_dedup: HashMap::new(),
+            durable_order: std::collections::VecDeque::new(),
+            durable_loaded: false,
             control: ControlState::Running,
             hook: Rc::new(|_| {}),
         }
@@ -178,6 +193,14 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
     /// Death-injection hook for the synthetic harness (latency measurement).
     pub fn set_hook(&mut self, hook: Rc<dyn Fn(crate::transaction::DeathPoint)>) {
         self.hook = hook;
+    }
+
+    /// Override the in-memory dedup bound (tests force eviction with a small
+    /// table; production uses [`protocol::MAX_DEDUP_ENTRIES`]). The durable
+    /// overflow and the generation-checked replay are identical either way.
+    pub fn with_dedup_cap(mut self, cap: usize) -> Self {
+        self.dedup.set_cap(cap);
+        self
     }
 
     pub fn control_state(&self) -> ControlState {
@@ -200,6 +223,112 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
 
     pub fn dedup_len(&self) -> usize {
         self.dedup.len()
+    }
+
+    // ---- durable dedup ----------------------------------------------------------
+
+    fn dedup_path(&self) -> String {
+        join(&self.config.dir, protocol::DEDUP_FILE)
+    }
+
+    /// Best-effort load of the durable overflow (once per host incarnation).
+    /// A missing or corrupt file means an empty overflow — never a failure.
+    fn dedup_ensure_loaded(&mut self) {
+        if self.durable_loaded {
+            return;
+        }
+        self.durable_loaded = true;
+        let path = self.dedup_path();
+        let fs = (self.fs_factory)();
+        let bytes = match fs.read_file(&path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        #[derive(serde::Deserialize)]
+        struct DedupFile {
+            #[serde(default)]
+            entries: Vec<(String, Reply)>,
+        }
+        let file: DedupFile = match serde_json::from_slice(&bytes) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        for (id, reply) in file.entries {
+            if journal::is_lower_uuid(&id) && !self.durable_dedup.contains_key(&id) {
+                self.durable_order.push_back(id.clone());
+                self.durable_dedup.insert(id, reply);
+                while self.durable_dedup.len() > protocol::MAX_PERSISTED_DEDUP_ENTRIES {
+                    match self.durable_order.pop_front() {
+                        Some(old) => {
+                            self.durable_dedup.remove(&old);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Best-effort persist of the durable overflow. Failures are ignored:
+    /// the in-memory table still answers, and the next store retries.
+    fn dedup_persist(&self) {
+        let entries: Vec<(String, Reply)> = self
+            .durable_order
+            .iter()
+            .filter_map(|k| self.durable_dedup.get(k).map(|r| (k.clone(), r.clone())))
+            .collect();
+        let bytes = match serde_json::to_vec(&serde_json::json!({"v": 1u32, "entries": entries})) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let fs = (self.fs_factory)();
+        let path = self.dedup_path();
+        let _ = fs.delete(&path);
+        let h = match fs.create_new(&path) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let _ = fs.write_all(h, &bytes).and(fs.flush_file(h));
+        let _ = fs.close(h);
+    }
+
+    /// Idempotency lookup: a stored reply is replayed only when its journal
+    /// generation matches the current generation (results live for the
+    /// transaction lifetime). The durable overflow keeps replayed ids
+    /// answerable after the 512-entry in-memory eviction; a hit there is
+    /// promoted back into memory.
+    fn dedup_lookup(&mut self, request_id: &str) -> Option<Reply> {
+        let generation = self.journal_generation();
+        if let Some(stored) = self.dedup.lookup(request_id) {
+            if stored.generation == generation {
+                return Some(stored.clone());
+            }
+        }
+        self.dedup_ensure_loaded();
+        if let Some(stored) = self.durable_dedup.get(request_id).cloned() {
+            if stored.generation == generation {
+                self.dedup.store(request_id.to_string(), stored.clone());
+                return Some(stored);
+            }
+        }
+        None
+    }
+
+    fn dedup_store(&mut self, request_id: String, reply: Reply) {
+        self.dedup.store(request_id.clone(), reply.clone());
+        if !self.durable_dedup.contains_key(&request_id) {
+            self.durable_order.push_back(request_id.clone());
+            self.durable_dedup.insert(request_id, reply);
+            while self.durable_dedup.len() > protocol::MAX_PERSISTED_DEDUP_ENTRIES {
+                match self.durable_order.pop_front() {
+                    Some(old) => {
+                        self.durable_dedup.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.dedup_persist();
     }
 
     fn now_ms(&self) -> i64 {
@@ -463,6 +592,11 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
 
     /// T0: authenticate the caller's process identity, bind the lease to it
     /// and hold that identity before replying. No DNS mutation happens here.
+    ///
+    /// Identity comes from the transport-authenticated peer (process-derived
+    /// image path/file id/SHA-256 and token-derived logon LUID) — never from
+    /// the request body. A caller-claimed image hash or file id that differs
+    /// from the process-observed value is rejected.
     fn op_register(&mut self, peer: &PeerAuth, req: &Request) -> Reply {
         let body = &req.body;
         let owner_id = match body
@@ -476,12 +610,18 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
         if !journal::is_lower_uuid(&owner_id) {
             return self.auth_reply(req, "owner_id is not a lowercase UUID");
         }
-        let image_sha256 = body
-            .get("image_sha256")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !journal::is_sha256_hex(image_sha256) {
-            return self.auth_reply(req, "image_sha256 must be lowercase SHA-256 hex");
+        // Server-side identity: the process-observed image hash/file id win.
+        // A caller-supplied value that contradicts the observed process is a
+        // spoof attempt.
+        if let Some(claimed) = body.get("image_sha256").and_then(|v| v.as_str()) {
+            if claimed != peer.image_sha256 {
+                return self.auth_reply(req, "caller-claimed image hash differs from the process image");
+            }
+        }
+        if let Some(claimed) = body.get("image_file_id").and_then(|v| v.as_str()) {
+            if claimed != peer.image_file_id {
+                return self.auth_reply(req, "caller-claimed image file id differs from the process image");
+            }
         }
         // The journal may already record a transaction: a service restart
         // with a LIVE owner reattaches to it (no blind restore); anything
@@ -569,12 +709,8 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             logon_luid: peer.logon_luid,
             session_id: peer.session_id,
             image_path: peer.image_path.clone(),
-            image_file_id: body
-                .get("image_file_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            image_sha256: image_sha256.to_string(),
+            image_file_id: peer.image_file_id.clone(),
+            image_sha256: peer.image_sha256.clone(),
         };
         let token = fresh_token();
         let now = self.now_ms();
@@ -679,7 +815,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             Ok(v) => v,
             Err(r) => return r,
         };
-        if let Some(stored) = self.dedup.lookup(&req.request_id) {
+        if let Some(stored) = self.dedup_lookup(&req.request_id) {
             return stored.clone();
         }
         let selected = match protocol::parse_selected(&req.body) {
@@ -734,7 +870,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             outcome,
             serde_json::json!({"errors": errors}),
         );
-        self.dedup.store(req.request_id.clone(), reply.clone());
+        self.dedup_store(req.request_id.clone(), reply.clone());
         reply
     }
 
@@ -751,7 +887,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             Ok(v) => v,
             Err(r) => return r,
         };
-        if let Some(stored) = self.dedup.lookup(&req.request_id) {
+        if let Some(stored) = self.dedup_lookup(&req.request_id) {
             return stored.clone();
         }
         let selected = match protocol::parse_selected(&req.body) {
@@ -793,7 +929,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             outcome,
             serde_json::json!({"errors": report.errors.len()}),
         );
-        self.dedup.store(req.request_id.clone(), reply.clone());
+        self.dedup_store(req.request_id.clone(), reply.clone());
         reply
     }
 
@@ -838,7 +974,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             Ok(v) => v,
             Err(r) => return r,
         };
-        if let Some(stored) = self.dedup.lookup(&req.request_id) {
+        if let Some(stored) = self.dedup_lookup(&req.request_id) {
             return stored.clone();
         }
         let engine = match self.engine_for(&snap.owner) {
@@ -857,7 +993,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
         };
         let reply = self.reply(req, report.generation, outcome_str(report.outcome),
             serde_json::json!({"errors": report.errors.len()}));
-        self.dedup.store(req.request_id.clone(), reply.clone());
+        self.dedup_store(req.request_id.clone(), reply.clone());
         reply
     }
 
@@ -963,13 +1099,79 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
     /// Watchdog entry for a signaled owner handle (proven death): begin
     /// restoration immediately (§8.3: target 1 s under normal scheduling).
     /// Returns the restore report; the caller measures start latency.
+    ///
+    /// Liveness is checked BEFORE the lease is touched: a non-dead probe
+    /// (live or unknown) leaves the lease in place and returns `None`. A
+    /// live owner is never restored from here.
     pub fn on_owner_death(&mut self, owner_id: &str) -> Option<EngineReport> {
-        let lease = self.leases.remove(owner_id)?;
-        // Proven death only: a live owner is never restored from here.
-        if !matches!((self.probe_factory)().check(&lease.owner), OwnerLiveness::Dead) {
+        let live = match self.leases.get(owner_id) {
+            None => return None,
+            Some(lease) => (self.probe_factory)().check(&lease.owner),
+        };
+        if !matches!(live, OwnerLiveness::Dead) {
             return None;
         }
+        let lease = self.leases.remove(owner_id)?;
         Some(self.restore_for_owner(&lease.owner))
+    }
+
+    /// Journal-recorded owner, if a transaction exists (used by the service
+    /// loop to keep a live owner under the held-handle monitor across a
+    /// restart, before any takeover and without a mutation lease).
+    pub fn recorded_owner(&self) -> Option<OwnerIdentity> {
+        self.current_transaction()
+            .ok()
+            .flatten()
+            .map(|(_, tx)| tx.owner)
+    }
+
+    /// Service-loop watchdog poll (§8.3, ~1 s cadence on the service thread):
+    /// poll every held owner handle AND the journal's recorded owner. A
+    /// `Dead` result starts `restore` inside the 1 s target and never
+    /// relaunches a GUI (restore runs through the engine only). A `Live`
+    /// result keeps the handle (the probe holds it). A service restart that
+    /// sees a live owner leaves that handle in the monitor before accepting
+    /// takeover — no blind restore, no mutation lease. Returns one report
+    /// per owner restored.
+    pub fn watchdog_poll(&mut self) -> Vec<EngineReport> {
+        let mut out = Vec::new();
+        // Snapshot the lease table so the probe (which may cache handles)
+        // never runs under a lease borrow.
+        let leased: Vec<(String, OwnerIdentity)> = self
+            .leases
+            .iter()
+            .map(|(id, l)| (id.clone(), l.owner.clone()))
+            .collect();
+        let mut dead_leases = Vec::new();
+        for (id, owner) in &leased {
+            if matches!((self.probe_factory)().check(owner), OwnerLiveness::Dead) {
+                dead_leases.push(id.clone());
+            }
+        }
+        for id in dead_leases {
+            if let Some(lease) = self.leases.remove(&id) {
+                out.push(self.restore_for_owner(&lease.owner));
+            }
+        }
+        // Journal-recorded owner without a covering lease (e.g. right after
+        // a service restart, before the live owner re-registers): a dead
+        // recorded owner restores now; a live one is left in the monitor
+        // (the check above holds the handle) with no blind restore and no
+        // lease minted here.
+        if let Some(recorded) = self.recorded_owner() {
+            let covered = self.leases.values().any(|l| {
+                l.owner.owner_id == recorded.owner_id
+                    && l.owner.pid == recorded.pid
+                    && l.owner.creation_time_filetime == recorded.creation_time_filetime
+            });
+            if !covered {
+                match (self.probe_factory)().check(&recorded) {
+                    OwnerLiveness::Dead => out.push(self.restore_for_owner(&recorded)),
+                    OwnerLiveness::Live | OwnerLiveness::Unknown(_) => {}
+                }
+            }
+        }
+        out
     }
 
     fn restore_after_lease_loss(&mut self, req: &Request, owner: &OwnerIdentity, why: &str) -> Reply {
