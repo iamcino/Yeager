@@ -17,7 +17,7 @@ use crate::model::{
     BoundEndpoint, CaptureError, DesiredPlan, Family, Provenance, Provider, Snapshot, Transport,
 };
 use crate::plan::{automatic_image, plan_image, provider_spec, setter_mask};
-use crate::setter::{DNS_SETTING_DOH, DNS_SETTING_NAMESERVER, DOH_ENABLE, ERROR_ACCESS_DENIED};
+use crate::setter::{DNS_SETTING_DOH, DNS_SETTING_NAMESERVER, DOH_ENABLE, DOH_FALLBACK_TO_UDP, ERROR_ACCESS_DENIED};
 use crate::store::{JournalStore, StoreError};
 use crate::transaction::{background_delay_ms, DeathPoint, EngineError, Outcome, TransactionEngine};
 use std::cell::Cell;
@@ -255,22 +255,42 @@ fn plan_builder_rules() {
     assert_eq!(img.server_properties[0].doh.template, Some(CF_TEMPLATE.to_string()));
     assert_eq!(img.server_properties[0].doh.flags, DOH_ENABLE);
 
-    // Single bound endpoint isolates the builder rule (one token per matching
-    // endpoint, loopback first, provider fallback last) from UDP+TCP duplication.
-    let single_local = DesiredPlan {
-        provider: Provider::Cloudflare,
-        local_requested: true,
-        bound_endpoints: vec![BoundEndpoint { ip: "127.0.0.1".parse().unwrap(), port: 53, transport: Transport::Udp }],
-        readiness_generation: 1,
-    };
-    let limg = plan_image(GUID_A, Family::Ipv4, &single_local, &before, NOW);
+    // Local lists use the schema-valid plans (each advertised family carries
+    // UDP+TCP readiness): dedup keeps one loopback token, then the first
+    // provider address of that family (§5.1).
+    let local = plan_local(Provider::Cloudflare);
+    let limg = plan_image(GUID_A, Family::Ipv4, &local, &before, NOW);
     assert_eq!(limg.name_server_raw, Some("127.0.0.1,1.1.1.1".to_string()));
     assert_eq!(limg.server_properties.len(), 1, "loopback carries no DoH property");
     assert_eq!(limg.server_properties[0].server_index, 1);
+    assert_eq!(limg.server_properties[0].doh.template, Some(CF_TEMPLATE.to_string()));
+    assert_eq!(limg.server_properties[0].doh.flags, DOH_ENABLE);
+    assert_eq!(limg.server_properties[0].doh.flags & DOH_FALLBACK_TO_UDP, 0);
 
-    let v6img = plan_image(GUID_A, Family::Ipv6, &plan_local_v4only(Provider::Cloudflare), &before, NOW);
+    let l6img = plan_image(GUID_A, Family::Ipv6, &local, &before, NOW);
+    assert_eq!(l6img.name_server_raw, Some("::1,2606:4700:4700::1111".to_string()));
+    assert_eq!(l6img.server_properties.len(), 1, "loopback carries no DoH property");
+    assert_eq!(l6img.server_properties[0].server_index, 1);
+    assert_eq!(l6img.server_properties[0].doh.template, Some(CF_TEMPLATE.to_string()));
+    assert_eq!(l6img.server_properties[0].doh.flags, DOH_ENABLE);
+    assert_eq!(l6img.server_properties[0].doh.flags & DOH_FALLBACK_TO_UDP, 0);
+
+    let v4only = plan_local_v4only(Provider::Cloudflare);
+    let l4only = plan_image(GUID_A, Family::Ipv4, &v4only, &before, NOW);
+    assert_eq!(l4only.name_server_raw, Some("127.0.0.1,1.1.1.1".to_string()));
+    assert_eq!(l4only.server_properties.len(), 1, "loopback carries no DoH property");
+    assert_eq!(l4only.server_properties[0].server_index, 1);
+    assert_eq!(l4only.server_properties[0].doh.template, Some(CF_TEMPLATE.to_string()));
+    assert_eq!(l4only.server_properties[0].doh.flags, DOH_ENABLE);
+    assert_eq!(l4only.server_properties[0].doh.flags & DOH_FALLBACK_TO_UDP, 0);
+
+    let v6img = plan_image(GUID_A, Family::Ipv6, &v4only, &before, NOW);
     assert_eq!(v6img.name_server_raw, Some("2606:4700:4700::1111".to_string()));
     assert_eq!(v6img.server_properties.len(), 1);
+    assert_eq!(v6img.server_properties[0].server_index, 0);
+    assert_eq!(v6img.server_properties[0].doh.template, Some(CF_TEMPLATE.to_string()));
+    assert_eq!(v6img.server_properties[0].doh.flags, DOH_ENABLE);
+    assert_eq!(v6img.server_properties[0].doh.flags & DOH_FALLBACK_TO_UDP, 0);
 
     let auto = automatic_image(GUID_A, &before, NOW);
     assert_eq!(auto.provenance, Provenance::Automatic);

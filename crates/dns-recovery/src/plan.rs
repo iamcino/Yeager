@@ -88,7 +88,10 @@ pub fn plan_image(
     if plan.local_requested {
         for e in &plan.bound_endpoints {
             if e.ip.is_ipv4() == want_v4 {
-                tokens.push(e.ip.to_string());
+                let s = e.ip.to_string();
+                if !tokens.iter().any(|t| t == &s) {
+                    tokens.push(s);
+                }
             }
         }
         tokens.push(provider_addrs[0].to_string());
