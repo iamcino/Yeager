@@ -1320,8 +1320,17 @@ pub fn remember_window_size_sample(
     now: Instant,
     force: bool,
 ) -> bool {
+    // Latch `initialized` on any coherent normal sample, including after the
+    // two startup settle shots. A close-to-tray (hidden), minimize, or
+    // bad-scale pair during those shots leaves the flag false, but the next
+    // settled resize or close/exit with coherent geometry must still capture.
     if !tracker.initialized {
-        return false;
+        if !should_accept_geometry(visible, minimized, maximized, true, scale, w, h) {
+            tracker.pending = None;
+            tracker.pending_since = None;
+            return false;
+        }
+        tracker.initialized = true;
     }
     if !should_accept_geometry(visible, minimized, maximized, true, scale, w, h) {
         tracker.pending = None;
@@ -1956,6 +1965,65 @@ mod geometry_tests {
     }
 
     #[test]
+    fn late_coherent_sample_latches_after_missed_settle() {
+        // Both startup settle shots saw incoherent samples (close-to-tray
+        // hidden, then minimized, then bad scale): `initialized` stays false
+        // for the process lifetime under the old two-shot latch. A later
+        // settled resize and a forced close/exit must still capture.
+        let mut stored = Some([860, 600]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([860, 600]),
+            initialized: false,
+            // Baselines as the settle timers leave them after incoherent shots.
+            last_scale: Some(1.0),
+            last_work_area: Some((1920.0, 1080.0)),
+            pending: None,
+            pending_since: None,
+        };
+        let t_missed = Instant::now();
+        // Settle shot window: hidden (close-to-tray), minimized, bad scale.
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, false, false, false, 1.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, false
+        ));
+        assert!(!tr.initialized);
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, true, false, 1.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, false
+        ));
+        assert!(!tr.initialized);
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 0.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, true
+        ));
+        assert!(!tr.initialized);
+        assert_eq!(stored, Some([860, 600]));
+        // Later settled resize: first coherent poll latches and arms pending.
+        let t0 = Instant::now();
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 900.0, 650.0,
+            Some((1920.0, 1080.0)), t0, false
+        ));
+        assert!(tr.initialized, "late coherent sample must latch initialized");
+        assert_eq!(stored, Some([860, 600]));
+        // Quiet expiry commits the settled resize.
+        let t1 = t0 + GEOMETRY_QUIET + Duration::from_millis(50);
+        assert!(remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 900.0, 650.0,
+            Some((1920.0, 1080.0)), t1, false
+        ));
+        assert_eq!(stored, Some([900, 650]));
+        assert_eq!(tr.last_known_good, Some([900, 650]));
+        // Close/exit capture still works after that sequence.
+        assert!(remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 920.0, 680.0,
+            Some((1920.0, 1080.0)), t1, true
+        ));
+        assert_eq!(stored, Some([920, 680]));
+        assert_eq!(tr.last_known_good, Some([920, 680]));
+    }
+
+    #[test]
     fn debounce_fires_only_after_quiet() {
         // Polls do not persist in-progress drag samples: the first sighting
         // arms pending, the commit fires only after GEOMETRY_QUIET.
@@ -2126,9 +2194,21 @@ mod geometry_tests {
         unsafe {
             std::env::set_var("LOCALAPPDATA", &anchor);
         }
+        let before_try = erwin::config::save_failure_surfacing_count();
         let err = erwin::config::try_save(&Config::default()).expect_err("try_save must surface error");
         assert!(!err.to_string().is_empty());
+        assert!(
+            erwin::config::save_failure_surfacing_count() > before_try,
+            "try_save must surface the write error through the logged path"
+        );
+        // Assert the surfacing itself: a `save` that discards the error again
+        // leaves the counter flat and fails here.
+        let before_save = erwin::config::save_failure_surfacing_count();
         erwin::config::save(&Config::default());
+        assert!(
+            erwin::config::save_failure_surfacing_count() > before_save,
+            "save must surface the write error instead of discarding it"
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("LOCALAPPDATA", v),

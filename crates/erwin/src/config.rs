@@ -2,6 +2,23 @@
 
 use common::Config;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Count of write failures surfaced through the logged error path.
+///
+/// Test hook: `save` returns `()` so a regression that discards the error
+/// would otherwise stay green. Every surfacing log increments this counter,
+/// so tests can assert the surfacing itself, not only `try_save`'s `Err`.
+static SAVE_FAILURE_SURFACED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of config write failures surfaced via the logged error so far.
+pub fn save_failure_surfacing_count() -> u64 {
+    SAVE_FAILURE_SURFACED.load(Ordering::SeqCst)
+}
+
+fn note_save_failure_surfaced() {
+    SAVE_FAILURE_SURFACED.fetch_add(1, Ordering::SeqCst);
+}
 
 /// `%LOCALAPPDATA%\Yeager` (or the OS temp dir as a fallback).
 pub fn dir() -> PathBuf {
@@ -97,6 +114,7 @@ fn load_from(path: &Path) -> Config {
 pub fn save(cfg: &Config) {
     if let Err(e) = try_save(cfg) {
         eprintln!("Yeager config: failed to save {}: {e}", path().display());
+        note_save_failure_surfaced();
     }
 }
 
@@ -104,6 +122,7 @@ pub fn save(cfg: &Config) {
 pub fn try_save(cfg: &Config) -> std::io::Result<()> {
     save_to(&path(), cfg).map_err(|e| {
         eprintln!("Yeager config: failed to save {}: {e}", path().display());
+        note_save_failure_surfaced();
         e
     })
 }
@@ -277,10 +296,21 @@ mod tests {
         unsafe {
             std::env::set_var("LOCALAPPDATA", &anchor);
         }
+        let before_try = save_failure_surfacing_count();
         let err = try_save(&Config::default()).expect_err("try_save must fail when dir is a file");
         assert!(!err.to_string().is_empty());
-        // `save()` logs instead of panicking on the same failure.
+        assert!(
+            save_failure_surfacing_count() > before_try,
+            "try_save must surface the write error through the logged path"
+        );
+        // `save()` logs instead of panicking on the same failure: assert the
+        // surfacing itself, so a `save` that discards the error again fails.
+        let before_save = save_failure_surfacing_count();
         save(&Config::default());
+        assert!(
+            save_failure_surfacing_count() > before_save,
+            "save must surface the write error instead of discarding it"
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("LOCALAPPDATA", v),
