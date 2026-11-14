@@ -251,7 +251,20 @@ impl<F: JournalFs> ReplayDriver<F> {
         };
         let result = match self.open_store() {
             Ok(store) => match store.reconcile() {
-                Ok(rec) => Ok(rec.current),
+                Ok(rec) => {
+                    // §3.3 deletes obsolete candidates under the lock: a clean
+                    // tombstone's post-barrier cleanup runs while the guard is
+                    // still held (best-effort, errors stay for the next pass).
+                    if let Some(winner) = &rec.current {
+                        if winner.env.payload.transaction.is_none()
+                            && winner.env.payload.journal_state == JournalState::Clean
+                            && winner.env.is_clean_tombstone()
+                        {
+                            let _ = store.cleanup_obsolete(&winner.env);
+                        }
+                    }
+                    Ok(rec.current)
+                }
                 Err(e) => Err(format!("journal reconciliation blocks replay: {e}")),
             },
             Err(e) => Err(format!("journal unavailable: {e}")),
@@ -292,15 +305,8 @@ impl<F: JournalFs> ReplayDriver<F> {
             Ok(Some(winner)) => {
                 let generation = winner.env.generation;
                 let Some(tx) = winner.env.payload.transaction.clone() else {
-                    if winner.env.payload.journal_state == JournalState::Clean
-                        && winner.env.is_clean_tombstone()
-                    {
-                        // Clean tombstone: best-effort obsolete cleanup, no
-                        // DNS writes (errors stay for the next pass).
-                        if let Ok(store) = self.open_store() {
-                            let _ = store.cleanup_obsolete(&winner.env);
-                        }
-                    }
+                    // Clean tombstone: obsolete cleanup already ran under the
+                    // machine lock in locked_current; no DNS writes here.
                     return Ok(ReplayReport {
                         outcome: Outcome::VerifiedRestored,
                         liveness: None,

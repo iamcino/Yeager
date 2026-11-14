@@ -15,7 +15,8 @@ use crate::journal::{
 use crate::lock::FakeLock;
 use crate::model::{Family, Provenance, Provider, ServerProperty, Snapshot};
 use crate::replay::{FakeOwnerProbe, OwnerLiveness, OwnerProbe, ReplayDriver};
-use crate::setter::{DOH_ENABLE, ERROR_ACCESS_DENIED};
+use crate::lock::{LockError, MachineLock, LOCK_BUDGET};
+use crate::setter::{DOH_ENABLE, DOH_FALLBACK_TO_UDP, ERROR_ACCESS_DENIED};
 use crate::store::{tombstone_envelope, JournalStore};
 use crate::transaction::{DeathPoint, Outcome, TransactionEngine};
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ const START_MS: i64 = 1_763_000_000_000;
 const V4_ORIG: &str = "192.0.2.53";
 const V6_ORIG: &str = "2001:db8::53";
 const GOOGLE_TEMPLATE: &str = "https://dns.google/dns-query";
+const CF_TEMPLATE: &str = "https://cloudflare-dns.com/dns-query";
 const FILETIME: u64 = 133_000_000_000_000_000;
 const OTHER_FILETIME: u64 = 133_000_000_111_111_111;
 
@@ -548,6 +550,46 @@ fn changed_doh_template_is_conflict_without_write() {
     assert_eq!(state_of(&w, GUID_A, Family::Ipv4), EntryState::Conflict);
 }
 
+#[test]
+fn changed_doh_flags_is_conflict_without_write() {
+    let w = World::new();
+    w.static_adapter(GUID_A);
+    let eng = w.engine();
+    assert_eq!(
+        eng.takeover(&[GUID_A.to_string()], &plan_provider(Provider::Cloudflare)).unwrap().outcome,
+        Outcome::Active
+    );
+    // Same server list and same template as the journaled image, but foreign
+    // DoH flags: not equal to any known image and not a qualified partial, so
+    // the classifier must still report Conflict (a flags-blind classifier
+    // would wrongly verify without a write).
+    let flags_only = vec![
+        doh_prop(0, Some(CF_TEMPLATE), DOH_ENABLE | DOH_FALLBACK_TO_UDP),
+        doh_prop(1, Some(CF_TEMPLATE), DOH_ENABLE | DOH_FALLBACK_TO_UDP),
+    ];
+    w.os.set_configured(GUID_A, Family::Ipv4, "1.1.1.1,1.0.0.1", flags_only);
+    recover(&w);
+    let v4_calls_before = w.os.setter_calls().iter().filter(|c| c.family == Family::Ipv4).count();
+    let calls_before = w.os.setter_call_count();
+    let originals = journal_originals(&w);
+    let rep = w.driver().replay().unwrap();
+    assert_eq!(rep.outcome, Outcome::Conflict);
+    assert_eq!(
+        w.os.setter_calls().iter().filter(|c| c.family == Family::Ipv4).count(),
+        v4_calls_before,
+        "foreign flags get no write"
+    );
+    assert_only_original_writes(&w, calls_before, &originals);
+    let kept = w.os.readback(GUID_A, Family::Ipv4).unwrap();
+    assert_eq!(kept.server_properties[0].doh.template.as_deref(), Some(CF_TEMPLATE));
+    assert_eq!(
+        kept.server_properties[0].doh.flags,
+        DOH_ENABLE | DOH_FALLBACK_TO_UDP,
+        "edited flags stay on the adapter"
+    );
+    assert_eq!(state_of(&w, GUID_A, Family::Ipv4), EntryState::Conflict);
+}
+
 // ---- 3. administrator edits and unrelated context ---------------------------
 
 #[test]
@@ -982,4 +1024,85 @@ fn access_denied_setter_is_never_retried_as_write() {
     let tx = journal_tx(&w).expect("baseline retained");
     let e4 = tx.entries.iter().find(|e| e.family == Family::Ipv4).expect("v4 entry");
     assert_eq!(e4.original.name_server_raw.as_deref(), Some(V4_ORIG));
+}
+
+#[test]
+fn arrival_complete_keeps_lock_across_tombstone() {
+    // Crash window between the Complete marker and the tombstone, re-driven
+    // via arrival: the tombstone commit and obsolete cleanup must run with
+    // the machine lock held by that arrival pass.
+    let w = World::new();
+    w.static_adapter(GUID_A);
+    let (o4, o6) =
+        (w.os.readback(GUID_A, Family::Ipv4).unwrap(), w.os.readback(GUID_A, Family::Ipv6).unwrap());
+    let eng0 = w.engine();
+    assert_eq!(
+        eng0.takeover(&[GUID_A.to_string()], &plan_provider(Provider::Cloudflare)).unwrap().outcome,
+        Outcome::Active
+    );
+    // Die after the Complete marker is flushed but before the tombstone.
+    let eng1 = w.engine().with_hook(Rc::new(|p| {
+        if p == DeathPoint::CompleteMarkerFlushed {
+            panic!("U04b death at complete marker");
+        }
+    }));
+    let res = catch_unwind(AssertUnwindSafe(|| eng1.restore()));
+    assert!(res.is_err(), "restore must die at the complete marker");
+    recover(&w);
+    let tx = journal_tx(&w).expect("Phase::Complete survives the crash");
+    assert_eq!(tx.phase, Phase::Complete);
+    // Arrival re-drives the Complete branch via the driver: tombstone written.
+    let rep = w.driver().notify_arrival(&[GUID_A.to_string()]).unwrap();
+    assert_eq!(rep.outcome, Outcome::VerifiedRestored);
+    assert_eq!(rep.liveness, Some(OwnerLiveness::Dead));
+    assert!(w.os.readback(GUID_A, Family::Ipv4).unwrap().configured_eq(&o4));
+    assert!(w.os.readback(GUID_A, Family::Ipv6).unwrap().configured_eq(&o6));
+    let env = journal_env(&w).expect("tombstone envelope");
+    assert!(env.is_clean_tombstone(), "arrival tombstones under the lock");
+
+    // Same crash window, re-driven via the engine with a hook that observes
+    // the lock held across TombstoneFlushed: holder pid is the arrival
+    // engine's pid and a second acquire times out until the pass returns.
+    let w2 = World::new();
+    w2.static_adapter(GUID_A);
+    let eng0 = w2.engine();
+    assert_eq!(
+        eng0.takeover(&[GUID_A.to_string()], &plan_provider(Provider::Cloudflare)).unwrap().outcome,
+        Outcome::Active
+    );
+    let eng1 = w2.engine().with_hook(Rc::new(|p| {
+        if p == DeathPoint::CompleteMarkerFlushed {
+            panic!("U04b death at complete marker");
+        }
+    }));
+    let res = catch_unwind(AssertUnwindSafe(|| eng1.restore()));
+    assert!(res.is_err());
+    recover(&w2);
+    assert_eq!(journal_tx(&w2).expect("tx").phase, Phase::Complete);
+    use std::cell::Cell;
+    let saw = Rc::new(Cell::new(false));
+    let saw_hook = Rc::clone(&saw);
+    let lock_clone = w2.lock.peer(4242, 0);
+    let hook = Rc::new(move |p| {
+        if p == DeathPoint::TombstoneFlushed {
+            assert!(lock_clone.is_held(), "tombstone must commit with lock held");
+            assert_eq!(
+                lock_clone.holder().expect("holder").pid, 4242,
+                "holder pid is the arrival engine's pid"
+            );
+            let contender = lock_clone.peer(9999, 0);
+            assert!(
+                matches!(contender.acquire(LOCK_BUDGET), Err(LockError::Timeout)),
+                "second acquire times out while arrival pass holds the lock"
+            );
+            saw_hook.set(true);
+        }
+    });
+    let eng2 = w2.engine().with_hook(hook);
+    let rep2 = eng2.run_arrival_pass(&[GUID_A.to_string()]).unwrap();
+    assert_eq!(rep2.outcome, Outcome::VerifiedRestored);
+    assert!(saw.get(), "TombstoneFlushed hook must run under the lock");
+    assert!(!w2.lock.is_held(), "lock released after the pass returns");
+    let env2 = journal_env(&w2).expect("tombstone envelope");
+    assert!(env2.is_clean_tombstone());
 }

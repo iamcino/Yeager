@@ -1690,8 +1690,11 @@ impl<F: JournalFs> TransactionEngine<F> {
         }
         if tx.phase == Phase::Complete {
             // Crash between the complete marker and the tombstone: finish the
-            // sweep (all-original verifies, anything else stays debt).
-            drop(guard);
+            // sweep under the machine lock (all-original verifies, anything
+            // else stays debt). The guard stays alive across finish_restore
+            // so the tombstone commit and obsolete cleanup run with the mutex
+            // held (FakeLock is not reentrant).
+            let _held = guard;
             return self.finish_restore();
         }
         let wanted: std::collections::HashSet<&str> =
