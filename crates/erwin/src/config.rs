@@ -4,11 +4,13 @@ use common::Config;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Count of write failures surfaced through the logged error path.
+/// Count of write failures surfaced through `save`'s logged error path.
 ///
 /// Test hook: `save` returns `()` so a regression that discards the error
-/// would otherwise stay green. Every surfacing log increments this counter,
-/// so tests can assert the surfacing itself, not only `try_save`'s `Err`.
+/// would otherwise stay green. Only `save`'s own error branch increments
+/// this counter — `try_save` surfaces failures through its `Err` return and
+/// never touches the counter — so tests can assert the surfacing belongs to
+/// `save` itself, not only that `try_save` failed.
 static SAVE_FAILURE_SURFACED: AtomicU64 = AtomicU64::new(0);
 
 /// Number of config write failures surfaced via the logged error so far.
@@ -119,10 +121,12 @@ pub fn save(cfg: &Config) {
 }
 
 /// Fallible save for callers (and tests) that need to observe write failures.
+///
+/// Surfaces failures through the returned `Err` only: it never touches
+/// [`save_failure_surfacing_count`], so that counter observes `save` alone.
 pub fn try_save(cfg: &Config) -> std::io::Result<()> {
     save_to(&path(), cfg).map_err(|e| {
         eprintln!("Yeager config: failed to save {}: {e}", path().display());
-        note_save_failure_surfaced();
         e
     })
 }
@@ -299,12 +303,15 @@ mod tests {
         let before_try = save_failure_surfacing_count();
         let err = try_save(&Config::default()).expect_err("try_save must fail when dir is a file");
         assert!(!err.to_string().is_empty());
-        assert!(
-            save_failure_surfacing_count() > before_try,
-            "try_save must surface the write error through the logged path"
+        assert_eq!(
+            save_failure_surfacing_count(),
+            before_try,
+            "try_save surfaces via its Err return and must not touch save's counter"
         );
         // `save()` logs instead of panicking on the same failure: assert the
-        // surfacing itself, so a `save` that discards the error again fails.
+        // surfacing itself. Only `save`'s error branch increments the
+        // counter, so a `save` that discards the error again (`let _ =
+        // try_save(cfg)`) leaves the counter flat and fails here.
         let before_save = save_failure_surfacing_count();
         save(&Config::default());
         assert!(

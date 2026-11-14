@@ -2197,12 +2197,14 @@ mod geometry_tests {
         let before_try = erwin::config::save_failure_surfacing_count();
         let err = erwin::config::try_save(&Config::default()).expect_err("try_save must surface error");
         assert!(!err.to_string().is_empty());
-        assert!(
-            erwin::config::save_failure_surfacing_count() > before_try,
-            "try_save must surface the write error through the logged path"
+        assert_eq!(
+            erwin::config::save_failure_surfacing_count(),
+            before_try,
+            "try_save surfaces via its Err return and must not touch save's counter"
         );
-        // Assert the surfacing itself: a `save` that discards the error again
-        // leaves the counter flat and fails here.
+        // Assert the surfacing itself: only `save`'s error branch increments
+        // the counter, so a `save` that discards the error again (`let _ =
+        // try_save(cfg)`) leaves the counter flat and fails here.
         let before_save = erwin::config::save_failure_surfacing_count();
         erwin::config::save(&Config::default());
         assert!(
