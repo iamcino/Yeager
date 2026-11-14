@@ -160,6 +160,10 @@ pub(crate) enum LegacyCleanup {
     Removed,
     /// Directory is a reparse point: skipped without traversing or deleting.
     SkippedReparse,
+    /// Directory attributes are unreadable: skipped without traversing or
+    /// deleting (fail-closed — an unreadable reparse point must not be
+    /// treated as an ordinary directory).
+    SkippedUnreadable,
     /// Best-effort removal failed partway; start proceeds anyway.
     Partial,
 }
@@ -190,6 +194,12 @@ pub fn cleanup_legacy_temp_dir() {
                 legacy_temp_dir().display()
             );
         }
+        LegacyCleanup::SkippedUnreadable => {
+            eprintln!(
+                "[!] Legacy driver directory {} attributes unreadable; left alone (not traversed)",
+                legacy_temp_dir().display()
+            );
+        }
         LegacyCleanup::Partial => {
             eprintln!(
                 "[!] Legacy driver directory {} could not be fully removed; left alone",
@@ -204,8 +214,13 @@ fn cleanup_legacy_temp_dir_at(temp_root: &Path) -> LegacyCleanup {
     if !dir.exists() {
         return LegacyCleanup::Gone;
     }
-    if is_reparse_point(&dir) {
-        return LegacyCleanup::SkippedReparse;
+    match is_reparse_point(&dir) {
+        // Unreadable attributes fail closed: an unreadable reparse point is
+        // indistinguishable from an ordinary directory to a fail-open check,
+        // so the cleanup is skipped instead of proceeding into `remove_file`.
+        None => return LegacyCleanup::SkippedUnreadable,
+        Some(true) => return LegacyCleanup::SkippedReparse,
+        Some(false) => {}
     }
     // Delete only the two known files by name. Errors are tolerated: a file
     // may be absent, or locked by a still-running old build.
@@ -225,10 +240,13 @@ fn cleanup_legacy_temp_dir_at(temp_root: &Path) -> LegacyCleanup {
     }
 }
 
-/// True when `path` itself is a reparse point (junction/symlink). Missing
-/// paths report false.
+/// Returns `Some(true)` when `path` itself is a reparse point
+/// (junction/symlink), `Some(false)` for an ordinary directory, and `None`
+/// when the attributes cannot be read. `None` must be treated as "do not
+/// touch": an unreadable reparse point is exactly what a fail-open check
+/// would mistake for an ordinary directory.
 #[cfg(windows)]
-fn is_reparse_point(path: &Path) -> bool {
+fn is_reparse_point(path: &Path) -> Option<bool> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
     };
@@ -238,14 +256,18 @@ fn is_reparse_point(path: &Path) -> bool {
         .chain(std::iter::once(0))
         .collect();
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
-    attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        return None;
+    }
+    Some((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
 #[cfg(not(windows))]
-fn is_reparse_point(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+fn is_reparse_point(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Some(m.file_type().is_symlink()),
+        Err(_) => None,
+    }
 }
 
 /// Creates the protected driver directory (parent `%ProgramData%\Yeager` and
@@ -825,6 +847,29 @@ mod tests {
         dir
     }
 
+    /// Removes a scratch test directory without any recursive delete: named
+    /// entries first (junctions/symlinks removed as links, never followed),
+    /// then `remove_dir` bottom-up. Mirrors the production discipline — this
+    /// package never calls `remove_dir_all`, not even in test teardown.
+    fn remove_test_tree(path: &Path) {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_real_dir = std::fs::symlink_metadata(&p)
+                    .map(|m| m.file_type().is_dir())
+                    .unwrap_or(false);
+                if is_real_dir {
+                    remove_test_tree(&p);
+                } else if std::fs::remove_file(&p).is_err() {
+                    // Junctions and other reparse points: remove the link
+                    // itself (never the target) as a directory.
+                    let _ = std::fs::remove_dir(&p);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(path);
+    }
+
     #[test]
     fn driver_dir_is_programdata_yeager_driver() {
         let selected = driver_dir_for(OsStr::new("C:\\ProgramData"));
@@ -925,7 +970,7 @@ mod tests {
             true
         );
         assert_eq!(std::fs::read(&dest).unwrap(), embedded);
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[test]
@@ -941,7 +986,7 @@ mod tests {
             true
         );
         assert_eq!(std::fs::read(&dest).unwrap(), embedded);
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[test]
@@ -963,7 +1008,7 @@ mod tests {
             std::fs::metadata(&dest).unwrap().modified().unwrap(),
             before
         );
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[test]
@@ -981,7 +1026,7 @@ mod tests {
         assert!(!legacy.join(WINDIVERT_DLL_NAME).exists());
         assert!(!legacy.join(WINDIVERT_SYS_NAME).exists());
         assert!(legacy.join("notes.txt").exists());
-        std::fs::remove_dir_all(&root).ok();
+        remove_test_tree(&root);
     }
 
     #[test]
@@ -993,14 +1038,14 @@ mod tests {
         std::fs::write(legacy.join(WINDIVERT_SYS_NAME), b"old").unwrap();
         assert_eq!(cleanup_legacy_temp_dir_at(&root), LegacyCleanup::Removed);
         assert!(!legacy.exists());
-        std::fs::remove_dir_all(&root).ok();
+        remove_test_tree(&root);
     }
 
     #[test]
     fn legacy_cleanup_is_gone_when_absent() {
         let root = unique_dir("legacy-gone");
         assert_eq!(cleanup_legacy_temp_dir_at(&root), LegacyCleanup::Gone);
-        std::fs::remove_dir_all(&root).ok();
+        remove_test_tree(&root);
     }
 
     #[cfg(windows)]
@@ -1014,7 +1059,7 @@ mod tests {
             err.contains("not protected") || err.contains("write/create"),
             "unexpected error: {err}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[cfg(windows)]
@@ -1129,7 +1174,267 @@ mod tests {
             err.contains("write/create"),
             "must fail on the hostile ACE, got: {err}"
         );
-        std::fs::remove_dir_all(&root).ok();
+        remove_test_tree(&root);
+    }
+
+    /// Enables a process privilege (e.g. `SeRestorePrivilege`) that is
+    /// present but disabled by default in elevated test runs, so the test
+    /// can assign an arbitrary directory owner.
+    #[cfg(windows)]
+    fn enable_privilege(name: windows_sys::core::PCWSTR) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            ) == 0
+            {
+                return Err(format!("OpenProcessToken failed (code {})", GetLastError()));
+            }
+            struct HandleGuard(*mut std::ffi::c_void);
+            impl Drop for HandleGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+            let _guard = HandleGuard(token);
+            let mut luid = std::mem::zeroed::<windows_sys::Win32::Foundation::LUID>();
+            if LookupPrivilegeValueW(std::ptr::null(), name, &mut luid) == 0 {
+                return Err(format!(
+                    "LookupPrivilegeValueW failed (code {})",
+                    GetLastError()
+                ));
+            }
+            let state = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            if AdjustTokenPrivileges(
+                token,
+                0,
+                &state,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(format!(
+                    "AdjustTokenPrivileges failed (code {})",
+                    GetLastError()
+                ));
+            }
+            if GetLastError() != 0 {
+                return Err(format!(
+                    "privilege not held by the test process (code {})",
+                    GetLastError()
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_owner_fails_verification() {
+        // A pre-existing directory whose owner is neither Administrators nor
+        // SYSTEM must fail closed with the owner error — even when the DACL
+        // is otherwise properly protected (protected flag set, no foreign
+        // write ACEs), so this reaches the owner gate that
+        // `unprotected_dir_fails_verification` never gets to (it trips the
+        // protected-flag gate first).
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+            SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+            TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+        };
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE, SE_RESTORE_NAME,
+            WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+        };
+        use windows_sys::core::PWSTR;
+
+        let root = unique_dir("wrong-owner");
+        let dir = root.join("Yeager");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Protected DACL with the correct shape: Admin + SYSTEM full
+        // control, Users read + execute only, inheritance OFF.
+        let mut admin_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut system_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut users_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        for (kind, buf) in [
+            (WinBuiltinAdministratorsSid, &mut admin_sid),
+            (WinLocalSystemSid, &mut system_sid),
+            (WinBuiltinUsersSid, &mut users_sid),
+        ] {
+            let mut size = buf.len() as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        kind,
+                        std::ptr::null_mut(),
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        &mut size,
+                    )
+                },
+                0
+            );
+        }
+        let trustee = |sid: &mut [u8]| TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstrName: sid.as_mut_ptr() as PWSTR,
+        };
+        let inheritance = windows_sys::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        let entries = [
+            EXPLICIT_ACCESS_W {
+                grfAccessPermissions: windows_sys::Win32::Foundation::GENERIC_ALL,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: inheritance,
+                Trustee: trustee(&mut admin_sid),
+            },
+            EXPLICIT_ACCESS_W {
+                grfAccessPermissions: windows_sys::Win32::Foundation::GENERIC_ALL,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: inheritance,
+                Trustee: trustee(&mut system_sid),
+            },
+            EXPLICIT_ACCESS_W {
+                grfAccessPermissions: {
+                    use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ};
+                    GENERIC_READ | GENERIC_EXECUTE
+                },
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: inheritance,
+                Trustee: trustee(&mut users_sid),
+            },
+        ];
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                SetEntriesInAclW(
+                    entries.len() as u32,
+                    entries.as_ptr(),
+                    std::ptr::null(),
+                    &mut acl,
+                )
+            },
+            ERROR_SUCCESS
+        );
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe {
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl,
+                    std::ptr::null(),
+                )
+            },
+            ERROR_SUCCESS
+        );
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(acl as *mut std::ffi::c_void);
+        }
+
+        // Re-own the directory to Users (neither Administrators nor SYSTEM).
+        // Needs SeRestorePrivilege: present but disabled by default in the
+        // elevated test runs this suite requires.
+        enable_privilege(SE_RESTORE_NAME).expect("test process must hold SeRestorePrivilege");
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                users_sid.as_mut_ptr() as *mut std::ffi::c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            rc, ERROR_SUCCESS,
+            "re-owning the scratch dir to Users must succeed"
+        );
+
+        let err = verify_protected_dir(&dir).expect_err("non-admin owner must fail closed");
+        assert!(
+            err.contains("unexpected owner"),
+            "must fail on the owner gate, got: {err}"
+        );
+        remove_test_tree(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_cleanup_skips_reparse_point_and_keeps_canary() {
+        // The legacy dir as a junction (reparse point) with a canary file at
+        // the target: cleanup must report `SkippedReparse` and the canary
+        // must survive untouched — nothing through the link may be deleted.
+        let root = unique_dir("legacy-reparse");
+        let target = root.join("real-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("canary.txt"), b"do not touch").unwrap();
+        let legacy = root.join(LEGACY_TEMP_SUBDIR);
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &legacy.to_string_lossy().into_owned(),
+                &target.to_string_lossy().into_owned(),
+            ])
+            .status()
+            .expect("mklink must spawn");
+        assert!(status.success(), "mklink /J must succeed");
+        assert!(
+            is_reparse_point(&legacy).unwrap_or(false),
+            "legacy dir must read back as a reparse point"
+        );
+
+        let outcome = cleanup_legacy_temp_dir_at(&root);
+        assert_eq!(outcome, LegacyCleanup::SkippedReparse);
+
+        // The link itself is still there and the target is untouched.
+        assert!(
+            std::fs::symlink_metadata(&legacy)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the junction itself must not have been removed"
+        );
+        assert_eq!(
+            std::fs::read(target.join("canary.txt")).unwrap(),
+            b"do not touch",
+            "canary behind the junction must survive"
+        );
+
+        // Teardown removes the junction itself (never the target), then the
+        // named files and directories — no recursive delete.
+        std::fs::remove_dir(&legacy).expect("junction removal must succeed");
+        remove_test_tree(&root);
     }
 
     #[cfg(windows)]
@@ -1141,7 +1446,7 @@ mod tests {
         ensure_admin_only_dir(&leaf).expect("admin setup must succeed");
         verify_protected_dir(&root.join("Yeager")).expect("parent must verify");
         verify_protected_dir(&leaf).expect("leaf must verify");
-        std::fs::remove_dir_all(&root).ok();
+        remove_test_tree(&root);
     }
 
     #[cfg(windows)]
@@ -1184,7 +1489,7 @@ mod tests {
             res.expect("matching hash must not touch the locked file"),
             false
         );
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[cfg(windows)]
@@ -1225,7 +1530,7 @@ mod tests {
             res.is_err(),
             "locked mismatch must fail closed, got {res:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 
     #[test]
@@ -1250,6 +1555,6 @@ mod tests {
             elapsed.as_secs() < 2,
             "extraction step took {elapsed:?}, expected < 2 s even in debug"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        remove_test_tree(&dir);
     }
 }

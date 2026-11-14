@@ -960,46 +960,62 @@ mod tests {
 
     #[test]
     fn real_extraction_step_stays_fast() {
-        // Owner yardstick: the extraction step — hash + conditional write of
-        // the real embedded driver files — stays well under 0.1 s. The
-        // release-mode number is the gate evidence (printed in both modes);
-        // debug builds only print, never fail on the clock.
+        // Owner yardstick: hashing the REAL embedded driver files
+        // (`WinDivert.dll` + `WinDivert64.sys`) stays well under 0.1 s. Both
+        // arms are timed — the write path and the hash-match path — through
+        // the protected-store sync itself (`sync_embedded_file`, never the
+        // `--driver-dir` override short-circuit), so the release assert can
+        // fail if hashing the real files is slow. Debug builds only print
+        // the figure, never fail on the clock.
         let mut dir = std::env::temp_dir();
         dir.push(format!("yeager-p0driver-realtiming-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dll = dir.join("WinDivert.dll");
+        let sys = dir.join("WinDivert64.sys");
+        // Stale files from a previous run: named removal + remove_dir only.
+        for stale in [&dll, &sys] {
+            let _ = std::fs::remove_file(stale);
+        }
+        let _ = std::fs::remove_dir(&dir);
         std::fs::create_dir_all(&dir).expect("timing dir must be creatable");
         let t0 = std::time::Instant::now();
-        let dll_path = driver_store::ensure_driver_extracted_with_override(
-            WINDIVERT_DLL,
-            WINDIVERT_SYS,
-            Some(&dir),
-        )
-        .expect("extraction into temp override must succeed");
-        // Second run: everything matches, nothing is rewritten.
-        let dll_path2 = driver_store::ensure_driver_extracted_with_override(
-            WINDIVERT_DLL,
-            WINDIVERT_SYS,
-            Some(&dir),
-        )
-        .expect("re-verification must succeed");
-        let elapsed = t0.elapsed();
+        assert!(
+            driver_store::sync_embedded_file(&dll, WINDIVERT_DLL)
+                .expect("first write must succeed"),
+            "missing file must be written"
+        );
+        assert!(
+            driver_store::sync_embedded_file(&sys, WINDIVERT_SYS)
+                .expect("first write must succeed"),
+            "missing file must be written"
+        );
+        let write_elapsed = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        assert!(
+            !driver_store::sync_embedded_file(&dll, WINDIVERT_DLL)
+                .expect("re-verification must succeed"),
+            "hash match must not rewrite"
+        );
+        assert!(
+            !driver_store::sync_embedded_file(&sys, WINDIVERT_SYS)
+                .expect("re-verification must succeed"),
+            "hash match must not rewrite"
+        );
+        let match_elapsed = t1.elapsed();
+        let total = t0.elapsed();
         eprintln!(
-            "real extraction step (embedded {} + {} bytes): {:?}",
+            "real extraction step (embedded {} + {} bytes): write {write_elapsed:?}, re-verify {match_elapsed:?}, total {total:?}",
             WINDIVERT_DLL.len(),
             WINDIVERT_SYS.len(),
-            elapsed
         );
-        assert_eq!(dll_path, dll_path2);
-        // Override dirs are used as-is (the user's own build): nothing is
-        // written there by the extraction step.
-        assert_eq!(dll_path, dir.join("WinDivert.dll"));
         if !cfg!(debug_assertions) {
             assert!(
-                elapsed.as_millis() < 100,
-                "extraction step took {elapsed:?}, yardstick is < 0.1 s"
+                total.as_millis() < 100,
+                "extraction step took {total:?}, yardstick is < 0.1 s"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dll);
+        let _ = std::fs::remove_file(&sys);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
