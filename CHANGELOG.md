@@ -8,6 +8,9 @@ All notable changes to Yeager are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **WinDivert driver planting hole (P0):** the engine no longer loads its driver from the user-writable `%TEMP%\Yeager_bin`. On every start the embedded `WinDivert.dll` / `WinDivert64.sys` are hash-verified (SHA-256) against the build and refreshed on mismatch inside the protected `%ProgramData%\Yeager\driver` store (Administrators + SYSTEM full control, Users read/execute only, inheritance off, owner and DACL re-verified on every start, fail closed on mismatch). A same-user planted DLL in the old temp directory is never loaded; the legacy directory is swept best-effort (reparse points are never traversed). Personal driver builds can still be substituted via the `--driver-dir <path>` flag on both `yeager.exe` and `levi.exe` — never via `config.json` or the environment.
+
 ## [1.1.6] - 2026-11-13
 
 ### Changed

@@ -8,6 +8,9 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Sửa lỗi
+- **Lỗ hổng cài driver WinDivert (P0):** engine không còn nạp driver từ `%TEMP%\Yeager_bin` mà tài khoản thường cũng ghi được. Mỗi lần khởi động, `WinDivert.dll` / `WinDivert64.sys` nhúng trong bản build được kiểm tra SHA-256 và chép lại khi khác, đặt trong `%ProgramData%\Yeager\driver` được bảo vệ (chỉ Administrators + SYSTEM được ghi, Users chỉ đọc/chạy, tắt kế thừa, kiểm tra lại chủ sở hữu và DACL mỗi lần khởi động, sai là dừng chứ không chạy tiếp). File DLL kẻ khác cài sẵn trong thư mục temp cũ không bao giờ được nạp; thư mục cũ được dọn khi có thể (gặp reparse point thì bỏ qua, không đi vào). Muốn dùng bản driver của riêng mình thì truyền cờ `--driver-dir <đường dẫn>` cho `yeager.exe` hoặc `levi.exe` — không đọc từ `config.json` hay biến môi trường.
+
 ## [1.1.6] - 2026-11-13
 
 ### Thay đổi
