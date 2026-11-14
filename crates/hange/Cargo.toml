@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 common.workspace = true
+dns-recovery.workspace = true
+serde_json.workspace = true
 hickory-proto = "0.26"
 hickory-net = { version = "0.26", features = ["h3-ring", "https-ring", "rustls-platform-verifier"] }
 futures-util = { version = "0.3", default-features = false }
