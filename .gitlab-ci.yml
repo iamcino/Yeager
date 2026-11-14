@@ -17,7 +17,8 @@
 #   CODESIGN_PFX_PASSWORD  its password (masked, protected)
 #   GITLAB_TOKEN           optional; only if the job token may not create releases
 #
-# levi is excluded everywhere: it is never built for or shipped with a release.
+# levi ships no binary of its own: the package is left out of the release build and
+# never ships, but its tests DO run in the check job below (cargo test -p levi).
 
 stages: [test, release]
 
@@ -65,6 +66,8 @@ check:
   script:
     - *rust
     - cargo test --locked --workspace --exclude levi
+    - if ($LASTEXITCODE -ne 0) { exit 1 }
+    - cargo test --locked -p levi
     - if ($LASTEXITCODE -ne 0) { exit 1 }
     - cargo build --locked --release -p yeager
     - if ($LASTEXITCODE -ne 0) { exit 1 }
