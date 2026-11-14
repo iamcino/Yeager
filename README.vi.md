@@ -56,7 +56,7 @@ cảnh báo, xem [Cảnh báo của Windows và phần mềm diệt virus](#cả
 
 - **Hai phạm vi.** *Toàn bộ* áp dụng cho mọi kết nối HTTPS đi ra. *Theo tên
   miền* chỉ áp dụng cho các tên miền bạn thêm (gồm cả tên miền con, ví dụ
-  `discord.com` hay `medium.com`); mọi trang khác đi thẳng.
+  `discord.com` hay `wikipedia.org`); mọi trang khác đi thẳng.
 - **Bốn cấu hình.** *Tự động* (mặc định) và *Tối ưu tốc độ* không thêm độ trễ,
   hợp với chơi game, cáp quang và đường hầm VPN như WireGuard hay NetBird.
   *Tăng cường* dành cho mạng can thiệp mạnh hơn. *Giám sát* không thay đổi gì,

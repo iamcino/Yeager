@@ -56,7 +56,7 @@ shows a warning, see [Windows and antivirus warnings](#windows-and-antivirus-war
 
 - **Two scopes.** *All* works on every outgoing HTTPS connection. *Domain list*
   works only on the domains you add (subdomains included, such as
-  `discord.com` or `medium.com`); everything else goes straight through.
+  `discord.com` or `wikipedia.org`); everything else goes straight through.
 - **Four profiles.** *Auto* (default) and *Fast* add no delay and suit games,
   fibre and VPN tunnels such as WireGuard or NetBird. *Hardened* is for
   networks that interfere harder. *Observe* changes nothing and only counts
