@@ -1050,6 +1050,47 @@ fn every_setter_call_targets_a_journaled_image() {
 }
 
 #[test]
+fn barrier_crash_same_host_watchdog_restores() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+    host.dispatch(
+        &peer,
+        &request(
+            Operation::Health,
+            Some(OWNER_ID),
+            None,
+            w.health_body(&token, 7, true),
+        ),
+    );
+    // Crash the apply mid-flight at the first intent barrier; the surviving
+    // service watchdog (same host, lease intact) restores exact originals.
+    host.set_hook(std::rc::Rc::new(|p| {
+        if p == crate::transaction::DeathPoint::TransactionCommitted {
+            panic!("synthetic crash at TransactionCommitted");
+        }
+    }));
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        host.dispatch(
+            &peer,
+            &request(Operation::Apply, Some(OWNER_ID), None, w.apply_body(&token, 7)),
+        );
+    }));
+    assert!(crashed.is_err());
+    w.probe.kill(PID);
+    let report = host
+        .on_owner_death(OWNER_ID)
+        .expect("dead owner restores");
+    assert_eq!(report.outcome, Outcome::VerifiedRestored);
+    assert_eq!(os_configured(&w, Family::Ipv4).0, V4_ORIG);
+    assert_eq!(os_configured(&w, Family::Ipv6).0, V6_ORIG);
+}
+
+#[test]
 fn unknown_version_and_oversized_frames_never_reach_dispatch() {
     // The codec is the boundary: these byte strings must fail decode, so no
     // Request value — and no lease/journal access — can be constructed.
