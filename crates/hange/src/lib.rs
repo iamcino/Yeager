@@ -13,12 +13,26 @@
 //! than plaintext. If port 53 is taken, or the stub is switched off, only
 //! Windows DoH is used.
 
+mod coordinator;
+mod plan;
 mod pool;
+mod service;
 mod stub;
 mod system;
 mod upstream;
 
+pub use coordinator::{
+    CoordError, Coordinator, ListenerBinder, ManagedListener, ManagedStatus, RealBinder,
+    Supervision, STOP_BOUND,
+};
+pub use plan::{
+    bound_endpoints, check_plan_rules, classify_bind, desired_plan, is_planned_loopback,
+    local_refs, service_provider, v4_loopback, v6_loopback, ListenerMode, ListenerPlan,
+    LOOPBACK_PORT,
+};
 pub use pool::{Choice, PoolStatus, AUTO_PROVIDERS};
+pub use service::{DnsService, HostClient, PipeClient, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE};
+pub use stub::ShutdownOutcome;
 pub use upstream::{Stat, Transport};
 
 use common::{DohProvider, Error, Result};
