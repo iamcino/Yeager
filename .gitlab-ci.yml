@@ -16,10 +16,12 @@
 #   CODESIGN_PFX_BASE64    the signing PFX, base64 (masked, protected)
 #   CODESIGN_PFX_PASSWORD  its password (masked, protected)
 #   GITLAB_TOKEN           optional; only if the job token may not create releases
+#   VT_API_KEY             VirusTotal key for the scan job (masked, protected); the
+#                          same key the GitHub virustotal workflow uses.
 #
 # levi is excluded everywhere: it is never built for or shipped with a release.
 
-stages: [test, release]
+stages: [test, release, scan]
 
 default:
   tags: [yeager-windows]
@@ -96,3 +98,20 @@ release:
       } finally {
         Remove-Item $pfx -Force -ErrorAction SilentlyContinue
       }
+
+# Scans the published release executables with VirusTotal and attaches
+# virustotal-<tag>.json to the GitLab release, the twin of the GitHub virustotal
+# workflow. Stage order holds it until the release job has succeeded; on master
+# that means after the manual release job is played. allow_failure on purpose:
+# the release is already published at this point and a VirusTotal problem must
+# never fail it - but the wrapper itself exits non-zero on a missing key, a
+# checksum mismatch or an unreadable release, so failures stay visible.
+virustotal:
+  stage: scan
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "merge_request_event"
+  allow_failure: true
+  timeout: 30m
+  script:
+    - .\tools\virustotal\scan-gitlab.ps1

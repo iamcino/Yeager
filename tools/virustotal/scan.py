@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Yeager VirusTotal Reference Scan Sidecar.
+"""VirusTotal Reference Scan Sidecar.
 
 Submits release executables (.exe) to VirusTotal and polls results
-bounded by an overall deadline.
+bounded by an overall deadline. Zero external dependencies (standard library only).
 """
 
 import datetime
 import glob
+import hashlib
 import json
 import os
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +23,7 @@ _last = 0.0
 
 
 def throttle():
+    """Throttle requests to stay within VirusTotal Free Tier limit (4 req/min)."""
     global _last
     wait = 45.0 - (time.time() - _last)
     if wait > 0:
@@ -31,6 +32,7 @@ def throttle():
 
 
 def iso_utc(ts):
+    """Converts unix timestamp to ISO 8601 UTC string."""
     if not ts:
         return None
     try:
@@ -40,6 +42,7 @@ def iso_utc(ts):
 
 
 def extract_analysis_entry(sha, finfo):
+    """Extracts standardized analysis result dictionary from VirusTotal file attributes."""
     stats = finfo.get("last_analysis_stats") or {}
     epoch = finfo.get("last_analysis_date")
     entry = {
@@ -71,6 +74,7 @@ def extract_analysis_entry(sha, finfo):
 
 
 def api_request(method, endpoint, headers=None, body=None):
+    """Performs rate-limited HTTPS request to VirusTotal API v3."""
     throttle()
     url = f"https://www.virustotal.com/api/v3{endpoint}"
     req_headers = {"x-apikey": KEY}
@@ -82,6 +86,7 @@ def api_request(method, endpoint, headers=None, body=None):
 
 
 def build_multipart(filename, file_bytes):
+    """Constructs RFC-compliant multipart/form-data payload with field name 'file'."""
     boundary = f"----VTBoundary{uuid.uuid4().hex}"
     header = (
         f"--{boundary}\r\n"
@@ -105,7 +110,8 @@ def main():
 
     # Scope: binary executables (.exe) only
     for f in sorted(glob.glob("dl/*.exe")):
-        sha = subprocess.check_output(["sha256sum", f]).split()[0].decode()
+        with open(f, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()
         link = f"https://www.virustotal.com/gui/file/{sha}"
         fname = os.path.basename(f)
 
@@ -126,7 +132,6 @@ def main():
             continue
         except urllib.error.HTTPError as e:
             if e.code != 404:
-                # Other HTTP errors (e.g. 429 quota or 401 auth)
                 out[fname] = {
                     "sha256": sha,
                     "link": link,
