@@ -21,6 +21,17 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// WinDivert capture filter: outbound only ClientHello-bearing payloads on
+/// 443 (TLS handshake record + ClientHello marker), inbound only TCP RSTs
+/// from 443. `tcp.PayloadLength >= 40` stays BEFORE any `tcp.Payload[i]`
+/// read — WinDivert evaluates left to right, so the length guard is what
+/// makes the byte reads safe. Non-ClientHello outbound traffic simply stops
+/// detouring through userspace; it is not blocked or altered.
+pub const WINDIVERT_FILTER: &str = "(!impostor and outbound and tcp.DstPort == 443 and tcp.PayloadLength >= 40 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01) or (inbound and tcp.SrcPort == 443 and tcp.Rst)";
+
+/// Inbound RST clause, kept byte-for-byte stable (kernel silencer path).
+pub const WINDIVERT_FILTER_INBOUND_RST: &str = "(inbound and tcp.SrcPort == 443 and tcp.Rst)";
+
 const WINDIVERT_DLL: &[u8] = include_bytes!("../../../assets/engine/WinDivert.dll");
 const WINDIVERT_SYS: &[u8] = include_bytes!("../../../assets/engine/WinDivert64.sys");
 
@@ -323,7 +334,8 @@ pub fn should_pass_through(sni: &str, compat_mode: bool, custom_excluded: &[Stri
 /// Transport Layer Resilience & Stabilization Profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResilienceProfile {
-    /// Auto-detects network conditions and adapter MTU (In-Order on tunnels, Hardened on physical).
+    /// Auto: currently selects Fast (In-Order 0ms split) unconditionally —
+    /// no MTU or tunnel detection; kept as a separate profile for future policy.
     #[default]
     Auto,
     /// Fast: In-Order 3-Way Multi-Split (0ms added delay, optimal for gaming, streaming & VPN WireGuard tunnels).
@@ -489,11 +501,12 @@ pub fn start_with_profile_and_driver_dir(
     }
     let api = Arc::new(WinDivertApi::load(&dll_path)?);
 
-    // Surgical WinDivert filter:
-    // Outbound: Port 443 TCP packets with payload >= 40 bytes.
+    // Surgical WinDivert filter (see WINDIVERT_FILTER):
+    // Outbound: only ClientHello-bearing Port 443 payloads (>= 40 bytes
+    // length guard first, then TLS handshake + ClientHello byte prefix).
     // Inbound: Middlebox-injected TCP RST packets from Port 443 to be neutralized.
     // Crucially '!impostor' prevents re-capturing our own injected fragmented packets!
-    let filter = "(!impostor and outbound and tcp.DstPort == 443 and tcp.PayloadLength >= 40) or (inbound and tcp.SrcPort == 443 and tcp.Rst)";
+    let filter = WINDIVERT_FILTER;
     let filter_cstr = std::ffi::CString::new(filter).map_err(|e| e.to_string())?;
 
     let raw_handle = unsafe {
@@ -584,7 +597,7 @@ pub fn start_with_profile_and_driver_dir(
                     1 => true,  // Fast: In-Order 3-Way Split (0ms delay)
                     2 => false, // Hardened: Out-of-Order Multi-Split (with jitter)
                     _ => {
-                        // Auto: Default to In-Order for tunnels/VPNs (MTU <= 1420), zero packet drops
+                        // Auto: selects In-Order unconditionally (same as Fast).
                         true
                     }
                 };
@@ -875,6 +888,32 @@ mod tests {
         // Different server IP -> NOT in window -> MUST be false
         let other_ip = [0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,1,1,1];
         assert!(!tracker.is_in_handshake_window(other_ip, client_port));
+    }
+
+    #[test]
+    fn test_windivert_filter_exact() {
+        // Locks the capture scope: any silent widening/narrowing fails here.
+        assert_eq!(
+            WINDIVERT_FILTER,
+            "(!impostor and outbound and tcp.DstPort == 443 and tcp.PayloadLength >= 40 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01) or (inbound and tcp.SrcPort == 443 and tcp.Rst)"
+        );
+        // Length guard must precede every byte read (WinDivert evaluates left to right).
+        let len_pos = WINDIVERT_FILTER
+            .find("tcp.PayloadLength >= 40")
+            .expect("length guard present");
+        for probe in ["tcp.Payload[0]", "tcp.Payload[1]", "tcp.Payload[5]"] {
+            let p = WINDIVERT_FILTER.find(probe).expect("byte probe present");
+            assert!(len_pos < p, "{probe} must come after the length guard");
+        }
+        // Inbound RST clause is byte-for-byte stable.
+        assert_eq!(
+            WINDIVERT_FILTER_INBOUND_RST,
+            "(inbound and tcp.SrcPort == 443 and tcp.Rst)"
+        );
+        assert!(
+            WINDIVERT_FILTER.contains(WINDIVERT_FILTER_INBOUND_RST),
+            "full filter must embed the inbound clause unchanged"
+        );
     }
 
     #[test]
