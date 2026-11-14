@@ -54,7 +54,14 @@ struct Shown {
 
 /// Builds the tray icon and starts a timer that pumps tray + menu events into
 /// the UI. The returned value must be kept alive for the tray to exist.
-pub fn setup(ui: &MainWindow) -> Option<Rc<TrayState>> {
+///
+/// `last_known_good` is the in-memory normal rectangle shared with the
+/// geometry tracker: re-show restores it when live bounds are invalid, and
+/// never overwrites it with the preferred substitute.
+pub fn setup(
+    ui: &MainWindow,
+    last_known_good: Rc<RefCell<Option<[u32; 2]>>>,
+) -> Option<Rc<TrayState>> {
     // Texts are filled in by `pump`, in the current language. Like EasyKey's:
     // the switch on top with a check mark, then what is running (each opens
     // its page), then the window, updates and quit.
@@ -97,19 +104,24 @@ pub fn setup(ui: &MainWindow) -> Option<Rc<TrayState>> {
     let st = state.clone();
     let timer = Box::leak(Box::new(slint::Timer::default()));
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), move || {
-        pump(&w, &st);
+        pump(&w, &st, &last_known_good);
     });
 
     Some(state)
 }
 
-fn pump(w: &Weak<MainWindow>, st: &TrayState) {
+fn pump(
+    w: &Weak<MainWindow>,
+    st: &TrayState,
+    last_known_good: &Rc<RefCell<Option<[u32; 2]>>>,
+) {
     let Some(ui) = w.upgrade() else { return };
+    let lkg = *last_known_good.borrow();
 
     // Drain everything queued since the last tick, not just one event.
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
         let open_page = |page| {
-            show(&ui);
+            show(&ui, lkg);
             ui.set_page(page);
         };
         if ev.id() == st.toggle.id() {
@@ -122,10 +134,10 @@ fn pump(w: &Weak<MainWindow>, st: &TrayState) {
         } else if ev.id() == st.dns.id() {
             open_page(4);
         } else if ev.id() == st.open.id() {
-            show(&ui);
+            show(&ui, lkg);
         } else if ev.id() == st.update.id() {
             // Offer the version a check found, or look for one.
-            show(&ui);
+            show(&ui, lkg);
             if ui.get_update_version().is_empty() {
                 ui.set_page(1);
                 ui.invoke_check_update();
@@ -139,7 +151,7 @@ fn pump(w: &Weak<MainWindow>, st: &TrayState) {
     while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
         match ev {
             TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-            | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => show(&ui),
+            | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => show(&ui, lkg),
             _ => {}
         }
     }
@@ -260,28 +272,91 @@ pub fn bounds_need_repair(scale: f32, w: f32, h: f32) -> bool {
     !common::is_valid_window_size(w, h)
 }
 
-/// Usable logical work area of the target monitor, if it can be queried.
-/// Falls back to `None` (no clamping) when the query fails.
+/// Usable logical work area of the primary monitor, if it can be queried.
+/// Falls back to `None` (no clamping) when the query fails. This is the
+/// fallback when no window handle exists; prefer
+/// [`work_area_size_for_window`] so the target monitor is used.
 pub fn work_area_size() -> Option<(f32, f32)> {
-    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint,
+    };
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
     unsafe {
+        let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if hmon.is_null() {
+            return None;
+        }
+        let mut info = std::mem::zeroed::<MONITORINFO>();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut info as *mut MONITORINFO as *mut _) == 0 {
+            return None;
+        }
+        let RECT { left, top, right, bottom } = info.rcWork;
+        let (ww, wh) = (right - left, bottom - top);
+        if ww <= 0 || wh <= 0 {
+            return None;
+        }
         let dpi = GetDpiForSystem();
         if dpi == 0 {
             return None;
         }
-        let w = GetSystemMetricsForDpi(SM_CXSCREEN, dpi);
-        let h = GetSystemMetricsForDpi(SM_CYSCREEN, dpi);
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        // System metrics are physical pixels at the queried DPI; convert to
-        // logical pixels.
         let scale = dpi as f32 / 96.0;
         if !scale.is_finite() || scale <= 0.0 {
             return None;
         }
-        Some((w as f32 / scale, h as f32 / scale))
+        Some((ww as f32 / scale, wh as f32 / scale))
+    }
+}
+
+/// Usable logical work area of the monitor the given native window is on.
+///
+/// Uses `MonitorFromWindow` + `GetMonitorInfo` (`rcWork`) and that window's
+/// DPI, converted to logical pixels. Falls back to [`work_area_size`] and
+/// then `None` when the handle or query is unavailable.
+pub fn work_area_size_for_hwnd(hwnd: HWND) -> Option<(f32, f32)> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+    };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+    if hwnd.is_null() {
+        return work_area_size();
+    }
+    unsafe {
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_null() {
+            return work_area_size();
+        }
+        let mut info = std::mem::zeroed::<MONITORINFO>();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut info as *mut MONITORINFO as *mut _) == 0 {
+            return work_area_size();
+        }
+        let (ww, wh) = (info.rcWork.right - info.rcWork.left, info.rcWork.bottom - info.rcWork.top);
+        if ww <= 0 || wh <= 0 {
+            return None;
+        }
+        let mut dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 {
+            dpi = GetDpiForSystem();
+        }
+        if dpi == 0 {
+            return None;
+        }
+        let scale = dpi as f32 / 96.0;
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Some((ww as f32 / scale, wh as f32 / scale))
+    }
+}
+
+/// [`work_area_size_for_hwnd`] for a Slint window, falling back to
+/// [`work_area_size`] when the native handle is not yet available.
+pub fn work_area_size_for_window(ui: &MainWindow) -> Option<(f32, f32)> {
+    match hwnd(ui) {
+        Some(h) => work_area_size_for_hwnd(h).or_else(work_area_size),
+        None => work_area_size(),
     }
 }
 
@@ -289,6 +364,9 @@ pub fn work_area_size() -> Option<(f32, f32)> {
 /// area leaves the size unchanged. When the work area is smaller than the UI
 /// minimum, the UI minimum is honored instead of persisting a temporary
 /// constrained size (see [`common::clamp_window_size_to_work_area`]).
+/// Retained for tests and as the no-window fallback; production re-show and
+/// startup prefer [`clamp_to_work_area_for_window`].
+#[allow(dead_code)]
 pub fn clamp_to_work_area(w: f32, h: f32) -> (f32, f32) {
     match work_area_size() {
         Some((ww, wh)) => common::clamp_window_size_to_work_area(w, h, ww, wh),
@@ -296,12 +374,46 @@ pub fn clamp_to_work_area(w: f32, h: f32) -> (f32, f32) {
     }
 }
 
+/// Same as [`clamp_to_work_area`] but on the target monitor for `ui`.
+pub fn clamp_to_work_area_for_window(ui: &MainWindow, w: f32, h: f32) -> (f32, f32) {
+    match work_area_size_for_window(ui) {
+        Some((ww, wh)) => common::clamp_window_size_to_work_area(w, h, ww, wh),
+        None => (w, h),
+    }
+}
+
+/// What to apply on re-show when live bounds are invalid.
+///
+/// Returns `None` when live bounds are valid (a deliberate resize, including
+/// stable 700x500, must never be replaced). Otherwise returns the
+/// in-memory last-known-good normal rectangle when it is a valid pair, and
+/// preferred 860x600 only when no last-known-good exists. Callers clamp the
+/// result to the target monitor work area and must not persist a preferred
+/// substitute over a real last-known-good.
+pub fn reshow_replacement(
+    scale: f32,
+    w: f32,
+    h: f32,
+    last_known_good: Option<[u32; 2]>,
+) -> Option<(f32, f32)> {
+    if !bounds_need_repair(scale, w, h) {
+        return None;
+    }
+    match last_known_good {
+        Some([lw, lh]) if common::is_valid_window_size_u32(lw, lh) => Some((lw as f32, lh as f32)),
+        _ => Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H)),
+    }
+}
+
 /// Brings the window back from the tray (or from minimized) to the front.
 ///
 /// Reapplies the last-known-good geometry ONLY when the actual bounds are
 /// invalid (e.g. a transient zero/minimized size survived). A valid
-/// deliberate resize is never overridden on tray clicks.
-pub fn show(ui: &MainWindow) {
+/// deliberate resize is never overridden on tray clicks. Preferred 860x600
+/// is used only when no last-known-good exists, and the caller keeps the
+/// stored last-known-good unchanged so a later poll never persists that
+/// preferred substitute over the real size.
+pub fn show(ui: &MainWindow, last_known_good: Option<[u32; 2]>) {
     let _ = ui.show();
     ui.window().set_minimized(false);
     apply_window_chrome(ui);
@@ -310,8 +422,8 @@ pub fn show(ui: &MainWindow) {
     // After unminimize the native bounds settle: repair only if invalid.
     let scale = ui.window().scale_factor();
     let size = ui.window().size().to_logical(scale);
-    if bounds_need_repair(scale, size.width, size.height) {
-        let (w, h) = clamp_to_work_area(common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H);
+    if let Some((rw, rh)) = reshow_replacement(scale, size.width, size.height, last_known_good) {
+        let (w, h) = clamp_to_work_area_for_window(ui, rw, rh);
         ui.window().set_size(slint::LogicalSize::new(w, h));
         eprintln!("Yeager window: repaired invalid bounds on re-show to {w}x{h}");
     }
@@ -601,7 +713,11 @@ pub fn ensure_single_instance(updated: bool) -> SingleInstanceDecision {
 }
 
 /// Shows the window whenever a second launch asks for it.
-pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {
+pub fn watch_show_requests(
+    ui: &MainWindow,
+    guard: &SingleInstanceGuard,
+    last_known_good: Rc<RefCell<Option<[u32; 2]>>>,
+) {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -616,7 +732,7 @@ pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {
         if unsafe { WaitForSingleObject(event as _, 0) } == WAIT_OBJECT_0
             && let Some(ui) = w.upgrade()
         {
-            show(&ui);
+            show(&ui, *last_known_good.borrow());
         }
     });
 }
@@ -701,5 +817,55 @@ mod tests {
         assert!(!bounds_need_repair(1.25, 900.0, 650.0));
         // Deliberate stable 700x500 is valid: never repaired.
         assert!(!bounds_need_repair(1.0, 700.0, 500.0));
+    }
+
+    #[test]
+    fn invalid_reshow_restores_last_known_good() {
+        // Invalid live bounds restore the in-memory last-known-good.
+        assert_eq!(
+            reshow_replacement(1.0, 0.0, 0.0, Some([900, 650])),
+            Some((900.0, 650.0))
+        );
+        assert_eq!(
+            reshow_replacement(1.0, 1.0, 1.0, Some([900, 650])),
+            Some((900.0, 650.0))
+        );
+        assert_eq!(
+            reshow_replacement(0.0, 860.0, 600.0, Some([900, 650])),
+            Some((900.0, 650.0))
+        );
+        // Preferred 860x600 only when no last-known-good exists.
+        assert_eq!(
+            reshow_replacement(1.0, 0.0, 0.0, None),
+            Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H))
+        );
+    }
+
+    #[test]
+    fn valid_deliberate_size_is_not_replaced_on_reshow() {
+        // Valid deliberate sizes, including stable 700x500, need no repair.
+        assert_eq!(reshow_replacement(1.0, 900.0, 650.0, Some([900, 650])), None);
+        assert_eq!(reshow_replacement(1.0, 700.0, 500.0, Some([900, 650])), None);
+        assert_eq!(reshow_replacement(1.0, 700.0, 500.0, Some([700, 500])), None);
+        assert_eq!(reshow_replacement(1.25, 859.0, 671.0, Some([900, 650])), None);
+        // A later poll must not persist the preferred substitute over a real
+        // good: repair picks the real good, never preferred, when it exists.
+        assert_ne!(
+            reshow_replacement(1.0, 0.0, 0.0, Some([900, 650])),
+            Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H))
+        );
+    }
+
+    #[test]
+    fn clamp_uses_common_work_area_rule() {
+        // The platform clamp delegates to the common work-area rule, which
+        // honors the UI minimum instead of persisting a temporary size when
+        // the work area itself is smaller than 700x500.
+        assert_eq!(clamp_to_work_area(1000.0, 800.0), {
+            match work_area_size() {
+                Some((ww, wh)) => common::clamp_window_size_to_work_area(1000.0, 800.0, ww, wh),
+                None => (1000.0, 800.0),
+            }
+        });
     }
 }

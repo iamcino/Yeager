@@ -258,4 +258,35 @@ mod tests {
         assert!(!err.to_string().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn save_and_try_save_surface_write_error() {
+        // The pre-fix `save()` discarded the write `Result`, so helpers alone
+        // passed while the top-level swallow stayed. Exercise `try_save` /
+        // `save` themselves by pointing the config dir at a regular file.
+        let anchor = std::env::temp_dir().join(format!(
+            "erwin-save-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&anchor, b"not-a-dir").unwrap();
+        let prev = std::env::var_os("LOCALAPPDATA");
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &anchor);
+        }
+        let err = try_save(&Config::default()).expect_err("try_save must fail when dir is a file");
+        assert!(!err.to_string().is_empty());
+        // `save()` logs instead of panicking on the same failure.
+        save(&Config::default());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        let _ = std::fs::remove_file(&anchor);
+    }
 }
