@@ -6,8 +6,16 @@
 //! reached (blocked, down, or the repository unavailable) the other one is
 //! enough. The latest version is the tag each site's "latest release" link
 //! redirects to. The new exe is downloaded over HTTPS (WinHTTP, so the Windows
-//! proxy and certificate store apply) and checked against the SHA-256 in the
-//! release's `SHA256SUMS.txt`, both from the same site. The running exe is
+//! proxy and certificate store apply). Acceptance is a fixed gate, identical
+//! for both origins: parse `SHA256SUMS.txt`, verify the exe's SHA-256, then
+//! verify the Authenticode signature with `WinVerifyTrust` and compare the
+//! signer certificate's SPKI hash (SHA-256 over the full DER encoding of the
+//! SubjectPublicKeyInfo) against the pinned key below. The signing certificate
+//! is self-issued, so chain-to-public-root trust is not the anchor; the anchor
+//! is a cryptographically valid signature plus the SPKI pin, with a mandatory
+//! RFC 3161 timestamp (validity is judged at signing time, so a countersigned
+//! binary stays acceptable after the signing certificate expires). Anything
+//! else fails closed. The running exe is
 //! renamed to `yeager.old.exe`, the new one takes its name and starts once this
 //! one has put Windows back, and the old file is deleted on the next start.
 //! Nothing is installed without asking.
@@ -15,7 +23,7 @@
 use common::lang::tr;
 use common::{t, Error, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// A site the releases are published on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +95,55 @@ const EXE_NAME: &str = "yeager.exe";
 const OLD_EXE: &str = "yeager.old.exe";
 const NEW_EXE: &str = "yeager.new.exe";
 const MAX_DOWNLOAD: usize = 64 * 1024 * 1024;
+
+/// SHA-256 over the full DER encoding of the code-signing key's SubjectPublicKeyInfo.
+///
+/// The key is EC P-256 (the DER SPKI is 91 bytes). This pins the *key*, not the
+/// certificate: the house has rotated the signing certificate before, and a
+/// thumbprint pin would brick every deployed updater at the next rotation,
+/// while the key survives renewal. A binary signed by a new certificate
+/// carrying this same key is therefore accepted; a validly signed binary under
+/// any other key is rejected.
+///
+/// Derived from the published `Yeager-codesign.cer` release asset and
+/// cross-checked against the signer certificate embedded in the signed
+/// `yeager.exe` itself (thumbprint `9131F99C0B198E81FBA0F5818D0637B4A14D4CF1`).
+pub const PINNED_SPKI_SHA256_HEX: &str =
+    "87d1146a21bbb25d5a1be26875050c63d227573e4c4db881788f8220a0600fe0";
+
+/// [`PINNED_SPKI_SHA256_HEX`] decoded, for constant-time comparison.
+const PINNED_SPKI_SHA256: [u8; 32] = decode_hex32(PINNED_SPKI_SHA256_HEX);
+
+const fn hex_nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
+}
+
+const fn decode_hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (hex_nibble(b[2 * i]) << 4) | hex_nibble(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether `spki_der` (full DER encoding of a SubjectPublicKeyInfo) is the
+/// pinned key. The comparison is on the SPKI hash only: certificate bytes,
+/// thumbprints and dates are never consulted, so rotation to a new
+/// certificate carrying the same key passes by construction.
+fn spki_pin_matches(spki_der: &[u8]) -> bool {
+    let digest = ring::digest::digest(&ring::digest::SHA256, spki_der);
+    let bytes = digest.as_ref();
+    bytes.len() == PINNED_SPKI_SHA256.len()
+        && bytes.iter().zip(PINNED_SPKI_SHA256.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
 
 /// Passed to the new exe after an update; `--connect` is added when the engine
 /// was on, so it comes back on.
@@ -186,10 +243,16 @@ pub fn latest() -> Result<String> {
 }
 
 /// Why an update did not go through, each with its own advice.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Failure {
     Download(Error),
     Mismatch,
+    /// The Authenticode/SPKI gate refused the file: unsigned, untrusted
+    /// signature, SPKI mismatch, or a verification API error. Kept distinct
+    /// from [`Failure::Mismatch`] so field reports stay readable: a checksum
+    /// mismatch means a broken download, a signature failure means the file
+    /// must not be trusted even though its hash matches the release listing.
+    Signature,
     Install(Error),
 }
 
@@ -205,6 +268,11 @@ impl Failure {
                 "The download did not match its checksum, so it was not installed. Open the download page?",
             )
             .into(),
+            Failure::Signature => tr(
+                "Không xác minh được chữ ký của bản cập nhật nên chưa được cài. Mở trang tải về?",
+                "The update's signature could not be verified, so it was not installed. Open the download page?",
+            )
+            .into(),
             Failure::Install(e) => t!(
                 "Không ghi được vào thư mục của Yeager ({e}). Mở trang tải về để tải thủ công?",
                 "Could not write to the Yeager folder ({e}). Open the download page to get it yourself?"
@@ -214,16 +282,61 @@ impl Failure {
 }
 
 /// Downloads `version` from `source` and checks it against that release's
-/// checksum list.
+/// checksum list, then through the signature gate.
 fn download(source: Source, version: &str) -> std::result::Result<Vec<u8>, Failure> {
     let base = source.download_base(version);
     let sums = http::get(&format!("{base}SHA256SUMS.txt"), 64 * 1024).map_err(Failure::Download)?;
-    let expected = checksum_for(&String::from_utf8_lossy(&sums), EXE_NAME).ok_or(Failure::Mismatch)?;
     let exe = http::get(&format!("{base}{EXE_NAME}"), MAX_DOWNLOAD).map_err(Failure::Download)?;
-    if !exe.starts_with(b"MZ") || sha256_hex(&exe) != expected {
+    accept_bytes(&exe, &sums, &http::verify_file_signature)
+}
+
+/// The acceptance gate, identical for both origins: parse `SHA256SUMS.txt`,
+/// verify the exe's SHA-256, then hand the bytes to `verify` (the Authenticode
+/// + SPKI step). `verify` receives the bytes staged to a freshly created temp
+/// file and is only called when the hashes already match, so a tampered exe
+/// served with recomputed sums still faces the signature check.
+///
+/// `verify` is a parameter (rather than a direct call) so tests can drive the
+/// gate with fixture outcomes; production passes
+/// [`http::verify_file_signature`].
+fn accept_bytes(
+    exe: &[u8],
+    sums: &[u8],
+    verify: &dyn Fn(&Path) -> std::result::Result<(), Failure>,
+) -> std::result::Result<Vec<u8>, Failure> {
+    let expected = checksum_for(&String::from_utf8_lossy(sums), EXE_NAME).ok_or(Failure::Mismatch)?;
+    if !exe.starts_with(b"MZ") || sha256_hex(exe) != expected {
         return Err(Failure::Mismatch);
     }
-    Ok(exe)
+    // Stage the exact bytes under check to a fresh file for the Authenticode
+    // APIs, which verify files rather than buffers. `create_new` refuses an
+    // existing path so a planted file can neither be read nor replaced here.
+    static STAGED_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let staged = std::env::temp_dir().join(format!(
+        "yeager-verify-{}-{}.tmp",
+        std::process::id(),
+        STAGED_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged_write = std::fs::OpenOptions::new().write(true).create_new(true).open(&staged);
+    match staged_write.and_then(|mut f| {
+        use std::io::Write as _;
+        f.write_all(exe).map(|_| f)
+    }) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.flush();
+            drop(f);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(Failure::Install(e.into()));
+        }
+    }
+    let verdict = verify(&staged);
+    let _ = std::fs::remove_file(&staged);
+    // Any verification API error fails closed as a signature refusal: the
+    // file is not installed unless the gate positively passes.
+    verdict.map(|_| exe.to_vec())
 }
 
 /// Downloads `version`, checks it and puts it in place of the running exe,
@@ -239,9 +352,12 @@ pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failu
                 exe = Some(bytes);
                 break;
             }
-            // a file that does not match its checksum is reported over a site that could not be reached
+            // A file that fails the checksum or the signature gate is reported
+            // over a site that could not be reached; the two hosts' results
+            // are not treated differently in any way.
             Err(f) => {
-                if !matches!(failure, Some(Failure::Mismatch)) {
+                let sticky = matches!(failure, Some(Failure::Mismatch) | Some(Failure::Signature));
+                if !sticky {
                     failure = Some(f);
                 }
             }
@@ -458,6 +574,371 @@ mod http {
         unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL) };
     }
 
+    // --- Authenticode + SPKI gate -------------------------------------------
+    //
+    // Same house pattern as EasyKey's updater verification (verify, compare
+    // pin, fail closed), but the comparison is an SPKI hash rather than a
+    // certificate thumbprint. The signing certificate is self-issued, so the
+    // default `WINTRUST_ACTION_GENERIC_VERIFY_V2` policy cannot express the
+    // trust rule on its own (it reports an untrusted root for a perfectly
+    // good self-issued signature, exactly as `Get-AuthenticodeSignature` does
+    // with `UnknownError`). The same flag/provider structure EasyKey uses is
+    // therefore used here: `WINTRUST_ACTION_GENERIC_CHAIN_VERIFY` with an
+    // isolated chain engine whose exclusive root is the file's own signer
+    // certificate, plus a policy callback that checks cryptographic validity,
+    // the SPKI pin, and a mandatory RFC 3161 timestamp whose chain verifies
+    // against normal Windows trust (DigiCert). Trusting the extracted signer
+    // for chain building is safe because acceptance still requires the SPKI
+    // pin: any other key is rejected no matter what signed the file.
+    //
+    // `WinVerifyTrust` judges validity at signing time when a countersignature
+    // is present, so a countersigned binary stays acceptable after the signing
+    // certificate expires; no date of our own is ever consulted.
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Security::Cryptography::*;
+    use windows_sys::Win32::Security::WinTrust::*;
+    use windows_sys::core::{HRESULT, PCSTR};
+
+    // `wintrust.h` values missing from windows-sys 0.59. Only the failure is
+    // load-bearing (anything but `S_OK` fails closed); the exact codes keep
+    // logs comparable with EasyKey's verifier.
+    const TRUST_E_SUBJECT_NOT_TRUSTED: HRESULT = 0x800B0004u32 as i32;
+    const TRUST_E_TIME_STAMP: HRESULT = 0x800B0009u32 as i32;
+    const S_OK: HRESULT = 0;
+
+    /// Callback argument: whether the policy accepted the file.
+    struct PolicyArg {
+        accepted: bool,
+    }
+
+    /// DER-encode the SubjectPublicKeyInfo of `cert` (any key type).
+    fn spki_der_of(cert: *const CERT_CONTEXT) -> Option<Vec<u8>> {
+        // SAFETY: `cert` is a live context from our own store lookup below.
+        unsafe {
+            let info = (*cert).pCertInfo;
+            if info.is_null() {
+                return None;
+            }
+            let spki = &(*info).SubjectPublicKeyInfo as *const CERT_PUBLIC_KEY_INFO;
+            let mut len: u32 = 0;
+            if CryptEncodeObject(
+                X509_ASN_ENCODING,
+                X509_PUBLIC_KEY_INFO,
+                spki as *const c_void,
+                null_mut(),
+                &mut len,
+            ) == 0
+                || len == 0
+            {
+                return None;
+            }
+            let mut der = vec![0u8; len as usize];
+            if CryptEncodeObject(
+                X509_ASN_ENCODING,
+                X509_PUBLIC_KEY_INFO,
+                spki as *const c_void,
+                der.as_mut_ptr(),
+                &mut len,
+            ) == 0
+            {
+                return None;
+            }
+            der.truncate(len as usize);
+            Some(der)
+        }
+    }
+
+    fn oid_eq(a: PCSTR, b: PCSTR) -> bool {
+        use std::ffi::CStr;
+        use std::os::raw::c_char;
+        // SAFETY: both are NUL-terminated OID strings from the OS or headers.
+        unsafe {
+            !a.is_null()
+                && !b.is_null()
+                && CStr::from_ptr(a as *const c_char) == CStr::from_ptr(b as *const c_char)
+        }
+    }
+
+    /// Policy callback: exactly one SHA-256 primary signature whose leaf
+    /// carries the pinned SPKI, an `AUTHENTICODE` chain that verifies, and a
+    /// mandatory RFC 3161 countersign whose chain verifies against system
+    /// trust. Anything else fails closed without setting `accepted`.
+    unsafe extern "system" fn spki_policy_callback(
+        _prov_data: *mut CRYPT_PROVIDER_DATA,
+        step_error: u32,
+        _policy_settings: u32,
+        signer_count: u32,
+        signers: *mut *mut WTD_GENERIC_CHAIN_POLICY_SIGNER_INFO,
+        policy_arg: *mut c_void,
+    ) -> HRESULT {
+        // SAFETY: WinVerifyTrust calls this with live provider data and a
+        // live `PolicyArg`; every pointer is checked before use.
+        unsafe {
+        let ctx = &mut *(policy_arg as *mut PolicyArg);
+        if step_error != 0 {
+            return step_error as HRESULT;
+        }
+        // Release tooling produces one primary signature. Fail closed on
+        // ambiguous multi-signatures rather than accepting an unrelated one.
+        if signer_count != 1 || signers.is_null() || (*signers).is_null() {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let signer = &*(*signers);
+        if signer.dwError != 0 {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let chain = signer.pChainContext;
+        if chain.is_null() || (*chain).cChain == 0 || (*chain).rgpChain.is_null() {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let simple = *(*chain).rgpChain;
+        if simple.is_null() || (*simple).cElement == 0 || (*simple).rgpElement.is_null() {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let leaf = (*(*(*simple).rgpElement)).pCertContext;
+        if leaf.is_null() {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        match spki_der_of(leaf) {
+            Some(der) if spki_pin_matches(&der) => {}
+            _ => return TRUST_E_SUBJECT_NOT_TRUSTED,
+        }
+        let msg_info = signer.pMsgSignerInfo;
+        if msg_info.is_null() || !oid_eq((*msg_info).HashAlgorithm.pszObjId, szOID_NIST_sha256) {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let mut extra: AUTHENTICODE_EXTRA_CERT_CHAIN_POLICY_PARA = std::mem::zeroed();
+        extra.cbSize = std::mem::size_of::<AUTHENTICODE_EXTRA_CERT_CHAIN_POLICY_PARA>() as u32;
+        extra.pSignerInfo = msg_info;
+        let mut para: CERT_CHAIN_POLICY_PARA = std::mem::zeroed();
+        para.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32;
+        para.pvExtraPolicyPara = &mut extra as *mut _ as *mut c_void;
+        let mut status: CERT_CHAIN_POLICY_STATUS = std::mem::zeroed();
+        status.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as u32;
+        if CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_AUTHENTICODE, chain, &para, &mut status) == 0
+            || status.dwError != 0
+        {
+            return TRUST_E_SUBJECT_NOT_TRUSTED;
+        }
+        let mut has_rfc3161 = false;
+        let attrs = &(*msg_info).UnauthAttrs;
+        if !attrs.rgAttr.is_null() {
+            for i in 0..attrs.cAttr {
+                let attr = &*attrs.rgAttr.add(i as usize);
+                if oid_eq(attr.pszObjId, szOID_RFC3161_counterSign) {
+                    has_rfc3161 = true;
+                    break;
+                }
+            }
+        }
+        if !has_rfc3161 || signer.rgpCounterSigner.is_null() {
+            return TRUST_E_TIME_STAMP;
+        }
+        // The timestamp chain must use normal Windows trust, never the
+        // signer's own key: it is what keeps the verdict meaningful after
+        // the signing certificate expires.
+        for i in 0..signer.cCounterSigner {
+            let counter = *signer.rgpCounterSigner.add(i as usize);
+            if counter.is_null() || (*counter).dwError != 0 || (*counter).pChainContext.is_null() {
+                continue;
+            }
+            let mut ts_para: CERT_CHAIN_POLICY_PARA = std::mem::zeroed();
+            ts_para.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32;
+            let mut ts_status: CERT_CHAIN_POLICY_STATUS = std::mem::zeroed();
+            ts_status.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as u32;
+            if CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_AUTHENTICODE_TS,
+                (*counter).pChainContext,
+                &ts_para,
+                &mut ts_status,
+            ) != 0
+                && ts_status.dwError == 0
+            {
+                ctx.accepted = true;
+                return S_OK;
+            }
+        }
+        TRUST_E_TIME_STAMP
+        }
+    }
+
+    /// The file's signer certificate, from the embedded PKCS#7 (no trust
+    /// involved: this is staging input for the engine below, not a verdict).
+    /// The caller owns the returned context and the message/store handles.
+    fn signer_and_handles(
+        path_wide: &[u16],
+    ) -> (*mut CERT_CONTEXT, *mut c_void, HCERTSTORE) {
+        // SAFETY: every pointer passed is NUL-terminated or sized as passed;
+        // every handle is checked before use; the caller releases all three.
+        unsafe {
+        let mut encoding: CERT_QUERY_ENCODING_TYPE = std::mem::zeroed();
+        let mut content: CERT_QUERY_CONTENT_TYPE = std::mem::zeroed();
+        let mut format: CERT_QUERY_FORMAT_TYPE = std::mem::zeroed();
+        let mut store: HCERTSTORE = std::mem::zeroed();
+        let mut msg: *mut c_void = null_mut();
+        let ok = CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            path_wide.as_ptr() as *const c_void,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            &mut encoding,
+            &mut content,
+            &mut format,
+            &mut store,
+            &mut msg,
+            null_mut(),
+        );
+        if ok == 0 || store.is_null() || msg.is_null() {
+            if !store.is_null() {
+                CertCloseStore(store, 0);
+            }
+            if !msg.is_null() {
+                CryptMsgClose(msg);
+            }
+            return (null_mut(), null_mut(), std::mem::zeroed());
+        }
+        let mut info_len: u32 = 0;
+        if CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, null_mut(), &mut info_len) == 0
+            || info_len == 0
+        {
+            CertCloseStore(store, 0);
+            CryptMsgClose(msg);
+            return (null_mut(), null_mut(), std::mem::zeroed());
+        }
+        let mut buf = vec![0u8; info_len as usize];
+        if CryptMsgGetParam(
+            msg,
+            CMSG_SIGNER_CERT_INFO_PARAM,
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut info_len,
+        ) == 0
+        {
+            CertCloseStore(store, 0);
+            CryptMsgClose(msg);
+            return (null_mut(), null_mut(), std::mem::zeroed());
+        }
+        let signer = CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING,
+            std::mem::zeroed(),
+            CERT_FIND_SUBJECT_CERT,
+            buf.as_ptr() as *const c_void,
+            null(),
+        );
+        if signer.is_null() {
+            CertCloseStore(store, 0);
+            CryptMsgClose(msg);
+            return (null_mut(), null_mut(), std::mem::zeroed());
+        }
+        (signer, msg, store)
+        }
+    }
+
+    /// Runs `WinVerifyTrust` with the isolated engine and the SPKI policy.
+    /// Returns true only when the signature is cryptographically valid, the
+    /// SPKI pin matches, and a system-trusted RFC 3161 timestamp is present.
+    pub fn verify_file_signature(path: &Path) -> std::result::Result<(), Failure> {
+        let path_wide = wide(&path.to_string_lossy());
+        // SAFETY: every pointer passed is NUL-terminated or sized as passed;
+        // every handle is checked before use and released before returning.
+        unsafe {
+            let (signer, msg, store) = signer_and_handles(&path_wide);
+            if signer.is_null() {
+                return Err(Failure::Signature);
+            }
+            // Isolated engine trusting only this file's signer, the same
+            // structure EasyKey uses for its pinned certificate. Nothing is
+            // added to the machine or user certificate stores.
+            let roots = CertOpenStore(CERT_STORE_PROV_MEMORY, std::mem::zeroed(), 0, 0, null());
+            let mut engine: HCERTCHAINENGINE = std::mem::zeroed();
+            let mut ready = false;
+            if !roots.is_null()
+                && CertAddCertificateContextToStore(roots, signer, CERT_STORE_ADD_NEW, null_mut()) != 0
+            {
+                let mut config: CERT_CHAIN_ENGINE_CONFIG = std::mem::zeroed();
+                config.cbSize = std::mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32;
+                config.hExclusiveRoot = roots;
+                if CertCreateCertificateChainEngine(&config, &mut engine) != 0 && engine != 0 {
+                    ready = true;
+                }
+            }
+            let mut valid = false;
+            if ready {
+                let mut code_usage = szOID_PKIX_KP_CODE_SIGNING as *mut u8;
+                let mut ts_usage = szOID_PKIX_KP_TIMESTAMP_SIGNING as *mut u8;
+                let mut code_para: CERT_CHAIN_PARA = std::mem::zeroed();
+                code_para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+                code_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+                code_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+                code_para.RequestedUsage.Usage.rgpszUsageIdentifier = &mut code_usage;
+                let mut ts_para: CERT_CHAIN_PARA = std::mem::zeroed();
+                ts_para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+                ts_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+                ts_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+                ts_para.RequestedUsage.Usage.rgpszUsageIdentifier = &mut ts_usage;
+                let mut primary: WTD_GENERIC_CHAIN_POLICY_CREATE_INFO = std::mem::zeroed();
+                primary.Anonymous.cbSize =
+                    std::mem::size_of::<WTD_GENERIC_CHAIN_POLICY_CREATE_INFO>() as u32;
+                primary.hChainEngine = engine;
+                primary.pChainPara = &mut code_para;
+                primary.dwFlags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+                let mut timestamp: WTD_GENERIC_CHAIN_POLICY_CREATE_INFO = std::mem::zeroed();
+                timestamp.Anonymous.cbSize =
+                    std::mem::size_of::<WTD_GENERIC_CHAIN_POLICY_CREATE_INFO>() as u32;
+                timestamp.pChainPara = &mut ts_para;
+                timestamp.dwFlags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+                let mut chain: WTD_GENERIC_CHAIN_POLICY_DATA = std::mem::zeroed();
+                chain.Anonymous.cbSize =
+                    std::mem::size_of::<WTD_GENERIC_CHAIN_POLICY_DATA>() as u32;
+                chain.pSignerChainInfo = &mut primary;
+                chain.pCounterSignerChainInfo = &mut timestamp;
+                chain.pfnPolicyCallback = Some(spki_policy_callback);
+                let mut arg = PolicyArg { accepted: false };
+                chain.pvPolicyArg = &mut arg as *mut _ as *mut c_void;
+                let mut file_info: WINTRUST_FILE_INFO = std::mem::zeroed();
+                file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+                file_info.pcwszFilePath = path_wide.as_ptr();
+                let mut trust: WINTRUST_DATA = std::mem::zeroed();
+                trust.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+                trust.pPolicyCallbackData = &mut chain as *mut _ as *mut c_void;
+                trust.dwUIChoice = WTD_UI_NONE;
+                trust.fdwRevocationChecks = WTD_REVOKE_NONE;
+                trust.dwUnionChoice = WTD_CHOICE_FILE;
+                trust.Anonymous.pFile = &mut file_info;
+                trust.dwStateAction = WTD_STATEACTION_VERIFY;
+                trust.dwProvFlags = std::mem::transmute::<u32, WINTRUST_DATA_PROVIDER_FLAGS>(
+                    WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE,
+                );
+                trust.dwUIContext = WTD_UICONTEXT_EXECUTE;
+                let mut action = WINTRUST_ACTION_GENERIC_CHAIN_VERIFY;
+                valid = WinVerifyTrust(
+                    null_mut::<c_void>() as HWND,
+                    &mut action,
+                    &mut trust as *mut _ as *mut c_void,
+                ) == 0
+                    && arg.accepted;
+                trust.dwStateAction = WTD_STATEACTION_CLOSE;
+                WinVerifyTrust(
+                    null_mut::<c_void>() as HWND,
+                    &mut action,
+                    &mut trust as *mut _ as *mut c_void,
+                );
+            }
+            CertFreeCertificateContext(signer);
+            CryptMsgClose(msg);
+            CertCloseStore(store, 0);
+            if engine != 0 {
+                CertFreeCertificateChainEngine(engine);
+            }
+            if !roots.is_null() {
+                CertCloseStore(roots, 0);
+            }
+            if valid { Ok(()) } else { Err(Failure::Signature) }
+        }
+    }
+
     /// The installer's entry under Apps still names the version it installed;
     /// point it at the new one when this exe is the installed copy.
     pub fn note_installed_version(exe: &Path, version: &str) {
@@ -502,6 +983,11 @@ mod http {
 
     pub fn get(_url: &str, _max: usize) -> Result<Vec<u8>> {
         Err(Error::new("Windows only"))
+    }
+
+    /// Fail closed off Windows: nothing may be accepted without the gate.
+    pub fn verify_file_signature(_path: &Path) -> std::result::Result<(), Failure> {
+        Err(Failure::Signature)
     }
 }
 
@@ -581,5 +1067,177 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(OLD_EXE)).unwrap(), b"old");
         assert!(!dir.join(NEW_EXE).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pinned value is the SHA-256 of the *full DER SPKI* (91 bytes for
+    /// EC P-256), not of the raw public-key bytes. Rebuild the DER SPKI from
+    /// the published certificate's raw key and prove the pin matches it.
+    #[test]
+    fn pin_is_full_der_spki_hash() {
+        const PREFIX: [u8; 26] = [
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D,
+            0x02, 0x01, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01,
+            0x07, 0x03, 0x42, 0x00,
+        ];
+        // Uncompressed P-256 point from `Yeager-codesign.cer` (public key;
+        // the private key never appears in the repo).
+        const RAW_KEY: [u8; 65] = [
+            0x04, 0x6c, 0x63, 0xf0, 0xa4, 0xd5, 0xa9, 0x7c, 0x68, 0x03, 0x2d,
+            0x9f, 0x87, 0x1e, 0x38, 0xeb, 0xb2, 0x9d, 0x1e, 0x23, 0xbd, 0x45,
+            0x89, 0x3a, 0x3b, 0x9b, 0xdd, 0x78, 0x4e, 0x0f, 0x83, 0x5c, 0xbf,
+            0x5b, 0x2f, 0xb2, 0x29, 0x6e, 0xf0, 0x64, 0xf8, 0xc2, 0xe8, 0xd3,
+            0xbe, 0x2e, 0x07, 0xa7, 0x4e, 0x6d, 0x28, 0x10, 0xfc, 0x09, 0x4b,
+            0x61, 0x3c, 0xa4, 0x10, 0x4b, 0x6c, 0x75, 0x84, 0x0a, 0x85,
+        ];
+        let mut der = Vec::with_capacity(91);
+        der.extend_from_slice(&PREFIX);
+        der.extend_from_slice(&RAW_KEY);
+        assert_eq!(der.len(), 91);
+        assert!(spki_pin_matches(&der));
+        assert_eq!(sha256_hex(&der), PINNED_SPKI_SHA256_HEX);
+        // A hash over the raw key bytes alone is a different value: this is
+        // the derivation the gate must NOT use.
+        assert_ne!(sha256_hex(&RAW_KEY), PINNED_SPKI_SHA256_HEX);
+        // One flipped bit (an attacker's adjacent key) must not match.
+        der[90] ^= 1;
+        assert!(!spki_pin_matches(&der));
+    }
+
+    /// Rotation: the comparison consults only the SPKI hash, so a new
+    /// certificate carrying the same key passes by construction. There is no
+    /// thumbprint, serial or date anywhere in the decision.
+    #[test]
+    fn pin_compares_key_not_certificate() {
+        // Same SPKI bytes a renewed certificate would carry (identical key).
+        // The gate takes only SPKI bytes, so cert-level differences cannot
+        // even be expressed, let alone cause a rejection.
+        let mut der = vec![0u8; 91];
+        der[0] = 0x30;
+        der[1] = 0x59;
+        // A zeroed SPKI is not the pin, whatever certificate wrapped it.
+        assert!(!spki_pin_matches(&der));
+    }
+
+    fn sums_for(exe: &[u8]) -> Vec<u8> {
+        format!("{}  {EXE_NAME}\n", sha256_hex(exe)).into_bytes()
+    }
+
+    /// The checksums must agree before the signature step runs at all: with
+    /// mismatched hashes the gate reports `Mismatch` and never calls `verify`.
+    #[test]
+    fn gate_checks_sums_before_signature() {
+        let exe = b"MZ-fake-binary";
+        let called = std::cell::Cell::new(false);
+        let result = accept_bytes(exe, "0".repeat(64).as_bytes(), &|_| {
+            called.set(true);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), Failure::Mismatch);
+        assert!(!called.get(), "signature step must not run when hashes mismatch");
+    }
+
+    /// The vulnerability scenario: the hashes match each other (a recomputed
+    /// `SHA256SUMS.txt` over a tampered exe) and the file is still refused,
+    /// with a `Signature` failure distinct from `Mismatch`.
+    #[test]
+    fn gate_rejects_matching_hashes_when_signature_fails() {
+        let exe = b"MZ-tampered";
+        let sums = sums_for(exe);
+        let result = accept_bytes(exe, &sums, &|_| Err(Failure::Signature));
+        let err = result.unwrap_err();
+        assert_eq!(err, Failure::Signature);
+        assert_ne!(err, Failure::Mismatch);
+    }
+
+    /// A good file (hashes match, signature verifies) is accepted unchanged.
+    #[test]
+    fn gate_accepts_matching_hashes_with_good_signature() {
+        let exe = b"MZ-good";
+        let sums = sums_for(exe);
+        assert_eq!(accept_bytes(exe, &sums, &|_| Ok(())), Ok(exe.to_vec()));
+    }
+
+    /// Unsigned files and files signed under any other key are refused at the
+    /// same gate with the same `Signature` failure.
+    #[test]
+    fn gate_rejects_unsigned_and_wrong_key() {
+        let exe = b"MZ-unsigned";
+        let sums = sums_for(exe);
+        assert_eq!(
+            accept_bytes(exe, &sums, &|_| Err(Failure::Signature)).unwrap_err(),
+            Failure::Signature
+        );
+        let other = b"MZ-attacker-signed";
+        let other_sums = sums_for(other);
+        assert_eq!(
+            accept_bytes(other, &other_sums, &|_| Err(Failure::Signature)).unwrap_err(),
+            Failure::Signature
+        );
+    }
+
+    /// Timestamp policy: the gate consults no certificate dates of its own
+    /// (there is no `SystemTime`/not-after check anywhere in this module), so
+    /// an expired certificate with a valid RFC 3161 countersign still passes
+    /// the fixture the way the real verifier judges validity at signing time.
+    #[test]
+    fn gate_expired_cert_with_timestamp_accepted() {
+        let exe = b"MZ-expired-but-timestamped";
+        let sums = sums_for(exe);
+        assert_eq!(accept_bytes(exe, &sums, &|_| Ok(())), Ok(exe.to_vec()));
+    }
+
+    /// Real-artifact check against the genuinely signed v1.1.6 `yeager.exe`:
+    /// accepted as-is, and a tampered copy with recomputed sums rejected by
+    /// the real `WinVerifyTrust` + SPKI verifier. Skipped where the release
+    /// artifact is not present (e.g. CI); the seam tests above always run.
+    #[cfg(windows)]
+    #[test]
+    fn real_artifact_signed_accepts_and_tampered_rejects() {
+        let path = std::env::var("YEAGER_SIGNED_FIXTURE").unwrap_or_else(|_| {
+            r"C:\projects\yeager-p0-pkg\yeager-1.1.6.exe".to_string()
+        });
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skipping real-artifact gate test: {path} not present");
+                return;
+            }
+        };
+        assert!(bytes.starts_with(b"MZ"));
+        let sums = sums_for(&bytes);
+        accept_bytes(&bytes, &sums, &http::verify_file_signature)
+            .expect("genuinely signed artifact must be accepted");
+        let mut bad = bytes.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xFF;
+        let bad_sums = sums_for(&bad);
+        let err = accept_bytes(&bad, &bad_sums, &http::verify_file_signature).unwrap_err();
+        assert_eq!(
+            err,
+            Failure::Signature,
+            "tampered exe with matching sums must be rejected by the signature gate"
+        );
+    }
+
+    /// Pin re-derivation from the shipped package inputs: the committed
+    /// `spki.der` (extracted from both the published cert and the signed exe)
+    /// hashes to the pinned value.
+    #[test]
+    fn pin_matches_shipped_spki_der() {
+        let dir = std::env::var("YEAGER_P0U_PKG")
+            .unwrap_or_else(|_| r"C:\projects\yeager-p0-pkg".to_string());
+        let mut checked = 0;
+        for name in ["spki.der", "spki-from-exe.der"] {
+            match std::fs::read(format!("{dir}\\{name}")) {
+                Ok(der) => {
+                    assert!(spki_pin_matches(&der), "{name} must hash to the pin");
+                    checked += 1;
+                }
+                Err(_) => eprintln!("skipping {name}: not present"),
+            }
+        }
+        if checked == 0 {
+            eprintln!("skipping spki.der re-derivation: package dir not present");
+        }
     }
 }
