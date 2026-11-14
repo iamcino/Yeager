@@ -28,6 +28,64 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const NETWORK_REFRESH: Duration = Duration::from_secs(10 * 60);
 /// How long the domain sheets wait after the last edit before writing config.json.
 const DOMAIN_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Quiet period after the last geometry change before a poll may persist it.
+/// Ensures only settled normal geometry reaches the file, never in-progress
+/// drag samples.
+const GEOMETRY_QUIET: Duration = Duration::from_millis(800);
+/// How often the geometry poll checks for settled normal bounds.
+const GEOMETRY_POLL: Duration = Duration::from_millis(250);
+/// Delay after first presentation before latching initialization and
+/// committing the validated pair (lets native bounds settle).
+const GEOMETRY_SETTLE: Duration = Duration::from_millis(800);
+
+/// In-memory settled-geometry state, held separately from live bounds.
+///
+/// `last_known_good` is the validated normal rectangle. Live minimized,
+/// maximized, transient, DPI-transitioning or work-area-constrained samples
+/// never overwrite it. `initialized` is latched from real presentation, not
+/// hardcoded at the call sites.
+#[derive(Debug, Clone)]
+pub struct GeometryTracker {
+    pub last_known_good: Option<[u32; 2]>,
+    pub initialized: bool,
+    pub last_scale: Option<f32>,
+    pub last_work_area: Option<(f32, f32)>,
+    pub pending: Option<[u32; 2]>,
+    pub pending_since: Option<Instant>,
+}
+
+impl GeometryTracker {
+    pub fn new(last_known_good: Option<[u32; 2]>) -> Self {
+        Self {
+            last_known_good,
+            initialized: false,
+            last_scale: None,
+            last_work_area: None,
+            pending: None,
+            pending_since: None,
+        }
+    }
+}
+
+/// Whether a live sample is only a work-area-constrained snapshot of a
+/// still-valid `last_known_good` (and must not overwrite it).
+pub fn is_work_area_constrained_snapshot(
+    live: [u32; 2],
+    last_good: Option<[u32; 2]>,
+    work_area: Option<(f32, f32)>,
+) -> bool {
+    let (Some([lw, lh]), Some((ww, wh))) = (last_good, work_area) else {
+        return false;
+    };
+    if live == [lw, lh] {
+        return false;
+    }
+    if !common::is_valid_window_size_u32(lw, lh) {
+        return false;
+    }
+    let (cw, ch) = common::clamp_window_size_to_work_area(lw as f32, lh as f32, ww, wh);
+    live == [cw.round() as u32, ch.round() as u32]
+}
 
 /// Runs a blocking operation off the UI thread and reports the result through a
 /// closure back on the UI thread.
@@ -161,10 +219,39 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui = MainWindow::new()?;
     let cfg = Rc::new(RefCell::new(config::load()));
-    if let Some([width, height]) = cfg.borrow().window_size {
-        let (min_w, min_h) = (ui.get_min_width_px(), ui.get_min_height_px());
-        ui.window().set_size(slint::LogicalSize::new((width as f32).max(min_w), (height as f32).max(min_h)));
+    // Validate on load, fall back as a pair: missing/invalid/below-minimum /
+    // implausibly huge legacy values resolve to the last validated geometry
+    // (here: preferred 860x600), never clamped into a minimum-size window.
+    // Otherwise-valid dimensions are clamped to the target monitor's usable
+    // work area for display only; the stored last-known-good stays unclamped.
+    let raw_window_size = cfg.borrow().window_size;
+    let validated_window_size = common::resolve_window_size(raw_window_size);
+    let raw_was_valid = raw_window_size
+        .is_some_and(|[w, h]| common::is_valid_window_size_u32(w, h));
+    {
+        let [w, h] = validated_window_size;
+        #[cfg(windows)]
+        let (fw, fh) = platform::clamp_to_work_area_for_window(&ui, w as f32, h as f32);
+        #[cfg(not(windows))]
+        let (fw, fh) = (w as f32, h as f32);
+        // Repair the in-memory geometry when the persisted value was corrupt
+        // so later saves don't re-poison the file; the validated replacement
+        // is written after successful normal presentation (see below). Keep
+        // the unclamped validated pair: a clamped display size must never
+        // overwrite a still-valid stored size.
+        if !raw_was_valid {
+            cfg.borrow_mut().window_size = Some(validated_window_size);
+        }
+        ui.window().set_size(slint::LogicalSize::new(fw, fh));
     }
+    // In-memory last-known-good, held separately from live bounds.
+    let tracker = Rc::new(RefCell::new(GeometryTracker::new(Some(
+        validated_window_size,
+    ))));
+    // Shared with the tray re-show path: repair uses it but never overwrites
+    // a real value with the preferred substitute.
+    let shared_lkg: Rc<RefCell<Option<[u32; 2]>>> =
+        Rc::new(RefCell::new(Some(validated_window_size)));
     lang::set(cfg.borrow().language.unwrap_or_else(Language::system));
 
     apply_config_to_ui(&ui, &cfg.borrow());
@@ -174,9 +261,9 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_congestion(provider_label(erwin::current_provider()).into());
 
     #[cfg(windows)]
-    let tray = platform::setup(&ui);
+    let tray = platform::setup(&ui, shared_lkg.clone());
     #[cfg(windows)]
-    platform::watch_show_requests(&ui, &instance_guard);
+    platform::watch_show_requests(&ui, &instance_guard, shared_lkg.clone());
     #[cfg(windows)]
     let has_tray = tray.is_some();
     #[cfg(not(windows))]
@@ -186,9 +273,15 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let tracker = tracker.clone();
+        let shared_lkg = shared_lkg.clone();
         ui.on_close_window(move || {
             if let Some(ui) = w.upgrade() {
-                remember_window_size(&ui, &mut cfg.borrow_mut());
+                // Normal close/hide: flush settled geometry, bypassing the
+                // quiet wait but keeping every reject and transition gate.
+                if capture_live_geometry(&ui, &mut cfg.borrow_mut(), &mut tracker.borrow_mut(), true) {
+                    *shared_lkg.borrow_mut() = tracker.borrow().last_known_good;
+                }
             }
             // Hide to tray instead of quitting; the tray's Thoát exits. Without
             // a tray there is no way back to a hidden window, so quit.
@@ -975,6 +1068,111 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.show()?;
     #[cfg(windows)]
     platform::apply_window_chrome(&ui);
+    // Commit the validated pair only after native bounds have settled. A
+    // still-valid loaded size is left in place when the live size is only a
+    // transient or work-area-constrained snapshot. This also latches
+    // `initialized` from real presentation instead of hardcoding true.
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        let tracker = tracker.clone();
+        let shared_lkg = shared_lkg.clone();
+        slint::Timer::single_shot(GEOMETRY_SETTLE, move || {
+            let Some(ui) = w.upgrade() else { return };
+            let scale = ui.window().scale_factor();
+            let size = ui.window().size().to_logical(scale);
+            let work_area = current_work_area(&ui);
+            let mut tr = tracker.borrow_mut();
+            // Baseline for later DPI / work-area transition detection.
+            tr.last_scale = Some(scale);
+            tr.last_work_area = work_area;
+            // Latch initialization only on coherent settled normal geometry.
+            let coherent = should_accept_geometry(
+                ui.window().is_visible(),
+                ui.window().is_minimized(),
+                ui.window().is_maximized(),
+                true,
+                scale,
+                size.width,
+                size.height,
+            ) && !is_work_area_constrained_snapshot(
+                [size.width.round() as u32, size.height.round() as u32],
+                tr.last_known_good,
+                work_area,
+            );
+            if coherent {
+                tr.initialized = true;
+                *shared_lkg.borrow_mut() = tr.last_known_good;
+                // If the file held corrupt geometry, persist the validated
+                // replacement now that presentation succeeded. A valid loaded
+                // size is never replaced by a transient live snapshot here.
+                if !raw_was_valid {
+                    let mut c = cfg.borrow_mut();
+                    if c.window_size != tr.last_known_good {
+                        c.window_size = tr.last_known_good;
+                    }
+                    config::save(&c);
+                }
+            } else {
+                // Not coherent yet: retry once after another settle interval
+                // rather than marking initialized on a mid-transition sample.
+                let w2 = w.clone();
+                let cfg2 = cfg.clone();
+                let tracker2 = tracker.clone();
+                let shared2 = shared_lkg.clone();
+                slint::Timer::single_shot(GEOMETRY_SETTLE, move || {
+                    let Some(ui) = w2.upgrade() else { return };
+                    let scale = ui.window().scale_factor();
+                    let size = ui.window().size().to_logical(scale);
+                    let work_area = current_work_area(&ui);
+                    let mut tr = tracker2.borrow_mut();
+                    tr.last_scale = Some(scale);
+                    tr.last_work_area = work_area;
+                    if should_accept_geometry(
+                        ui.window().is_visible(),
+                        ui.window().is_minimized(),
+                        ui.window().is_maximized(),
+                        true,
+                        scale,
+                        size.width,
+                        size.height,
+                    ) {
+                        tr.initialized = true;
+                        *shared2.borrow_mut() = tr.last_known_good;
+                        if !raw_was_valid {
+                            let mut c = cfg2.borrow_mut();
+                            if c.window_size != tr.last_known_good {
+                                c.window_size = tr.last_known_good;
+                            }
+                            config::save(&c);
+                        }
+                    }
+                });
+            }
+        });
+    }
+    // Capture settled normal geometry on resize/move with a debounce that
+    // fires after the geometry has been quiet, plus flushes at close/exit.
+    // DPI / work-area transitions are skipped until size and scale cohere.
+    let geometry_timer = slint::Timer::default();
+    {
+        let w = ui.as_weak();
+        let cfg = cfg.clone();
+        let tracker = tracker.clone();
+        let shared_lkg = shared_lkg.clone();
+        geometry_timer.start(slint::TimerMode::Repeated, GEOMETRY_POLL, move || {
+            if let Some(ui) = w.upgrade() {
+                if capture_live_geometry(
+                    &ui,
+                    &mut cfg.borrow_mut(),
+                    &mut tracker.borrow_mut(),
+                    false,
+                ) {
+                    *shared_lkg.borrow_mut() = tracker.borrow().last_known_good;
+                }
+            }
+        });
+    }
 
     // `ui.run()` would end as soon as the window hides to the tray, taking the
     // tray with it. Run until the tray's Thoát (or close without a tray) quits.
@@ -984,7 +1182,14 @@ fn main() -> Result<(), slint::PlatformError> {
         domain_save.stop();
         config::save(&cfg.borrow());
     }
-    remember_window_size(&ui, &mut cfg.borrow_mut());
+    {
+        let mut tr = tracker.borrow_mut();
+        let mut c = cfg.borrow_mut();
+        if capture_live_geometry(&ui, &mut c, &mut tr, true) {
+            *shared_lkg.borrow_mut() = tr.last_known_good;
+        }
+    }
+    drop(geometry_timer);
     let _ = ui.hide();
     #[cfg(windows)]
     drop(tray);
@@ -1029,17 +1234,222 @@ fn refresh_network(ui: &MainWindow) {
     });
 }
 
-/// Saves the window size, so the next start opens at the size the user left.
-fn remember_window_size(ui: &MainWindow, cfg: &mut Config) {
-    if !ui.window().is_visible() {
-        return;
+/// Whether a live window snapshot may become the persisted normal geometry.
+///
+/// Accepts only settled normal geometry: visible, non-minimized,
+/// non-maximized, initialization complete, finite positive dimensions with a
+/// valid positive scale. Transient zero/below-minimum sizes are ignored so
+/// they never overwrite last-known-good. A deliberate stable 700x500 is
+/// accepted; minimum size alone is not corruption.
+pub fn should_accept_geometry(
+    visible: bool,
+    minimized: bool,
+    maximized: bool,
+    initialized: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+) -> bool {
+    if !visible || minimized || maximized || !initialized {
+        return false;
     }
-    let size = ui.window().size().to_logical(ui.window().scale_factor());
-    let size = Some([size.width.round() as u32, size.height.round() as u32]);
-    if cfg.window_size != size {
-        cfg.window_size = size;
+    if !scale.is_finite() || scale <= 0.0 {
+        return false;
+    }
+    common::is_valid_window_size(w, h)
+}
+
+/// Validated startup size for a persisted value: falls back as a pair to the
+/// preferred 860x600, never clamping garbage into a minimum-size window.
+pub fn startup_window_size(raw: Option<[u32; 2]>) -> (f32, f32) {
+    let [w, h] = common::resolve_window_size(raw);
+    (w as f32, h as f32)
+}
+
+/// Minimal store step exercised by regression tests: updates `stored` only
+/// for settled normal geometry, leaving a stored last-known-good unchanged
+/// for minimized, maximized, hidden, uninitialized, bad-scale and transient
+/// rejects. Returns true when the stored value changed.
+pub fn try_update_geometry(
+    stored: &mut Option<[u32; 2]>,
+    visible: bool,
+    minimized: bool,
+    maximized: bool,
+    initialized: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+) -> bool {
+    if !should_accept_geometry(visible, minimized, maximized, initialized, scale, w, h) {
+        return false;
+    }
+    let next = Some([w.round() as u32, h.round() as u32]);
+    if *stored == next {
+        return false;
+    }
+    *stored = next;
+    true
+}
+
+/// Settled capture core: debounced, transition-aware, work-area-aware.
+///
+/// - Rejects hidden/minimized/maximized/uninitialized/bad-scale/
+///
+/// below-minimum samples without touching `stored` or `tracker`.
+/// - Skips saves across a DPI or work-area transition until size and scale
+///   are coherent (updates baselines, clears pending, returns false).
+/// - Holds last-known-good separately: a work-area-constrained snapshot of a
+///   still-valid stored size never overwrites it.
+/// - Polls (`force=false`) commit only after the candidate has been quiet for
+///   [`GEOMETRY_QUIET`]; close/exit (`force=true`) commits a coherent valid
+///   candidate at once.
+///
+/// Returns true when `stored`/`tracker.last_known_good` changed (caller
+/// persists and syncs the shared re-show value).
+#[allow(clippy::too_many_arguments)]
+pub fn remember_window_size_sample(
+    stored: &mut Option<[u32; 2]>,
+    tracker: &mut GeometryTracker,
+    visible: bool,
+    minimized: bool,
+    maximized: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+    work_area: Option<(f32, f32)>,
+    now: Instant,
+    force: bool,
+) -> bool {
+    // Latch `initialized` on any coherent normal sample, including after the
+    // two startup settle shots. A close-to-tray (hidden), minimize, or
+    // bad-scale pair during those shots leaves the flag false, but the next
+    // settled resize or close/exit with coherent geometry must still capture.
+    if !tracker.initialized {
+        if !should_accept_geometry(visible, minimized, maximized, true, scale, w, h) {
+            tracker.pending = None;
+            tracker.pending_since = None;
+            return false;
+        }
+        tracker.initialized = true;
+    }
+    if !should_accept_geometry(visible, minimized, maximized, true, scale, w, h) {
+        tracker.pending = None;
+        tracker.pending_since = None;
+        return false;
+    }
+    // DPI / work-area transition: skip until size and scale cohere.
+    let scale_changed =
+        tracker.last_scale.is_some_and(|s| (s - scale).abs() > 0.01 || !s.is_finite());
+    let area_changed = match (tracker.last_work_area, work_area) {
+        (Some((a, b)), Some((c, d))) => (a - c).abs() > 1.0 || (b - d).abs() > 1.0,
+        (None, Some(_)) | (Some(_), None) => tracker.last_scale.is_some(),
+        (None, None) => false,
+    };
+    if scale_changed || area_changed {
+        tracker.last_scale = Some(scale);
+        tracker.last_work_area = work_area;
+        tracker.pending = None;
+        tracker.pending_since = None;
+        return false;
+    }
+    // First coherent sample establishes baselines without skipping.
+    if tracker.last_scale.is_none() {
+        tracker.last_scale = Some(scale);
+        tracker.last_work_area = work_area;
+    }
+    let candidate = [w.round() as u32, h.round() as u32];
+    let candidate_opt = Some(candidate);
+    if tracker.last_known_good == candidate_opt && *stored == candidate_opt {
+        tracker.pending = None;
+        tracker.pending_since = None;
+        return false;
+    }
+    // Do not store a temporary constrained size over a still-valid good.
+    if is_work_area_constrained_snapshot(candidate, tracker.last_known_good.or(*stored), work_area) {
+        tracker.pending = None;
+        tracker.pending_since = None;
+        return false;
+    }
+    if is_work_area_constrained_snapshot(candidate, *stored, work_area) {
+        tracker.pending = None;
+        tracker.pending_since = None;
+        return false;
+    }
+    if force {
+        tracker.last_known_good = candidate_opt;
+        tracker.pending = None;
+        tracker.pending_since = None;
+        if *stored == candidate_opt {
+            return false;
+        }
+        *stored = candidate_opt;
+        return true;
+    }
+    // Debounce: fire only after the geometry has been quiet.
+    match tracker.pending {
+        Some(p) if p == candidate => {
+            if tracker.pending_since.is_some_and(|t| now.duration_since(t) >= GEOMETRY_QUIET) {
+                tracker.last_known_good = candidate_opt;
+                tracker.pending = None;
+                tracker.pending_since = None;
+                if *stored == candidate_opt {
+                    return false;
+                }
+                *stored = candidate_opt;
+                return true;
+            }
+            false
+        }
+        _ => {
+            tracker.pending = candidate_opt;
+            tracker.pending_since = Some(now);
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn current_work_area(ui: &MainWindow) -> Option<(f32, f32)> {
+    platform::work_area_size_for_window(ui)
+}
+
+#[cfg(not(windows))]
+fn current_work_area(_ui: &MainWindow) -> Option<(f32, f32)> {
+    None
+}
+
+/// Reads live window state and runs the settled capture core. Saves on commit.
+/// Returns true when the stored geometry changed.
+fn capture_live_geometry(
+    ui: &MainWindow,
+    cfg: &mut Config,
+    tracker: &mut GeometryTracker,
+    force: bool,
+) -> bool {
+    let visible = ui.window().is_visible();
+    let minimized = ui.window().is_minimized();
+    let maximized = ui.window().is_maximized();
+    let scale = ui.window().scale_factor();
+    let size = ui.window().size().to_logical(scale);
+    let work_area = current_work_area(ui);
+    let now = Instant::now();
+    if remember_window_size_sample(
+        &mut cfg.window_size,
+        tracker,
+        visible,
+        minimized,
+        maximized,
+        scale,
+        size.width,
+        size.height,
+        work_area,
+        now,
+        force,
+    ) {
         config::save(cfg);
+        return true;
     }
+    false
 }
 
 /// Shows the ISP a lookup found, and keeps it as the value to return to when
@@ -1433,5 +1843,380 @@ fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
         ui.set_engine_active(false);
         ui.set_engine_status(tr("Lỗi", "Error").into());
         ui.set_log(t!("Không bật lại được: {e}", "Could not restart: {e}").into());
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn corrupted_default_migration_falls_back_as_pair() {
+        // [0,0], [1,1], one undersized dimension, huge: all fall back as a
+        // pair to preferred, never clamped into a minimum-size window.
+        assert_eq!(startup_window_size(Some([0, 0])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([1, 1])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([100, 600])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([860, 100])), (860.0, 600.0));
+        assert_eq!(startup_window_size(Some([99999, 99999])), (860.0, 600.0));
+        assert_eq!(startup_window_size(None), (860.0, 600.0));
+    }
+
+    #[test]
+    fn deliberate_minimum_size_persists_and_restores() {
+        // Minimum size alone is not corruption: 700x500 round-trips.
+        assert_eq!(startup_window_size(Some([700, 500])), (700.0, 500.0));
+        assert!(should_accept_geometry(true, false, false, true, 1.0, 700.0, 500.0));
+    }
+
+    #[test]
+    fn minimized_maximized_transient_close_does_not_overwrite() {
+        // Minimized, maximized, invisible, uninitialized, bad scale and
+        // transient zero/below-minimum snapshots are all rejected.
+        assert!(!should_accept_geometry(true, true, false, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, true, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(false, false, false, true, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, false, 1.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, 0.0, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, f32::NAN, 860.0, 600.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 0.0, 0.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 1.0, 1.0));
+        assert!(!should_accept_geometry(true, false, false, true, 1.0, 100.0, 600.0));
+    }
+
+    #[test]
+    fn stored_last_known_good_unchanged_for_rejects_via_remember() {
+        // The store step itself (not only the predicate) leaves a stored
+        // last-known-good unchanged for minimized, maximized and transient
+        // rejects.
+        let mut stored = Some([900, 650]);
+        for (visible, minimized, maximized, initialized, scale, w, h) in [
+            (true, true, false, true, 1.0, 860.0, 600.0),
+            (true, false, true, true, 1.0, 860.0, 600.0),
+            (false, false, false, true, 1.0, 860.0, 600.0),
+            (true, false, false, false, 1.0, 860.0, 600.0),
+            (true, false, false, true, 0.0, 860.0, 600.0),
+            (true, false, false, true, 1.0, 0.0, 0.0),
+            (true, false, false, true, 1.0, 100.0, 600.0),
+        ] {
+            assert!(
+                !try_update_geometry(
+                    &mut stored,
+                    visible,
+                    minimized,
+                    maximized,
+                    initialized,
+                    scale,
+                    w,
+                    h
+                ),
+                "reject must not update stored"
+            );
+            assert_eq!(stored, Some([900, 650]), "stored LKG must survive reject");
+        }
+        // A valid deliberate resize, including 700x500, does update.
+        assert!(try_update_geometry(
+            &mut stored,
+            true,
+            false,
+            false,
+            true,
+            1.0,
+            700.0,
+            500.0
+        ));
+        assert_eq!(stored, Some([700, 500]));
+    }
+
+    #[test]
+    fn settled_sample_holds_lkg_for_transient_and_min_max() {
+        // Full settled core (with debounce bypassed via force) still holds
+        // LKG for minimized / maximized / transient rejects.
+        let mut stored = Some([900, 650]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([900, 650]),
+            initialized: true,
+            last_scale: Some(1.0),
+            last_work_area: Some((1920.0, 1080.0)),
+            pending: None,
+            pending_since: None,
+        };
+        let now = Instant::now();
+        for (min, max, w, h) in [(true, false, 860.0, 600.0), (false, true, 860.0, 600.0), (false, false, 0.0, 0.0)]
+        {
+            assert!(
+                !remember_window_size_sample(
+                    &mut stored,
+                    &mut tr,
+                    true,
+                    min,
+                    max,
+                    1.0,
+                    w,
+                    h,
+                    Some((1920.0, 1080.0)),
+                    now,
+                    true
+                )
+            );
+            assert_eq!(stored, Some([900, 650]));
+            assert_eq!(tr.last_known_good, Some([900, 650]));
+        }
+    }
+
+    #[test]
+    fn late_coherent_sample_latches_after_missed_settle() {
+        // Both startup settle shots saw incoherent samples (close-to-tray
+        // hidden, then minimized, then bad scale): `initialized` stays false
+        // for the process lifetime under the old two-shot latch. A later
+        // settled resize and a forced close/exit must still capture.
+        let mut stored = Some([860, 600]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([860, 600]),
+            initialized: false,
+            // Baselines as the settle timers leave them after incoherent shots.
+            last_scale: Some(1.0),
+            last_work_area: Some((1920.0, 1080.0)),
+            pending: None,
+            pending_since: None,
+        };
+        let t_missed = Instant::now();
+        // Settle shot window: hidden (close-to-tray), minimized, bad scale.
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, false, false, false, 1.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, false
+        ));
+        assert!(!tr.initialized);
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, true, false, 1.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, false
+        ));
+        assert!(!tr.initialized);
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 0.0, 860.0, 600.0,
+            Some((1920.0, 1080.0)), t_missed, true
+        ));
+        assert!(!tr.initialized);
+        assert_eq!(stored, Some([860, 600]));
+        // Later settled resize: first coherent poll latches and arms pending.
+        let t0 = Instant::now();
+        assert!(!remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 900.0, 650.0,
+            Some((1920.0, 1080.0)), t0, false
+        ));
+        assert!(tr.initialized, "late coherent sample must latch initialized");
+        assert_eq!(stored, Some([860, 600]));
+        // Quiet expiry commits the settled resize.
+        let t1 = t0 + GEOMETRY_QUIET + Duration::from_millis(50);
+        assert!(remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 900.0, 650.0,
+            Some((1920.0, 1080.0)), t1, false
+        ));
+        assert_eq!(stored, Some([900, 650]));
+        assert_eq!(tr.last_known_good, Some([900, 650]));
+        // Close/exit capture still works after that sequence.
+        assert!(remember_window_size_sample(
+            &mut stored, &mut tr, true, false, false, 1.0, 920.0, 680.0,
+            Some((1920.0, 1080.0)), t1, true
+        ));
+        assert_eq!(stored, Some([920, 680]));
+        assert_eq!(tr.last_known_good, Some([920, 680]));
+    }
+
+    #[test]
+    fn debounce_fires_only_after_quiet() {
+        // Polls do not persist in-progress drag samples: the first sighting
+        // arms pending, the commit fires only after GEOMETRY_QUIET.
+        let mut stored = Some([860, 600]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([860, 600]),
+            initialized: true,
+            last_scale: Some(1.0),
+            last_work_area: Some((1920.0, 1080.0)),
+            pending: None,
+            pending_since: None,
+        };
+        let t0 = Instant::now();
+        assert!(!remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.0,
+            900.0,
+            650.0,
+            Some((1920.0, 1080.0)),
+            t0,
+            false
+        ));
+        assert_eq!(stored, Some([860, 600]));
+        // Still moving: same candidate before quiet -> no commit.
+        assert!(!remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.0,
+            900.0,
+            650.0,
+            Some((1920.0, 1080.0)),
+            t0,
+            false
+        ));
+        assert_eq!(stored, Some([860, 600]));
+        // Quiet: same candidate after the interval commits.
+        let t1 = t0 + GEOMETRY_QUIET + Duration::from_millis(50);
+        assert!(remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.0,
+            900.0,
+            650.0,
+            Some((1920.0, 1080.0)),
+            t1,
+            false
+        ));
+        assert_eq!(stored, Some([900, 650]));
+        assert_eq!(tr.last_known_good, Some([900, 650]));
+    }
+
+    #[test]
+    fn skips_saves_across_dpi_or_work_area_transition() {
+        let mut stored = Some([860, 600]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([860, 600]),
+            initialized: true,
+            last_scale: Some(1.0),
+            last_work_area: Some((1920.0, 1080.0)),
+            pending: None,
+            pending_since: None,
+        };
+        let now = Instant::now();
+        // DPI jump: skip, update baseline, clear pending.
+        assert!(!remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.25,
+            860.0,
+            600.0,
+            Some((1920.0, 1080.0)),
+            now,
+            false
+        ));
+        assert_eq!(stored, Some([860, 600]));
+        assert_eq!(tr.last_scale, Some(1.25));
+        // Work-area jump: skip as well.
+        assert!(!remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.25,
+            860.0,
+            600.0,
+            Some((1536.0, 864.0)),
+            now,
+            true
+        ));
+        assert_eq!(stored, Some([860, 600]));
+    }
+
+    #[test]
+    fn work_area_constrained_snapshot_does_not_overwrite_valid_loaded() {
+        // Live 800x600 is exactly clamp(900x650 -> 800x600): constrained.
+        assert!(is_work_area_constrained_snapshot(
+            [800, 600],
+            Some([900, 650]),
+            Some((800.0, 600.0))
+        ));
+        assert!(!is_work_area_constrained_snapshot(
+            [900, 650],
+            Some([900, 650]),
+            Some((800.0, 600.0))
+        ));
+        // Settled core holds the valid loaded size in that case.
+        let mut stored = Some([900, 650]);
+        let mut tr = GeometryTracker {
+            last_known_good: Some([900, 650]),
+            initialized: true,
+            last_scale: Some(1.0),
+            last_work_area: Some((800.0, 600.0)),
+            pending: None,
+            pending_since: None,
+        };
+        assert!(!remember_window_size_sample(
+            &mut stored,
+            &mut tr,
+            true,
+            false,
+            false,
+            1.0,
+            800.0,
+            600.0,
+            Some((800.0, 600.0)),
+            Instant::now(),
+            true
+        ));
+        assert_eq!(stored, Some([900, 650]));
+    }
+
+    #[test]
+    fn valid_normal_resize_round_trips() {
+        assert!(should_accept_geometry(true, false, false, true, 1.0, 900.0, 650.0));
+        assert!(should_accept_geometry(true, false, false, true, 1.25, 859.0, 671.0));
+        assert_eq!(startup_window_size(Some([900, 650])), (900.0, 650.0));
+    }
+
+    #[test]
+    fn write_failure_surfaces_via_save_and_try_save() {
+        // Old tests called only helpers that already returned Result while
+        // `save` discarded it. Call the top level: `try_save` must Err and
+        // `save` must not panic when the config dir cannot be created.
+        let anchor = std::env::temp_dir().join(format!(
+            "yeager-ui-save-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&anchor, b"not-a-dir").unwrap();
+        let prev = std::env::var_os("LOCALAPPDATA");
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &anchor);
+        }
+        let before_try = erwin::config::save_failure_surfacing_count();
+        let err = erwin::config::try_save(&Config::default()).expect_err("try_save must surface error");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            erwin::config::save_failure_surfacing_count(),
+            before_try,
+            "try_save surfaces via its Err return and must not touch save's counter"
+        );
+        // Assert the surfacing itself: only `save`'s error branch increments
+        // the counter, so a `save` that discards the error again (`let _ =
+        // try_save(cfg)`) leaves the counter flat and fails here.
+        let before_save = erwin::config::save_failure_surfacing_count();
+        erwin::config::save(&Config::default());
+        assert!(
+            erwin::config::save_failure_surfacing_count() > before_save,
+            "save must surface the write error instead of discarding it"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        let _ = std::fs::remove_file(&anchor);
     }
 }
