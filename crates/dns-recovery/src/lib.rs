@@ -1,8 +1,8 @@
-//! Yeager DNS recovery — units U01 + U01b + U02 + U03 + U04: model, original
-//! capture, Windows API qualification, the durable journal, the
-//! apply/reconfigure/restore transaction engine and the startup replay with
-//! owner identity, conflict handling and the deferred scheduler
-//! (SPEC-DNS-FIX.md §12).
+//! Yeager DNS recovery — units U01 + U01b + U02 + U03 + U04 + U05: model,
+//! original capture, Windows API qualification, the durable journal, the
+//! apply/reconfigure/restore transaction engine, the startup replay with
+//! owner identity, conflict handling and the deferred scheduler, and the
+//! privileged-service host with secure IPC (SPEC-DNS-FIX.md §12).
 //!
 //! # U04: replay, owner identity and deferred scheduler
 //!
@@ -94,14 +94,18 @@ pub mod journal;
 pub mod lock;
 pub mod model;
 pub mod plan;
+pub mod protocol;
 pub mod replay;
 pub mod security;
+pub mod service;
 pub mod setter;
 pub mod store;
 pub mod transaction;
 
 #[cfg(windows)]
 pub mod fs_windows;
+#[cfg(windows)]
+pub mod service_os;
 #[cfg(windows)]
 pub mod windows;
 
@@ -113,6 +117,8 @@ mod tests_u02;
 mod tests_u03;
 #[cfg(test)]
 mod tests_u04;
+#[cfg(test)]
+mod tests_u05;
 
 pub use backend::{
     capture_family, capture_family_with_effective, capture_stable, capture_two_families,
@@ -124,7 +130,15 @@ pub use canonical::{canonical_json, canonical_value, fingerprint};
 pub use clock::{utc_string, Clock, SystemClock, VirtualClock};
 pub use model::*;
 pub use plan::{automatic_image, plan_image, provider_spec, setter_mask, ProviderSpec};
+pub use protocol::{
+    exit_code_for_outcome, AuthError, DedupCache, Operation, PeerAuth, ProtocolError, Request,
+    Reply, MAX_DEDUP_ENTRIES, MAX_FRAME_BYTES, PIPE_NAME, PIPE_SDDL, PROTOCOL_VERSION,
+};
 pub use replay::{FakeOwnerProbe, OwnerLiveness, OwnerProbe, ReplayDriver, ReplayReport};
+pub use service::{
+    ControlState, Lease, ScmServiceState, ServiceConfig, ServiceHost, HEALTH_INTERVAL_MS,
+    MISSED_HEALTH_LIMIT, RESTORE_START_TARGET_MS,
+};
 pub use setter::{
     DnsSetter, SetterError, SetterImage, DNS_SETTING_DOH, DNS_SETTING_NAMESERVER, DOH_ENABLE,
     DOH_ENABLE_AUTO, DOH_ENABLE_DDR, DOH_FALLBACK_TO_UDP,
