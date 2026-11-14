@@ -67,8 +67,9 @@ shows a warning, see [Windows and antivirus warnings](#windows-and-antivirus-war
 - **Leaves your local network alone.** Private and local addresses, and IPv6
   devices on your own /64 such as a NAS or a TV, go straight through at LAN speed.
 - **Built for heavy traffic.** Pages that open 20–30 connections at once,
-  downloads, 4K video and games keep their speed; only the packets that open a
-  connection are inspected.
+  downloads, 4K video and games keep their speed; outbound, only packets
+  carrying a TLS ClientHello are inspected — everything else stays out of
+  userspace.
 - **Antivirus-friendly.** No fake packets or unusual TCP flags, and DNS
   (port 53 and Yeager's own encrypted DNS) is never touched.
 - **Live counters** on the Engine page: connections handled, stabilised, and

@@ -67,7 +67,8 @@ cảnh báo, xem [Cảnh báo của Windows và phần mềm diệt virus](#cả
 - **Không động tới mạng nội bộ.** Địa chỉ riêng, cục bộ, và thiết bị IPv6 cùng
   mạng /64 như NAS hay TV đi thẳng với tốc độ mạng LAN.
 - **Chịu tải lớn.** Trang mở 20–30 kết nối cùng lúc, tải file, video 4K hay
-  game vẫn giữ tốc độ; chỉ gói mở đầu kết nối mới được xem xét.
+  game vẫn giữ tốc độ; chiều đi, chỉ gói mang ClientHello TLS mới được xem
+  xét — còn lại không đi qua userspace.
 - **Thân thiện với phần mềm diệt virus.** Không chèn gói giả hay cờ TCP bất
   thường, và không bao giờ động tới DNS (cổng 53 và DNS mã hóa của chính Yeager).
 - **Bộ đếm trực tiếp** ở trang Engine: số kết nối đã xử lý, đã ổn định, và số

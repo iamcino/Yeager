@@ -107,8 +107,10 @@ yeager/
   domains and their subdomains only).
 - Non-blocking: bounded pool of 4 to 6 worker threads communicating via `sync_channel(256)`,
   completely eliminating Windows thread allocation churn.
-- Only connection-opening payloads are captured outbound, so ACKs and
-  keepalives never reach user space; the per-packet path is 100% allocation-free (zero-alloc).
+- Outbound, only ClientHello-bearing payloads are captured, so ACKs,
+  keepalives and bulk upload bytes never reach user space; the Auto/Fast
+  inline path is allocation-free (zero-alloc), while Hardened queues to the
+  bounded worker pool.
 - Anti-tampering: Inbound Middlebox RST Silencer drops spoofed reset packets
   on port 443 in kernel space before they reach application sockets. Only
   resets matching a connection opened in the last 3.5 s are dropped, so a real
