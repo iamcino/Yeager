@@ -80,6 +80,14 @@ yeager/
   command-line build (~486 KB).
 - Embeds the signed WinDivert 2.2 driver and unpacks it on start; no separate
   install.
+- Driver store: `%ProgramData%\Yeager\driver` with an Admin/SYSTEM-only write
+  DACL (read + execute for everyone), enforced via Windows security APIs on
+  every start with no fallback; on-disk files are SHA-256 re-verified against
+  the embedded bytes and rewritten on any mismatch before load; the DLL loads
+  with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`.
+  Setting `YEAGER_WINDIVERT_PATH` to a full `WinDivert.dll` path substitutes a
+  personal build instead (LGPLv3 replaceability); the engine logs one line when
+  the override is active.
 - Supports 4 Transport Profiles (`ResilienceProfile`):
   - `Auto` (default, used by `start`): selects `Fast`.
   - `Fast`: 3-way In-Order Multi-Split (0ms added delay, optimal for gaming & WireGuard VPN tunnels).
