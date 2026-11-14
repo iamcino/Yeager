@@ -1,6 +1,23 @@
-//! Yeager DNS recovery — units U01 + U01b + U02 + U03: model, original
-//! capture, Windows API qualification, the durable journal and the
-//! apply/reconfigure/restore transaction engine (SPEC-DNS-FIX.md §12).
+//! Yeager DNS recovery — units U01 + U01b + U02 + U03 + U04: model, original
+//! capture, Windows API qualification, the durable journal, the
+//! apply/reconfigure/restore transaction engine and the startup replay with
+//! owner identity, conflict handling and the deferred scheduler
+//! (SPEC-DNS-FIX.md §12).
+//!
+//! # U04: replay, owner identity and deferred scheduler
+//!
+//! [`replay`] implements SPEC-DNS-FIX.md §7 startup replay over the U03
+//! engine: PID + creation-FILETIME liveness ([`OwnerProbe`]; access
+//! denied/query failure is unknown, never dead), live-owner protection across
+//! sessions, §5.4 classification of every intent/current family against the
+//! original and all committed/intent images, exact-original restore, conflict
+//! retention without writes, and the §5.3 deferred scheduler (due passes,
+//! arrival-triggered retries, no age-based removal). Replay needs no user
+//! profile, network, listener runtime or UI, and never performs the old
+//! heuristic public-provider reset: every setter call targets a journaled
+//! immutable original.
+//!
+//! # U03: transaction engine
 //!
 //! # U03: transaction engine
 //!
@@ -77,6 +94,7 @@ pub mod journal;
 pub mod lock;
 pub mod model;
 pub mod plan;
+pub mod replay;
 pub mod security;
 pub mod setter;
 pub mod store;
@@ -93,6 +111,8 @@ mod tests;
 mod tests_u02;
 #[cfg(test)]
 mod tests_u03;
+#[cfg(test)]
+mod tests_u04;
 
 pub use backend::{
     capture_family, capture_family_with_effective, capture_stable, capture_two_families,
@@ -104,6 +124,7 @@ pub use canonical::{canonical_json, canonical_value, fingerprint};
 pub use clock::{utc_string, Clock, SystemClock, VirtualClock};
 pub use model::*;
 pub use plan::{automatic_image, plan_image, provider_spec, setter_mask, ProviderSpec};
+pub use replay::{FakeOwnerProbe, OwnerLiveness, OwnerProbe, ReplayDriver, ReplayReport};
 pub use setter::{
     DnsSetter, SetterError, SetterImage, DNS_SETTING_DOH, DNS_SETTING_NAMESERVER, DOH_ENABLE,
     DOH_ENABLE_AUTO, DOH_ENABLE_DDR, DOH_FALLBACK_TO_UDP,

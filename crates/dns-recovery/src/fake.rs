@@ -348,6 +348,11 @@ struct OsInner {
     fail_for: HashMap<(String, Family), FailSpec>,
     readback_errors: HashMap<(String, Family), CaptureError>,
     capture_errors: HashMap<(String, Family), CaptureError>,
+    /// Link-down markers (U04): a disconnected adapter is still enumerated
+    /// and its configured DNS is still readable/writable — link state never
+    /// affects capture, readback or the setter. Only full removal
+    /// ([`FakeOs::remove_adapter`]) makes an adapter missing/not-ready.
+    disconnected: HashSet<String>,
 }
 
 /// Mutable fake OS: one shared machine state behind clones. Reads go through
@@ -418,6 +423,23 @@ impl FakeOs {
         for family in [Family::Ipv4, Family::Ipv6] {
             inner.state.remove(&(guid.to_string(), family));
         }
+    }
+
+    /// Mark an adapter link-down (U04). It stays enumerated and its
+    /// configured DNS stays readable/writable: a disconnected-but-
+    /// configurable adapter restores now (§7 step 5). Only removal makes an
+    /// adapter missing/not-ready (deferred, retried on arrival).
+    pub fn set_disconnected(&self, guid: &str, down: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if down {
+            inner.disconnected.insert(guid.to_string());
+        } else {
+            inner.disconnected.remove(guid);
+        }
+    }
+
+    pub fn is_disconnected(&self, guid: &str) -> bool {
+        self.inner.borrow().disconnected.contains(guid)
     }
 
     /// Fixture input: set the configured NameServer + properties directly

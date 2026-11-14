@@ -1669,6 +1669,64 @@ impl<F: JournalFs> TransactionEngine<F> {
         }
         self.finish_restore()
     }
+
+    /// One adapter-arrival pass (U04, SPEC-DNS-FIX.md §7 step 5 / §5.3):
+    /// retry Failed/Deferred entries — and take fresh reads for Conflict
+    /// entries — for exactly the arrived GUIDs, without waiting for the
+    /// persisted next-attempt schedule. GUIDs with no journal entry are
+    /// ignored (a new GUID reusing a name/index never inherits old settings).
+    /// At most three entries per pass, one attempt each; the rest stays debt.
+    pub fn run_arrival_pass(&self, arrived: &[String]) -> Result<EngineReport, EngineError> {
+        self.errors.borrow_mut().clear();
+        let Some((guard, _)) = self.acquire()? else {
+            return Ok(self.report(Outcome::Busy));
+        };
+        self.load()?;
+        let Some(tx) = self.tx() else {
+            return Ok(self.report(Outcome::VerifiedRestored));
+        };
+        if tx.owner.owner_id != self.owner.owner_id {
+            return Ok(self.report(Outcome::Busy));
+        }
+        if tx.phase == Phase::Complete {
+            // Crash between the complete marker and the tombstone: finish the
+            // sweep (all-original verifies, anything else stays debt).
+            drop(guard);
+            return self.finish_restore();
+        }
+        let wanted: std::collections::HashSet<&str> =
+            arrived.iter().map(|s| s.as_str()).collect();
+        let targets: Vec<usize> = tx
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                wanted.contains(e.adapter_guid.as_str())
+                    && matches!(
+                        e.state,
+                        EntryState::Failed | EntryState::Deferred | EntryState::Conflict
+                    )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if targets.is_empty() {
+            let outcome = match tx.phase {
+                Phase::Active => Outcome::Active,
+                Phase::Pending => Outcome::Pending,
+                _ => Outcome::Pending,
+            };
+            return Ok(self.report(outcome));
+        }
+        let mut guard_opt = Some(guard);
+        let overall_deadline = self.clock.now_ms() + 30_000;
+        for idx in targets.into_iter().take(3) {
+            let cont = self.restore_entry(idx, overall_deadline, &mut guard_opt, false)?;
+            if !cont {
+                return Ok(self.report(Outcome::Pending));
+            }
+        }
+        self.finish_restore()
+    }
 }
 
 fn family_rank(f: Family) -> u8 {
