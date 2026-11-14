@@ -80,6 +80,23 @@ yeager/
   command-line build (~486 KB).
 - Embeds the signed WinDivert 2.2 driver and unpacks it on start; no separate
   install.
+- Driver store: `%ProgramData%\Yeager\driver` with an Admin/SYSTEM-only write
+  DACL (read + execute for Users), created with SECURITY_ATTRIBUTES and
+  enforced via Windows security APIs on every start with no fallback: the
+  parent `%ProgramData%\Yeager` carries the same protected DACL, and a
+  pre-existing directory whose owner or effective DACL (unprotected, or any
+  medium-IL-writable ACE) mismatches fails the start closed instead of being
+  repaired or used. On-disk files follow hash-first discipline: SHA-256
+  re-verified against the embedded bytes on every start, skipped when they
+  match, rewritten on mismatch, and any write failure (locked by a second
+  running binary or otherwise) fails closed; only a hash-verified file loads,
+  with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`.
+  The legacy `%TEMP%\Yeager_bin` is never loaded from and is swept best-effort
+  (reparse points are never traversed, no recursive deletion). Passing
+  `--driver-dir <path>` to either host binary substitutes a personal build
+  used as-is instead (LGPLv3 replaceability); the engine logs one line when
+  the override is active. The override is never read from `config.json` or the
+  environment.
 - Supports 4 Transport Profiles (`ResilienceProfile`):
   - `Auto` (default, used by `start`): selects `Fast`.
   - `Fast`: 3-way In-Order Multi-Split (0ms added delay, optimal for gaming & WireGuard VPN tunnels).

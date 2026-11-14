@@ -3,6 +3,7 @@
 
 pub mod adaptive;
 pub mod adaptive_emit;
+pub mod driver_store;
 pub mod engine;
 pub mod packet;
 pub mod raw;
@@ -13,7 +14,6 @@ use engine::ResilienceEngine;
 use packet::{PacketMetadata, ParsedPacket};
 use raw::{SafeHandle, WinDivertAddress, WinDivertApi, WINDIVERT_LAYER_NETWORK};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -409,29 +409,25 @@ struct ResilienceTask {
     addr: WinDivertAddress,
 }
 
-pub fn get_driver_dir() -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push("Yeager_bin");
-    dir
+/// Protected driver directory (`%ProgramData%\Yeager\driver`). Fails closed when
+/// `%ProgramData%` is missing: there is no fallback to a user-writable location.
+pub fn get_driver_dir() -> Result<PathBuf, String> {
+    driver_store::get_driver_dir()
 }
 
+/// Extracts (or SHA-256 re-verifies) the embedded driver files into the
+/// protected directory and returns the DLL path to load. See [`driver_store`].
 pub fn ensure_driver_extracted() -> Result<PathBuf, String> {
-    let bin_dir = get_driver_dir();
-    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+    driver_store::ensure_driver_extracted(WINDIVERT_DLL, WINDIVERT_SYS)
+}
 
-    let files: [(&str, &[u8]); 2] = [
-        ("WinDivert.dll", WINDIVERT_DLL),
-        ("WinDivert64.sys", WINDIVERT_SYS),
-    ];
-
-    for (name, bytes) in files.iter() {
-        let dest = bin_dir.join(name);
-        if !dest.exists() || fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == 0 {
-            fs::write(&dest, bytes).map_err(|e| format!("Failed writing {}: {}", name, e))?;
-        }
-    }
-
-    Ok(bin_dir.join("WinDivert.dll"))
+/// Same as [`ensure_driver_extracted`], but honors the `--driver-dir` CLI
+/// override: when `Some`, that directory is used as-is (the user's deliberate
+/// LGPL-substitution act) instead of the protected default.
+pub fn ensure_driver_extracted_with_override(
+    driver_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    driver_store::ensure_driver_extracted_with_override(WINDIVERT_DLL, WINDIVERT_SYS, driver_dir)
 }
 
 /// Starts the native Levi connection resilience engine with default Auto profile.
@@ -441,6 +437,18 @@ pub fn start(cfg: &Config) -> Result<(), String> {
 
 /// Starts the native Levi connection resilience engine with the specified transport profile.
 pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<(), String> {
+    start_with_profile_and_driver_dir(cfg, profile, None)
+}
+
+/// Starts the engine like [`start_with_profile`], but honors the `--driver-dir`
+/// CLI override (`Some` = use that directory as-is instead of the protected
+/// default). This is the only override channel: `config.json` and the
+/// environment are never consulted for the driver location.
+pub fn start_with_profile_and_driver_dir(
+    cfg: &Config,
+    profile: ResilienceProfile,
+    driver_dir: Option<PathBuf>,
+) -> Result<(), String> {
     stop();
 
     ACTIVE_PROFILE.store(
@@ -453,7 +461,32 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
         Ordering::SeqCst,
     );
 
-    let dll_path = ensure_driver_extracted()?;
+    let dll_path = ensure_driver_extracted_with_override(driver_dir.as_deref())?;
+    // Stale-record guard: the SCM service record decides which `.sys` the
+    // kernel loads, regardless of which DLL was just hash-verified — so this
+    // runs on BOTH the protected-store and the `--driver-dir` paths, with the
+    // expected `.sys` taken as the file next to the DLL actually being
+    // loaded. A foreign record is deleted when stopped (the DLL recreates it
+    // from the correct directory); a running/undeletable one fails closed.
+    // The product's own delete-pending in-use record (the DLL marks the
+    // service for deletion right after a successful start) proceeds: it
+    // cannot be started, so it can never load a planted driver.
+    {
+        let expected_sys = dll_path.parent().map(|d| {
+            d.join(driver_store::WINDIVERT_SYS_NAME)
+        });
+        match expected_sys {
+            Some(expected_sys) => {
+                driver_store::ensure_windivert_service_record(&expected_sys)?
+            }
+            None => {
+                return Err(format!(
+                    "Refusing to start the engine: driver path {} has no parent directory",
+                    dll_path.display()
+                ));
+            }
+        }
+    }
     let api = Arc::new(WinDivertApi::load(&dll_path)?);
 
     // Surgical WinDivert filter:
@@ -948,6 +981,87 @@ mod tests {
         assert!(!is_builtin_bypass("google.com"));
         assert!(!is_builtin_bypass("youtube.com"));
         assert!(!is_builtin_bypass("notubi.com"));
+    }
+
+    #[test]
+    fn real_extraction_step_stays_fast() {
+        // Owner yardstick: hashing the REAL embedded driver files
+        // (`WinDivert.dll` + `WinDivert64.sys`) stays well under 0.1 s. Both
+        // arms are timed — the write path and the hash-match path — through
+        // the protected-store sync itself (`sync_embedded_file`, never the
+        // `--driver-dir` override short-circuit), so the release assert can
+        // fail if hashing the real files is slow. Debug builds only print
+        // the figure, never fail on the clock.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("yeager-p0driver-realtiming-{}", std::process::id()));
+        let dll = dir.join("WinDivert.dll");
+        let sys = dir.join("WinDivert64.sys");
+        // Stale files from a previous run: named removal + remove_dir only.
+        for stale in [&dll, &sys] {
+            let _ = std::fs::remove_file(stale);
+        }
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir_all(&dir).expect("timing dir must be creatable");
+        let t0 = std::time::Instant::now();
+        assert!(
+            driver_store::sync_embedded_file(&dll, WINDIVERT_DLL)
+                .expect("first write must succeed"),
+            "missing file must be written"
+        );
+        assert!(
+            driver_store::sync_embedded_file(&sys, WINDIVERT_SYS)
+                .expect("first write must succeed"),
+            "missing file must be written"
+        );
+        let write_elapsed = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        assert!(
+            !driver_store::sync_embedded_file(&dll, WINDIVERT_DLL)
+                .expect("re-verification must succeed"),
+            "hash match must not rewrite"
+        );
+        assert!(
+            !driver_store::sync_embedded_file(&sys, WINDIVERT_SYS)
+                .expect("re-verification must succeed"),
+            "hash match must not rewrite"
+        );
+        let match_elapsed = t1.elapsed();
+        let total = t0.elapsed();
+        eprintln!(
+            "real extraction step (embedded {} + {} bytes): write {write_elapsed:?}, re-verify {match_elapsed:?}, total {total:?}",
+            WINDIVERT_DLL.len(),
+            WINDIVERT_SYS.len(),
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                total.as_millis() < 100,
+                "extraction step took {total:?}, yardstick is < 0.1 s"
+            );
+        }
+        let _ = std::fs::remove_file(&dll);
+        let _ = std::fs::remove_file(&sys);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn extraction_never_uses_the_legacy_temp_dir() {
+        // A DLL pre-planted in the legacy %TEMP%\Yeager_bin must never be
+        // loaded: the resolved path always lives outside the temp tree (or
+        // the start fails closed with a reason on hosts without a properly
+        // protected store).
+        match ensure_driver_extracted() {
+            Ok(p) => {
+                assert!(
+                    !p.starts_with(std::env::temp_dir()),
+                    "must never load from the temp tree: {p:?}"
+                );
+                assert_eq!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("WinDivert.dll")
+                );
+            }
+            Err(e) => assert!(!e.is_empty(), "fail-closed errors must say why"),
+        }
     }
 
     #[test]

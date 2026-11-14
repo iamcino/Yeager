@@ -211,6 +211,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let resume = std::env::args().any(|a| a == updater::CONNECT_ARG);
     updater::finish_previous_update(updated);
 
+    // LGPL substitution mechanism: the ONLY way to redirect the driver load
+    // away from the protected %ProgramData%\Yeager\driver store. Never read
+    // from config.json or the environment (both are reachable by a
+    // medium-integrity attacker and would reopen the planting hole).
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        match levi::driver_store::parse_driver_dir_arg(&argv) {
+            Ok(dir) => engine::set_driver_dir_override(dir),
+            Err(e) => {
+                eprintln!("[-] {}", e);
+                std::process::exit(2);
+            }
+        }
+    }
+
     #[cfg(windows)]
     let instance_guard = match platform::ensure_single_instance(updated) {
         platform::SingleInstanceDecision::Proceed(guard) => guard,

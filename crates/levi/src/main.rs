@@ -59,6 +59,8 @@ fn print_help() {
     println!("  --all                   Intercept all outbound HTTPS (Port 443)");
     println!("  --hosts <domain,...>    Target specific domains (comma-separated)");
     println!("  --profile <name>        Resilience profile: auto, fast, hardened, observe");
+    println!("  --driver-dir <path>     Use a personal WinDivert build from <path> instead of");
+    println!("                          the protected %ProgramData%\\Yeager\\driver store");
     println!("  --help, -h              Print this help message and exit");
     println!("  --version, -V           Print version information and exit");
     println!("  --license               Print license information and exit");
@@ -123,9 +125,20 @@ fn main() {
         cfg.scope = Scope::All;
     }
 
+    // LGPL substitution mechanism: the ONLY way to redirect the driver load.
+    // Never read from config.json or the environment (both are reachable by
+    // a medium-integrity attacker and would reopen the planting hole).
+    let driver_dir = match levi::driver_store::parse_driver_dir_arg(&args) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("[-] {}", e);
+            std::process::exit(2);
+        }
+    };
+
     println!("[*] Transport Profile: {:?}", profile);
     println!("[*] Starting Levi Native Engine...");
-    match levi::start_with_profile(&cfg, profile) {
+    match levi::start_with_profile_and_driver_dir(&cfg, profile, driver_dir) {
         Ok(()) => {
             println!("[+] Levi Engine is running smoothly.");
             println!("[+] Engine packet-loop is intercepting TLS Handshakes.");

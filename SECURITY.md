@@ -101,6 +101,18 @@ These are all the connections Yeager makes on its own:
 No telemetry, no analytics, no command server and no data leaves your computer
 beyond these. See the [privacy policy](PRIVACY.md).
 
+### Driver directory
+
+Yeager loads its WinDivert driver only from the protected
+`%ProgramData%\Yeager\driver` directory (Administrators and SYSTEM can write,
+everyone else can only read and execute; inheritance is off and the owner and
+permissions are re-verified on every start — anything unexpected stops the
+engine instead of loading). The old `%TEMP%\Yeager_bin` directory is never
+used. If you build your own WinDivert, pass it with the `--driver-dir <path>`
+flag to `yeager.exe` or `levi.exe`; note that a substituted driver runs with
+the process's own (administrator) privileges, so only point it at a build you
+trust.
+
 ---
 
 ## Tiếng Việt
@@ -204,3 +216,14 @@ Vì chưa dùng chứng chỉ thương mại, Windows SmartScreen vẫn có th�
 Không telemetry, không phân tích, không máy chủ điều khiển, và không dữ liệu
 nào rời máy bạn ngoài những kết nối này. Xem
 [chính sách quyền riêng tư](PRIVACY.md#tiếng-việt).
+
+#### Thư mục driver
+
+Yeager chỉ nạp driver WinDivert từ thư mục được bảo vệ
+`%ProgramData%\Yeager\driver` (chỉ Administrators và SYSTEM được ghi, còn lại
+chỉ đọc và chạy; tắt kế thừa và kiểm tra lại chủ sở hữu cùng quyền mỗi lần
+khởi động — thấy gì lạ là engine dừng chứ không nạp). Thư mục
+`%TEMP%\Yeager_bin` cũ không bao giờ được dùng. Nếu bạn tự build WinDivert,
+hãy truyền bằng cờ `--driver-dir <đường dẫn>` cho `yeager.exe` hoặc
+`levi.exe`; lưu ý driver thay thế chạy với quyền của chính tiến trình
+(administrator), nên chỉ trỏ tới bản build bạn tin tưởng.
