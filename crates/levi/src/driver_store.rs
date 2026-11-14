@@ -960,6 +960,14 @@ fn service_paths_match(recorded: &str, expected_sys: &Path) -> bool {
 pub enum ServiceRecord {
     /// No record: the DLL creates one from the loaded DLL's directory.
     Absent,
+    /// The record is marked for deletion (`OpenServiceW` failed with
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE`). This is the product's own
+    /// in-use record: the vendored DLL calls `DeleteService` right after a
+    /// successful start, while the driver stays loaded until reboot. A
+    /// delete-pending service cannot be started, so it can never load a
+    /// planted `.sys`; the DLL opens the already-loaded device directly.
+    /// Non-blocking: restarts proceed against it.
+    DeletePending,
     /// A record exists. `running` is true unless the service is confirmed
     /// STOPPED — any other state (running, pending, unknown) is fail-closed.
     Present {
@@ -969,11 +977,12 @@ pub enum ServiceRecord {
 }
 
 /// SCM read/delete operations behind a seam so the stale-record decision is
-/// unit-testable with faked records (absent / matching / foreign-stopped /
-/// foreign-running / query-error).
+/// unit-testable with faked records (absent / delete-pending / matching /
+/// foreign-stopped / foreign-running / query-error).
 pub trait ServiceControl {
-    /// Reads the service record: `Absent`, or `Present` with its binary path
-    /// and whether it is anything but STOPPED. Any failure is `Err`.
+    /// Reads the service record: `Absent`, `DeletePending`, or `Present`
+    /// with its binary path and whether it is anything but STOPPED. Any
+    /// other failure is `Err`.
     fn query(&self, service_name: &str) -> Result<ServiceRecord, String>;
     /// Deletes a STOPPED record; the DLL recreates it from the correct
     /// directory on the next install.
@@ -983,6 +992,9 @@ pub trait ServiceControl {
 /// Rejects a stale `WinDivert` service record before the DLL load step.
 ///
 /// - No record → proceed (the DLL creates it from the loaded DLL's directory).
+/// - Delete-pending record → proceed (a delete-pending service cannot be
+///   started, so it cannot load a planted `.sys`; the DLL opens the
+///   already-loaded device directly, as pre-guard builds did).
 /// - Record resolves to exactly `expected_sys` → proceed.
 /// - Record points anywhere else: if the service is STOPPED, delete the
 ///   record and proceed; if it is RUNNING (or its state/deletion fails),
@@ -1002,6 +1014,7 @@ pub fn ensure_service_record(
     })?;
     match record {
         ServiceRecord::Absent => Ok(()),
+        ServiceRecord::DeletePending => Ok(()),
         ServiceRecord::Present {
             binary_path,
             running,
@@ -1054,7 +1067,7 @@ impl Drop for ScmHandleGuard {
 impl ServiceControl for WindowsServiceControl {
     fn query(&self, service_name: &str) -> Result<ServiceRecord, String> {
         use windows_sys::Win32::Foundation::{
-            GetLastError, ERROR_SERVICE_DOES_NOT_EXIST,
+            GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE,
         };
         use windows_sys::Win32::System::Services::{
             OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatus,
@@ -1086,6 +1099,15 @@ impl ServiceControl for WindowsServiceControl {
             let code = unsafe { GetLastError() };
             if code == ERROR_SERVICE_DOES_NOT_EXIST {
                 return Ok(ServiceRecord::Absent);
+            }
+            if code == ERROR_SERVICE_MARKED_FOR_DELETE {
+                // The product's own in-use record: the vendored DLL marks
+                // the service delete-pending right after a successful start
+                // while the driver stays loaded until reboot. A
+                // delete-pending service cannot be started, so it can never
+                // load a planted `.sys` — proceed and let the DLL open the
+                // already-loaded device directly.
+                return Ok(ServiceRecord::DeletePending);
             }
             return Err(format!("OpenServiceW({service_name}) failed (code {code})"));
         }
@@ -1125,10 +1147,7 @@ impl ServiceControl for WindowsServiceControl {
         let ok = unsafe { QueryServiceStatus(service, &mut status) };
         if ok == 0 {
             let code = unsafe { GetLastError() };
-            return Err(format!(
-                "QueryServiceStatus({service_name}) failed (code {code}); \
-                 the record state cannot be determined"
-            ));
+            return Err(state_undetermined_error(service_name, &binary_path, code));
         }
         Ok(ServiceRecord::Present {
             binary_path,
@@ -1166,6 +1185,17 @@ impl ServiceControl for WindowsServiceControl {
         }
         Ok(())
     }
+}
+
+/// The state-undetermined refusal: like every other refusal, it names the
+/// recorded binary path so the operator can see which record blocked the
+/// start. Factored out so the committed suite can assert the path is named.
+#[cfg(windows)]
+fn state_undetermined_error(service_name: &str, binary_path: &str, code: u32) -> String {
+    format!(
+        "QueryServiceStatus({service_name}) failed (code {code}) for the record pointing at \
+         {binary_path}; the record state cannot be determined, so the engine never starts against it"
+    )
 }
 
 /// Reads a NUL-terminated UTF-16 Windows string (empty when null).
@@ -1532,6 +1562,43 @@ mod tests {
             scm.deleted.borrow().as_slice(),
             ["WinDivert"],
             "foreign stopped record must be deleted exactly once"
+        );
+    }
+
+    #[test]
+    fn stale_record_delete_pending_proceeds() {
+        // The product's own in-use record: the vendored DLL marks the
+        // service delete-pending right after a successful start while the
+        // driver stays loaded until reboot. It cannot be started, so it can
+        // never load a planted `.sys` — restarts must proceed without
+        // touching the record.
+        let scm = FakeScm {
+            record: Ok(ServiceRecord::DeletePending),
+            delete_result: Ok(()),
+            deleted: std::cell::RefCell::new(Vec::new()),
+        };
+        let expected = Path::new("C:\\ProgramData\\Yeager\\driver\\WinDivert64.sys");
+        assert!(
+            ensure_service_record(&scm, "WinDivert", expected).is_ok(),
+            "delete-pending record must proceed (restart after first start)"
+        );
+        assert!(
+            scm.deleted.borrow().is_empty(),
+            "delete-pending record must never be deleted"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_undetermined_refusal_names_recorded_path() {
+        let err = state_undetermined_error(
+            "WinDivert",
+            "\\??\\C:\\Temp\\Yeager_bin\\WinDivert64.sys",
+            1723,
+        );
+        assert!(
+            err.contains("Yeager_bin\\WinDivert64.sys"),
+            "state-undetermined refusal must name the recorded path, got: {err}"
         );
     }
 

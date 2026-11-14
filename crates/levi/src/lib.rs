@@ -468,6 +468,9 @@ pub fn start_with_profile_and_driver_dir(
     // expected `.sys` taken as the file next to the DLL actually being
     // loaded. A foreign record is deleted when stopped (the DLL recreates it
     // from the correct directory); a running/undeletable one fails closed.
+    // The product's own delete-pending in-use record (the DLL marks the
+    // service for deletion right after a successful start) proceeds: it
+    // cannot be started, so it can never load a planted driver.
     {
         let expected_sys = dll_path.parent().map(|d| {
             d.join(driver_store::WINDIVERT_SYS_NAME)
