@@ -90,6 +90,33 @@ pub fn is_elevated() -> bool {
     unsafe { Ws::UI::Shell::IsUserAnAdmin() != 0 }
 }
 
+/// Best-effort service diagnostics log (NOT journal data): timestamped lines
+/// appended to `<ProgramData>\Yeager\dns-recovery-service.log`, which inherits
+/// the protected directory ACL. Never logs lease tokens or request bodies;
+/// failures are silently ignored so diagnostics can never break recovery.
+pub fn service_log(note: &str) {
+    use std::fmt::Write as _;
+    let dir = match program_data_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let mut line = String::new();
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let _ = write!(line, "{ms} {note}\n");
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{dir}\\dns-recovery-service.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 // ---- SCM query/install/remove -------------------------------------------------------
 
 fn open_manager(access: u32) -> Result<Ws::System::Services::SC_HANDLE, String> {
@@ -784,10 +811,16 @@ fn serve_one(
                                 );
                                 protocol::encode_reply(&rep).unwrap_or_default()
                             }
-                            Ok(peer) => {
-                                let rep = dispatch(&peer, &req);
-                                protocol::encode_reply(&rep).unwrap_or_default()
-                            }
+                    Ok(peer) => {
+                        let rep = dispatch(&peer, &req);
+                        service_log(&format!(
+                            "pipe: op={} outcome={} gen={}",
+                            req.operation.as_str(),
+                            rep.outcome,
+                            rep.generation
+                        ));
+                        protocol::encode_reply(&rep).unwrap_or_default()
+                    }
                         },
                     }
                 }
@@ -796,6 +829,11 @@ fn serve_one(
     };
     if !reply_bytes.is_empty() {
         let _ = write_all(pipe, &reply_bytes);
+        // Delivery barrier: DisconnectNamedPipe may otherwise discard the
+        // reply before the client reads it (client would see 233).
+        unsafe {
+            Ws::Storage::FileSystem::FlushFileBuffers(pipe);
+        }
     }
 }
 
@@ -835,7 +873,9 @@ pub fn run_pipe_server(
         if pipe == Ws::Foundation::INVALID_HANDLE_VALUE || pipe.is_null() {
             // ERROR_ACCESS_DENIED here means a squatted pipe name: fail
             // closed rather than serving on another name.
-            return Err(format!("CreateNamedPipeW failed: {}", last_error()));
+            let e = format!("CreateNamedPipeW failed: {}", last_error());
+            service_log(&format!("pipe server: {e}"));
+            return Err(e);
         }
         let connected = unsafe { P::ConnectNamedPipe(pipe, std::ptr::null_mut()) };
         if connected == 0 {
@@ -846,10 +886,12 @@ pub fn run_pipe_server(
                 unsafe {
                     Ws::Foundation::CloseHandle(pipe);
                 }
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                return Err(format!("ConnectNamedPipe failed: {e}"));
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let e = format!("ConnectNamedPipe failed: {e}");
+            service_log(&format!("pipe server: {e}"));
+            return Err(e);
             }
         }
         serve_one(pipe, &dispatch);
@@ -1131,6 +1173,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     if status.is_null() {
         return;
     }
+    service_log("service_main: starting");
     // Build the host with the real Windows backends.
     let dir = match program_data_dir() {
         Ok(d) => d,
@@ -1169,6 +1212,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
             return;
         }
     };
+    service_log("service_main: backends ready, building host");
     let probe = WindowsOwnerProbe::new();
     let probe_factory_probe = probe.clone();
     let fs_build = Rc::clone(&fs);
@@ -1219,9 +1263,11 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     }
 
     // Boot replay before accepting any takeover (§8.3).
-    {
-        let _ = host.boot_replay();
-    }
+    let boot_outcome = {
+        let r = host.boot_replay();
+        format!("{:?}", r.map(|rep| rep.outcome))
+    };
+    service_log(&format!("service_main: boot replay done: {boot_outcome}"));
     let running = S::SERVICE_STATUS {
         dwServiceType: S::SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: S::SERVICE_RUNNING,
@@ -1236,6 +1282,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     unsafe {
         S::SetServiceStatus(status, &running);
     }
+    service_log("service_main: RUNNING, entering pipe loop");
 
     // Tick waker: the pipe loop blocks in ConnectNamedPipe, so a helper
     // thread wakes it once per second (open + close, no frame). The wakeup

@@ -244,22 +244,32 @@ mod win {
             fail("install-service", 13, e);
         }
         // Hello validation over the protected pipe with the SCM PID check.
+        // Retried: the pipe is single-instance and the 1 s scheduler waker
+        // also opens it, so one attempt can land on a torn-down instance.
         let hello_outcome = (|| -> Result<String, String> {
-            let pid = service_os::scm_service_pid()?.ok_or("service has no PID")?;
-            let req = Request::new(
-                dns_recovery::journal::new_uuid(),
-                Operation::Hello,
-                None,
-                None,
-                serde_json::json!({}),
-            );
-            let frame = protocol::encode_frame(&req).map_err(|e| e.to_string())?;
-            let raw = service_os::pipe_roundtrip(&frame, Some(pid))?;
-            let reply = protocol::decode_reply(&raw).map_err(|e| e.to_string())?;
-            if reply.request_id != req.request_id {
-                return Err("hello reply ID mismatch".into());
+            let mut last = "no attempt".to_string();
+            for _ in 0..3 {
+                let pid = service_os::scm_service_pid()?.ok_or("service has no PID")?;
+                let req = Request::new(
+                    dns_recovery::journal::new_uuid(),
+                    Operation::Hello,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                let frame = protocol::encode_frame(&req).map_err(|e| e.to_string())?;
+                match service_os::pipe_roundtrip(&frame, Some(pid)).and_then(|raw| {
+                    protocol::decode_reply(&raw).map_err(|e| e.to_string())
+                }) {
+                    Ok(reply) if reply.request_id == req.request_id => {
+                        return Ok(reply.outcome);
+                    }
+                    Ok(_) => last = "hello reply ID mismatch".into(),
+                    Err(e) => last = e,
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            Ok(reply.outcome)
+            Err(last)
         })();
         match hello_outcome {
             Ok(outcome) if outcome == "success" => {
