@@ -219,6 +219,129 @@ pub fn scm_query_state() -> Result<ScmServiceState, String> {
     }
 }
 
+/// Whether an SCM record exists. `OpenServiceW` failing with
+/// `ERROR_SERVICE_DOES_NOT_EXIST` (1060) means ABSENT — proceed to create.
+/// Any other open failure refuses (Err). The STOPPED wait applies only when
+/// a record exists; absent never takes the offline path (the install seam
+/// creates it, never offline-recovers it).
+pub fn service_exists() -> Result<bool, String> {
+    use Ws::System::Services as S;
+    unsafe {
+        let manager = open_manager(S::SC_MANAGER_CONNECT)?;
+        let name = wide(SERVICE_NAME);
+        let h = S::OpenServiceW(manager, name.as_ptr(), S::SERVICE_QUERY_STATUS);
+        let exists = if h.is_null() {
+            let e = last_error();
+            close(manager);
+            if e == 1060 {
+                return Ok(false);
+            }
+            return Err(format!("OpenServiceW failed: {e}"));
+        } else {
+            close(h);
+            close(manager);
+            true
+        };
+        Ok(exists)
+    }
+}
+
+/// Current ImagePath value (the `binPath=` the SCM record holds) for
+/// rollback restore. Returns the full quoted `"path" --service` string.
+pub fn query_service_binpath() -> Result<String, String> {
+    use Ws::System::Services as S;
+    unsafe {
+        let manager = open_manager(S::SC_MANAGER_CONNECT)?;
+        let name = wide(SERVICE_NAME);
+        let h = S::OpenServiceW(manager, name.as_ptr(), S::SERVICE_QUERY_CONFIG);
+        if h.is_null() {
+            let e = last_error();
+            close(manager);
+            return Err(format!("OpenServiceW(QUERY_CONFIG) failed: {e}"));
+        }
+        let mut needed: u32 = 0;
+        // First call yields the required size (ERROR_INSUFFICIENT_BUFFER = 122).
+        S::QueryServiceConfigW(h, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            let e = last_error();
+            close(h);
+            close(manager);
+            return Err(format!("QueryServiceConfigW size query failed: {e}"));
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if S::QueryServiceConfigW(
+            h,
+            buf.as_mut_ptr() as *mut S::QUERY_SERVICE_CONFIGW,
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            let e = last_error();
+            close(h);
+            close(manager);
+            return Err(format!("QueryServiceConfigW failed: {e}"));
+        }
+        let cfg = &*(buf.as_ptr() as *const S::QUERY_SERVICE_CONFIGW);
+        let bin = pwstr_to_string(cfg.lpBinaryPathName);
+        close(h);
+        close(manager);
+        if bin.is_empty() {
+            return Err("QueryServiceConfigW returned an empty binPath".into());
+        }
+        Ok(bin)
+    }
+}
+
+/// Restore a previous ImagePath and re-arm the full §8.1 configuration
+/// (quoted binPath, 1 s / 5 s / 30 s restarts, non-crash flag, preshutdown).
+/// Used by the `--install-service` rollback when a start/Hello failure
+/// follows an in-place `ChangeServiceConfigW` replacement.
+pub fn restore_service_registration(prev_binpath: &str) -> Result<(), String> {
+    use Ws::System::Services as S;
+    if !is_elevated() {
+        return Err("restore_service_registration requires elevation".into());
+    }
+    unsafe {
+        let manager = open_manager(S::SC_MANAGER_CONNECT)?;
+        let name = wide(SERVICE_NAME);
+        let display = wide(SERVICE_DISPLAY);
+        let bin = wide(prev_binpath);
+        let existing = S::OpenServiceW(manager, name.as_ptr(), S::SERVICE_ALL_ACCESS);
+        if existing.is_null() {
+            let e = last_error();
+            close(manager);
+            return Err(format!("restore open service failed: {e}"));
+        }
+        if S::ChangeServiceConfigW(
+            existing,
+            S::SERVICE_NO_CHANGE,
+            S::SERVICE_NO_CHANGE,
+            S::SERVICE_NO_CHANGE,
+            bin.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            display.as_ptr(),
+        ) == 0
+        {
+            let e = last_error();
+            close(existing);
+            close(manager);
+            return Err(format!("restore binPath failed: {e}"));
+        }
+        if let Err(e) = configure_failure_actions(existing) {
+            close(existing);
+            close(manager);
+            return Err(e);
+        }
+        close(existing);
+        close(manager);
+        Ok(())
+    }
+}
+
 /// SCM service PID (for the client's server-identity check).
 pub fn scm_service_pid() -> Result<Option<u32>, String> {
     use Ws::System::Services as S;

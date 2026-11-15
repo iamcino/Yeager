@@ -226,17 +226,20 @@ pub fn plan_install(ctx: &InstallContext) -> InstallDecision {
         // invented historical baseline).
         steps.push(InstallStep::CloseLegacyGuiGracefully);
     }
-    // Maintenance guards existing journal state behind a live service; a
-    // running service never takes the offline path (aligned with
-    // `ServiceHost::offline_precheck`, which refuses Running). In every other
-    // case the offline path (proven STOPPED-or-absent, boot replay owns
-    // recovery) applies and no marker is created. In particular a maintenance
-    // marker is never created when no journal exists yet: it would wedge a
-    // bare genesis journal that has no legal clean return.
+    // U09-REV2 item 6: the offline arm matches the service guard.
+    // `ServiceHost::offline_precheck` accepts proven STOPPED only: Running,
+    // start/stop-pending and Unknown refuse, and Absent maps to Unknown and
+    // is refused by `cmd_recover_offline`. So only STOPPED takes
+    // `OfflineRecoverProvenStopped`; Running takes `EnterMaintenance`; ABSENT
+    // takes neither — the install seam creates the record (item 2), never
+    // offline-recovers it. A maintenance marker is never created when no
+    // journal exists yet: it would wedge a bare genesis journal that has no
+    // legal clean return.
     let in_maintenance = ctx.service == ServiceState::Running;
+    let needs_offline = ctx.service == ServiceState::Stopped;
     if in_maintenance {
         steps.push(InstallStep::EnterMaintenance);
-    } else {
+    } else if needs_offline {
         steps.push(InstallStep::OfflineRecoverProvenStopped);
     }
     steps.push(InstallStep::NotifyGuiRequestCoordinatorExit);
@@ -530,6 +533,25 @@ pub fn portable_path_is_portable_folder_file(path: &str) -> bool {
     !portable_path_is_protected_deletion_target(path)
 }
 
+/// U09-REV2 item 8: guarded portable deletion — the actual portable removal
+/// path calls this (not just the constants). Refuses any protected deletion
+/// target (`%ProgramFiles%\Yeager`, `%ProgramData%\Yeager`); allows only
+/// portable-folder files. Returns `Err` without touching the filesystem when
+/// the path is protected.
+pub fn portable_delete_guarded(path: &str) -> Result<(), String> {
+    if portable_path_is_protected_deletion_target(path) {
+        return Err(format!(
+            "portable cleanup refused: {path:?} is a protected deletion target"
+        ));
+    }
+    if !portable_path_is_portable_folder_file(path) {
+        return Err(format!(
+            "portable cleanup refused: {path:?} is not a portable-folder file"
+        ));
+    }
+    Ok(())
+}
+
 // ---- update / service compatibility --------------------------------------------
 
 /// What the running (or absent) service offers.
@@ -746,12 +768,14 @@ mod tests {
             InstallDecision::Abort { reason } => panic!("clean install aborted: {reason}"),
         };
         assert!(steps.contains(&InstallStep::StageVerifyHelper));
-        // Clean install (no journal): offline path with proven STOPPED, and
-        // deliberately NO maintenance marker (nothing to guard; a marker
-        // would wedge the bare genesis journal).
-        assert!(steps.contains(&InstallStep::OfflineRecoverProvenStopped));
+        // Clean install (no journal, no SCM record): created directly by the
+        // install seam (item 2) — deliberately NO maintenance marker (nothing
+        // to guard; a marker would wedge the bare genesis journal) and NO
+        // offline arm (the guard accepts proven STOPPED only; Absent maps to
+        // Unknown and is refused by cmd_recover_offline).
+        assert!(!steps.contains(&InstallStep::OfflineRecoverProvenStopped));
         assert!(!steps.contains(&InstallStep::EnterMaintenance));
-        // Offline path: no marker entered, so none is left.
+        // No marker entered, so none is left.
         assert!(!steps.contains(&InstallStep::LeaveMaintenance));
         assert!(steps.contains(&InstallStep::RequireCleanBeforeReplace));
         assert!(steps.contains(&InstallStep::StartAndValidateHelloInspection));
@@ -832,19 +856,41 @@ mod tests {
     }
 
     #[test]
-    fn absent_and_stopped_service_take_the_offline_path() {
-        // No live service to quiesce: the offline path applies whether or
-        // not a journal already exists (boot replay owns recovery).
+    fn stopped_service_takes_the_offline_path_and_absent_creates_directly() {
+        // U09-REV2 item 6: the offline arm requires proven STOPPED (the
+        // service `offline_precheck` accepts STOPPED only; Absent maps to
+        // Unknown and `cmd_recover_offline` refuses it). Stopped takes the
+        // offline path; Absent takes neither arm — the install seam creates
+        // the record (item 2), never offline-recovers it.
         for journal in [JournalStatus::Absent, JournalStatus::Clean] {
-            for service in [ServiceState::Absent, ServiceState::Stopped] {
-                match plan_install(&install_ctx(service, journal.clone(), GuiState::NotRunning)) {
-                    InstallDecision::Proceed { steps } => {
-                        assert!(steps.contains(&InstallStep::OfflineRecoverProvenStopped));
-                        assert!(!steps.contains(&InstallStep::EnterMaintenance));
-                    }
-                    InstallDecision::Abort { reason } => {
-                        panic!("{service:?}/{journal:?} should take the offline path: {reason}")
-                    }
+            match plan_install(&install_ctx(
+                ServiceState::Stopped,
+                journal.clone(),
+                GuiState::NotRunning,
+            )) {
+                InstallDecision::Proceed { steps } => {
+                    assert!(steps.contains(&InstallStep::OfflineRecoverProvenStopped));
+                    assert!(!steps.contains(&InstallStep::EnterMaintenance));
+                }
+                InstallDecision::Abort { reason } => {
+                    panic!("Stopped/{journal:?} should take the offline path: {reason}")
+                }
+            }
+            match plan_install(&install_ctx(
+                ServiceState::Absent,
+                journal.clone(),
+                GuiState::NotRunning,
+            )) {
+                InstallDecision::Proceed { steps } => {
+                    assert!(
+                        !steps.contains(&InstallStep::OfflineRecoverProvenStopped),
+                        "Absent must not take the offline arm (guard refuses it)"
+                    );
+                    assert!(!steps.contains(&InstallStep::EnterMaintenance));
+                    assert!(steps.contains(&InstallStep::RequireCleanBeforeReplace));
+                }
+                InstallDecision::Abort { reason } => {
+                    panic!("Absent/{journal:?} should create directly: {reason}")
                 }
             }
         }
@@ -1193,9 +1239,10 @@ mod tests {
         assert!(!scope.deletes_protected_binary);
         assert!(!scope.deletes_program_data_state);
         assert!(scope.deletes_portable_folder_only);
-        // The behavior the scope names is enforced by the portable cleanup
-        // path: protected and ProgramData locations are never deletion
-        // targets (the predicate reports them as forbidden).
+        // The behavior the scope names is enforced by the actual portable
+        // removal path (`portable_delete_guarded`), which calls the
+        // predicate: protected and ProgramData locations are never deletion
+        // targets.
         assert!(portable_path_is_protected_deletion_target(
             "C:\\Program Files\\Yeager\\yeager-dns-recovery.exe"
         ));
@@ -1208,6 +1255,58 @@ mod tests {
         assert!(!portable_path_is_protected_deletion_target(
             "D:\\tools\\yeager-portable\\yeager.exe"
         ));
+        // Behavior, not constants: the guarded path refuses protected
+        // targets and allows portable-folder files.
+        assert!(portable_delete_guarded(
+            "C:\\Program Files\\Yeager\\yeager-dns-recovery.exe"
+        )
+        .is_err());
+        assert!(portable_delete_guarded("C:\\ProgramData\\Yeager\\dns-takeover-v1.json").is_err());
+        assert!(portable_delete_guarded("D:\\tools\\yeager-portable\\yeager.exe").is_ok());
+    }
+
+    #[test]
+    fn installer_thumbprint_is_derived_from_the_pinned_cert_file() {
+        // U09-REV2 item 1: the thumbprint is derived, never hand-typed.
+        // The cert file is the same source the signing tooling
+        // (`tools/signing/common.ps1` `Get-PinnedThumbprint`) loads.
+        let iss_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../installer/setup.iss");
+        let iss = std::fs::read_to_string(&iss_path)
+            .unwrap_or_else(|e| panic!("cannot read setup.iss: {e}"));
+        // No hand-typed 39/40-hex thumbprint literal remains in the script:
+        // the value arrives via /DPINNED_THUMBPRINT at build time.
+        assert!(
+            !iss.contains("9131F99C0B198E81FBA0F5818D0637B4A14DCF1"),
+            "setup.iss still holds the 39-digit dropped-4 constant"
+        );
+        for line in iss.lines() {
+            let t = line.trim();
+            if t.starts_with("PINNED_THUMBPRINT") && t.contains('=') && t.contains('\'') {
+                // The only allowed form is the preprocessor expansion of the
+                // build-time define; any hex literal is a hand-typed thumbprint.
+                if t.contains("{#PINNED_THUMBPRINT}") {
+                    continue;
+                }
+                let hex_run = t.chars().filter(|c| c.is_ascii_hexdigit()).count();
+                if hex_run >= 32 {
+                    panic!("setup.iss holds a hand-typed PINNED_THUMBPRINT literal: {t}");
+                }
+            }
+        }
+        assert!(
+            iss.contains("PINNED_THUMBPRINT") && iss.contains("Get-PinnedThumbprint"),
+            "setup.iss must derive PINNED_THUMBPRINT via Get-PinnedThumbprint (build-time /D)"
+        );
+        // The documented thumbprint in BUILD.md is the 40-digit cert value.
+        let build_md = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/BUILD.md"),
+        )
+        .expect("cannot read docs/BUILD.md");
+        assert!(
+            build_md.contains("9131F99C0B198E81FBA0F5818D0637B4A14D4CF1"),
+            "docs/BUILD.md must document the 40-digit pinned cert thumbprint"
+        );
     }
 
     #[test]

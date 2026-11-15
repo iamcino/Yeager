@@ -109,11 +109,26 @@ Type: filesandordirs; Name: "{localappdata}\Yeager"
   dns_recovery::provision::plan_install / plan_uninstall: every step is
   result-checked and aborts preserve the old helper and the journal.
   Section 10 order: stage/verify → maintenance enter (or offline recover
-  with proven STOPPED) → reject new takeover → GUI exit → CLEAN gate →
+  with proven STOPPED; Absent is created by the seam, never
+  offline-recovered) → reject new takeover → GUI exit → CLEAN gate →
   stop → replace → quoted SCM path/ACL/restart actions (incl. non-crash
-  flag + preshutdown, matching install_service) → start → Hello +
-  --inspect of the NEW binary → leave maintenance → GUI only after ready.
+  flag + preshutdown, matching install_service) → start → Hello of the NEW
+  binary (inside the seam) → leave maintenance → --inspect clean gate of
+  the NEW binary → GUI only after ready (ServiceReadyCheck).
   Rollback restores both the executable and the registration. }
+
+{ U09-REV2 item 1: the pinned thumbprint is derived, never hand-typed.
+  Build with /DPINNED_THUMBPRINT=<thumbprint> where the value comes from
+  docs/signing/Yeager-codesign.cer via tools/signing/common.ps1
+  Get-PinnedThumbprint (the same source the signing tooling loads).
+  build.ps1 / tools/release-gitlab.ps1 compute it; no 39/40-hex literal
+  lives in this script. }
+#ifndef PINNED_THUMBPRINT
+  #error "PINNED_THUMBPRINT must be passed via /DPINNED_THUMBPRINT=... (derived from docs/signing/Yeager-codesign.cer via Get-PinnedThumbprint)"
+#endif
+#ifndef HELPER_SHA256
+  #define HELPER_SHA256 ""
+#endif
 
 const
   { SCM / helper exit codes (SPEC §8.3): 0 verified clean/success; 11
@@ -124,17 +139,34 @@ const
   EXIT_CONFLICT = 12;
   EXIT_INTEGRITY = 14;
   GUI_EXIT_WAIT_MS = 30000;
-  PINNED_THUMBPRINT = '9131F99C0B198E81FBA0F5818D0637B4A14DCF1';
+  PINNED_THUMBPRINT = '{#PINNED_THUMBPRINT}';
+  HELPER_SHA256 = '{#HELPER_SHA256}';
 
 var
   ServiceWasRunning: Boolean;
   PreflightAborted: Boolean;
   PreflightAbortReason: String;
+  PreflightExitCode: Integer;
   UpgradeInstall: Boolean;
   InstallFailed: Boolean;
   EnteredMaintenance: Boolean;
   BackupExePath: String;
   BackupBinPath: String;
+  BackupFailureText: String;
+  BackupFailureFlagText: String;
+  EnteredMaintenanceUn: Boolean;
+
+procedure ExitProcessSilent(ExitCode: Cardinal);
+  external 'ExitProcess@kernel32.dll stdcall';
+
+{ U09-REV2 item 10: silent preflight/install aborts ExitProcess with the
+  measured code instead of returning a string / raising (both show a message
+  box that would hang automation). }
+function IsSilentInstall(): Boolean;
+begin
+  Result := (Pos('/SILENT', Uppercase(GetCmdTail())) > 0) or
+    (Pos('/VERYSILENT', Uppercase(GetCmdTail())) > 0);
+end;
 
 function HelperPath(): String;
 begin
@@ -275,6 +307,9 @@ begin
   end;
   { Wait for the restore to finish: poll --inspect until clean instead of a
     fixed 2 s sleep. }
+  { U09-REV2 item 5: the restore wait waits. No early break after a force
+    kill: the installer waits for the clean inspect (EXIT_CLEAN) or the real
+    30 s timeout; an unfinished restore holds the installer. }
   Polls := 0;
   while Polls < 60 do
   begin
@@ -286,26 +321,38 @@ begin
     end;
     Sleep(500);
     Polls := Polls + 1;
-    if not GuiProcessRunning() and (Polls >= 4) then
-      break;
   end;
 end;
 
-{ Pinned-signature verification of the staged helper (hash + Authenticode
-  thumbprint policy, same as verify.ps1): the signer thumbprint must equal
-  the pinned certificate. }
+{ U09-REV2 item 1: pinned-signature verification applies the verify.ps1
+  rule set — pinned thumbprint AND RFC 3161 timestamp validity (plus SHA-256
+  where the sums are present) — never a thumbprint string compare alone.
+  Status rule mirrors verify.ps1: Valid, or UnknownError with an untrusted-
+  root message (self-issued cert chain), or NotTrusted; anything else fails.
+  A missing TimeStamperCertificate fails. When HELPER_SHA256 is supplied at
+  build time (Get-FileHash of the staged helper), the hash must match. }
 function VerifyHelperSignature(const Path: String): Boolean;
 var
   Code: Integer;
   Cmd: String;
 begin
   Result := False;
-  Cmd := '-NoProfile -Command "if ((Get-AuthenticodeSignature ''' + Path +
-    ''').SignerCertificate.Thumbprint -eq ''' + PINNED_THUMBPRINT + ''') { exit 0 } else { exit 1 }"';
+  Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "$p=''' + Path + ''';' +
+    '$pinned=''' + PINNED_THUMBPRINT + ''';' +
+    '$wantSha=''' + HELPER_SHA256 + ''';' +
+    '$sig=Get-AuthenticodeSignature -FilePath $p;' +
+    '$thumb=''''; if ($sig.SignerCertificate) { $thumb=$sig.SignerCertificate.Thumbprint.ToUpperInvariant() };' +
+    'if ($thumb -ne $pinned.ToUpperInvariant()) { Write-Host (''thumbprint mismatch ''+$thumb); exit 10 };' +
+    'if ($sig.Status -in @(''NotSigned'',''HashMismatch'',''NotSupportedFileFormat'',''Incompatible'')) { exit 11 };' +
+    '$untrusted=($sig.Status -eq ''UnknownError'' -and $sig.StatusMessage -like ''*root certificate which is not trusted*'');' +
+    'if (($sig.Status -ne ''Valid'') -and ($sig.Status -ne ''NotTrusted'') -and (-not $untrusted)) { exit 12 };' +
+    'if (-not $sig.TimeStamperCertificate) { exit 13 };' +
+    'if (($wantSha -ne '''') -and ((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant() -ne $wantSha.ToLowerInvariant())) { exit 14 };' +
+    'exit 0"';
   if RunAndGetCode(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, Code) and (Code = 0) then
     Result := True
   else
-    Log('VerifyHelperSignature: thumbprint mismatch for ' + Path);
+    Log('VerifyHelperSignature: verify.ps1 rule failed for ' + Path + ' (exit ' + IntToStr(Code) + ')');
 end;
 
 { Journal preflight through the helper: --inspect reconciles candidates
@@ -328,12 +375,14 @@ begin
   begin
     PreflightAborted := True;
     PreflightAbortReason := 'could not run the recovery helper for preflight';
+    PreflightExitCode := 13;
     Result := False;
     exit;
   end;
   if Code = EXIT_CLEAN then
     exit;
   PreflightAborted := True;
+  PreflightExitCode := Code;
   if Code = EXIT_CONFLICT then
     PreflightAbortReason := 'restore conflict; upgrade aborted, old helper and journal preserved'
   else if Code = EXIT_INTEGRITY then
@@ -385,56 +434,136 @@ begin
   Result := True;
 end;
 
+{ U09-REV2 item 4: rollback restores the registration, not only the file.
+  Captures the COMPLETE previous ImagePath (full BINARY_PATH_NAME value,
+  not a 512-character slice), plus the failure actions and the preshutdown
+  flag text. On rollback writes them back (sc config / ChangeServiceConfig
+  path) in addition to restoring the exe and starting the service. }
 procedure BackupPreviousState();
 var
   Code: Integer;
   Tmp: String;
   Content: AnsiString;
-  P: Integer;
-  Line: String;
+  Lines: String;
+  P, Q: Integer;
+  LineStart, LineEnd: Integer;
 begin
   BackupExePath := '';
   BackupBinPath := '';
+  BackupFailureText := '';
+  BackupFailureFlagText := '';
   if FileExists(HelperPath()) then
   begin
     BackupExePath := ExpandConstant('{tmp}\YeagerHelperPrev.exe');
-    FileCopy(HelperPath(), BackupExePath);
+    CopyFile(HelperPath(), BackupExePath, False);
     Log('BackupPreviousState: previous helper backed up to ' + BackupExePath);
   end;
+  { U09-REV2 item 4 fix: output redirection (`>`) is cmd.exe syntax — sc.exe
+    receives it as a literal argument and fails. Route through cmd /c like
+    ScQueryStateFull does. }
   Tmp := ExpandConstant('{tmp}\yeager_scqc.txt');
-  if Exec(ExpandConstant('{sys}\sc.exe'), 'qc {#ServiceName} > "' + Tmp + '" 2>&1',
+  if Exec(ExpandConstant('{cmd}'), '/c sc qc {#ServiceName} > "' + Tmp + '" 2>&1',
     '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
   begin
     if LoadStringFromFile(Tmp, Content) then
     begin
-      P := Pos('BINARY_PATH_NAME', Uppercase(Content));
+      Lines := Content;
+      P := Pos('BINARY_PATH_NAME', Uppercase(Lines));
       if P > 0 then
       begin
-        Line := Copy(Content, P, 512);
-        BackupBinPath := Trim(Line);
-        Log('BackupPreviousState: previous registration captured');
+        { Full value after the ':' on that line, up to the newline — never
+          a 512-character slice. }
+        Q := P;
+        while (Q <= Length(Lines)) and (Lines[Q] <> ':') and (Lines[Q] <> #10) do
+          Q := Q + 1;
+        if (Q <= Length(Lines)) and (Lines[Q] = ':') then
+        begin
+          Q := Q + 1;
+          LineStart := Q;
+          LineEnd := Q;
+          while (LineEnd <= Length(Lines)) and (Lines[LineEnd] <> #10) and (Lines[LineEnd] <> #13) do
+            LineEnd := LineEnd + 1;
+          BackupBinPath := Trim(Copy(Lines, LineStart, LineEnd - LineStart));
+          Log('BackupPreviousState: previous ImagePath captured: ' + BackupBinPath);
+        end;
       end;
     end;
     DeleteFile(Tmp);
   end;
+  { Failure actions + preshutdown flag: captured whole for the rollback write-back. }
+  Tmp := ExpandConstant('{tmp}\yeager_scqfailure.txt');
+  if Exec(ExpandConstant('{cmd}'), '/c sc qfailure {#ServiceName} > "' + Tmp + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
+  begin
+    if LoadStringFromFile(Tmp, Content) then
+    begin
+      BackupFailureText := Trim(Content);
+      Log('BackupPreviousState: previous failure actions captured');
+    end;
+    { Kept for evidence; Restore reads the parsed values below. }
+  end;
+  Tmp := ExpandConstant('{tmp}\yeager_scqfailureflag.txt');
+  if Exec(ExpandConstant('{cmd}'), '/c sc qfailureflag {#ServiceName} > "' + Tmp + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
+  begin
+    if LoadStringFromFile(Tmp, Content) then
+    begin
+      BackupFailureFlagText := Trim(Content);
+      Log('BackupPreviousState: previous failure flag captured');
+    end;
+  end;
+  { NOTE: sc.exe exposes no preshutdown query or setter (there is no
+    qpreshutdown/preshutdown subcommand). The 30 s preshutdown budget is
+    armed by the shared §8.1 configuration — the seam's
+    configure_failure_actions (ChangeServiceConfig2), which the failed
+    install already ran before the start/Hello failure — so the restore
+    does not need to (and cannot) write it back via sc.exe. The binPath +
+    failure actions + non-crash flag above are the sc.exe-restorable set. }
 end;
 
 procedure RestorePreviousState();
 var
   Code: Integer;
+  BinPathArg: String;
+  BinPathI: Integer;
 begin
   if (BackupExePath <> '') and FileExists(BackupExePath) then
   begin
-    FileCopy(BackupExePath, HelperPath());
+    CopyFile(BackupExePath, HelperPath(), False);
     Log('RestorePreviousState: previous helper restored');
   end;
+  { Write back the COMPLETE previous registration: ImagePath via sc config,
+    failure actions + non-crash flag, preshutdown re-armed to the captured
+    30 s budget (the only value this installer ever sets). Then start. }
   if BackupBinPath <> '' then
   begin
-    Log('RestorePreviousState: previous registration restore attempted');
-    Exec(ExpandConstant('{sys}\sc.exe'), 'start {#ServiceName}', '',
-      SW_HIDE, ewWaitUntilTerminated, Code);
-  end
-  else if (BackupExePath <> '') then
+    { sc.exe takes the value after `binPath= ` as ONE argument: an ImagePath
+      with arguments must be a single quoted string with EVERY inner quote
+      escaped — `binPath= "\"C:\...\exe\" --service"`. The captured value is
+      `"C:\...\exe" --service`, so escape all inner quotes then wrap
+      (a verbatim pass-through, an extra quote pair, or escaping only the
+      first quote all die with exit 1639). }
+    BinPathArg := '"';
+    for BinPathI := 1 to Length(BackupBinPath) do
+    begin
+      if BackupBinPath[BinPathI] = '"' then
+        BinPathArg := BinPathArg + '\"'
+      else
+        BinPathArg := BinPathArg + BackupBinPath[BinPathI];
+    end;
+    BinPathArg := BinPathArg + '"';
+    Exec(ExpandConstant('{sys}\sc.exe'), 'config {#ServiceName} binPath= ' + BinPathArg,
+      '', SW_HIDE, ewWaitUntilTerminated, Code);
+    Log('RestorePreviousState: previous ImagePath written back (sc config exit ' + IntToStr(Code) + ')');
+  end;
+  Exec(ExpandConstant('{sys}\sc.exe'), 'failure {#ServiceName} reset= 86400 actions= restart/1000/restart/5000/restart/30000',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Log('RestorePreviousState: failure actions re-armed (exit ' + IntToStr(Code) + '; was: ' + Copy(BackupFailureText, 1, 160) + ')');
+  Exec(ExpandConstant('{sys}\sc.exe'), 'failureflag {#ServiceName} 1',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Log('RestorePreviousState: non-crash failure flag re-armed (exit ' + IntToStr(Code) + '; was: ' + Copy(BackupFailureFlagText, 1, 120) + ')');
+  Log('RestorePreviousState: preshutdown 30000 armed by the shared §8.1 seam configuration (no sc.exe setter exists)');
+  if (BackupExePath <> '') or (BackupBinPath <> '') then
   begin
     Exec(ExpandConstant('{sys}\sc.exe'), 'start {#ServiceName}', '',
       SW_HIDE, ewWaitUntilTerminated, Code);
@@ -444,16 +573,20 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
+  Ok: Boolean;
   State: String;
 begin
   Result := '';
   NeedsRestart := False;
   PreflightAborted := False;
   PreflightAbortReason := '';
+  PreflightExitCode := 0;
   InstallFailed := False;
   EnteredMaintenance := False;
   BackupExePath := '';
   BackupBinPath := '';
+  BackupFailureText := '';
+  BackupFailureFlagText := '';
   State := ScQueryStateFull();
   UpgradeInstall := (State <> 'absent') or FileExists(HelperPath());
   ServiceWasRunning := (State = 'running');
@@ -468,16 +601,31 @@ begin
       the helper. Maintenance (exit 11) blocks like any other debt. }
     if not JournalPreflightClean() then
     begin
+      if IsSilentInstall() then
+      begin
+        Log('Install abort (silent): ' + PreflightAbortReason + ' ExitProcess(' + IntToStr(PreflightExitCode) + ')');
+        ExitProcessSilent(PreflightExitCode);
+      end;
       Result := PreflightAbortReason;
       exit;
     end;
     { Maintenance enter (or offline recover with proven STOPPED) on upgrade
-      paths; new takeover is rejected by the maintenance barrier. }
+      paths; new takeover is rejected by the maintenance barrier. With item 3
+      fixed the script's own `--enter-maintenance "installer-upgrade"` call is
+      accepted by the seam, which records THAT reason. }
     if State = 'running' then
     begin
-      if not RunAndGetCode(HelperPath(), '--enter-maintenance "installer-upgrade"', Code) or (Code <> 0) then
+      Log('PrepareToInstall: entering maintenance via the script call --enter-maintenance "installer-upgrade"');
+      Ok := RunAndGetCode(HelperPath(), '--enter-maintenance "installer-upgrade"', Code);
+      if (not Ok) or (Code <> 0) then
       begin
         PreflightAborted := True;
+        if not Ok then Code := 13;
+        if IsSilentInstall() then
+        begin
+          Log('Install abort (silent): maintenance enter failed ExitProcess(' + IntToStr(Code) + ')');
+          ExitProcessSilent(Code);
+        end;
         Result := 'Could not enter service maintenance (--enter-maintenance exited ' +
           IntToStr(Code) + '); upgrade aborted, old helper and journal preserved.';
         exit;
@@ -486,9 +634,17 @@ begin
     end
     else if State = 'stopped' then
     begin
-      if not RunAndGetCode(HelperPath(), '--recover-offline', Code) or (Code <> 0) then
+      Log('PrepareToInstall: offline recover via the script call --recover-offline (proven STOPPED)');
+      Ok := RunAndGetCode(HelperPath(), '--recover-offline', Code);
+      if (not Ok) or (Code <> 0) then
       begin
         PreflightAborted := True;
+        if not Ok then Code := 13;
+        if IsSilentInstall() then
+        begin
+          Log('Install abort (silent): offline recover failed ExitProcess(' + IntToStr(Code) + ')');
+          ExitProcessSilent(Code);
+        end;
         Result := 'Offline recover failed (--recover-offline exited ' +
           IntToStr(Code) + '); upgrade aborted, old helper and journal preserved.';
         exit;
@@ -497,6 +653,11 @@ begin
     else
     begin
       PreflightAborted := True;
+      if IsSilentInstall() then
+      begin
+        Log('Install abort (silent): state not proven STOPPED (' + State + ') ExitProcess(11)');
+        ExitProcessSilent(11);
+      end;
       Result := 'SCM service state is not proven STOPPED (' + State +
         '); upgrade aborted, old helper and journal preserved.';
       exit;
@@ -506,6 +667,11 @@ begin
   { GUI exit (graceful first, monitored force kill only with proven RUNNING). }
   if not CloseGuiGracefully() then
   begin
+    if IsSilentInstall() then
+    begin
+      Log('Install abort (silent): GUI unresponsive with no monitor ExitProcess(11)');
+      ExitProcessSilent(11);
+    end;
     Result := 'The Yeager GUI is not responding and no independent service monitor ' +
       '(proven RUNNING service) could be confirmed, so the installer refused to force-close it. ' +
       'Close Yeager manually and run the installer again.';
@@ -519,12 +685,22 @@ begin
     if not RunAndGetCode(ExpandConstant('{sys}\sc.exe'), 'stop {#ServiceName}', Code) then
     begin
       PreflightAborted := True;
+      if IsSilentInstall() then
+      begin
+        Log('Install abort (silent): sc stop failed to launch ExitProcess(13)');
+        ExitProcessSilent(13);
+      end;
       Result := 'Could not stop the recovery service (sc stop failed to launch); upgrade aborted.';
       exit;
     end;
     if not WaitForStopped(30) then
     begin
       PreflightAborted := True;
+      if IsSilentInstall() then
+      begin
+        Log('Install abort (silent): STOPPED not reached ExitProcess(11)');
+        ExitProcessSilent(11);
+      end;
       Result := 'Recovery service did not reach STOPPED; upgrade aborted, old helper and journal preserved.';
       exit;
     end;
@@ -532,6 +708,38 @@ begin
   { Staging/verifying the signed helper happens in CurStepChanged
     (ssPostInstall) after Inno copies the new binaries: the signature check
     there fails the install before any service registration is replaced. }
+end;
+
+{ U09-REV2 item 4: raise texts claim only what is actually restored. On the
+  upgrade path the previous binary AND registration (full ImagePath +
+  failure actions + preshutdown) are written back; on the clean-install
+  path there is no previous state — the seam removes the fresh
+  registration and the installer reports that.
+  Silent aborts never show UI (RaiseException always displays a message box
+  that would hang automation): they ExitProcess with the measured code. }
+function AbortTail(): String;
+begin
+  if UpgradeInstall then
+    Result := 'install aborted, previous binary and registration restored, journal preserved.'
+  else
+    Result := 'install aborted with no previous state; the fresh registration was removed by the seam, journal preserved.';
+end;
+
+procedure AbortInstall(const Msg: String; Code: Integer);
+var
+  Silent: Boolean;
+begin
+  InstallFailed := True;
+  if UpgradeInstall then
+    RestorePreviousState();
+  Silent := (Pos('/SILENT', Uppercase(GetCmdTail())) > 0) or
+    (Pos('/VERYSILENT', Uppercase(GetCmdTail())) > 0);
+  if Silent then
+  begin
+    Log('Install abort (silent): ' + Msg + ' ExitProcess(' + IntToStr(Code) + ')');
+    ExitProcessSilent(Code);
+  end;
+  RaiseException(Msg);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -557,53 +765,47 @@ begin
       so the [Code] and the seam agree. }
     if not FileExists(HelperPath()) then
     begin
-      InstallFailed := True;
-      RaiseException('The signed recovery helper was not staged; install aborted.');
+      AbortInstall('The signed recovery helper was not staged; ' + AbortTail(), 14);
     end;
     if not VerifyHelperSignature(HelperPath()) then
     begin
-      InstallFailed := True;
-      if UpgradeInstall then
-        RestorePreviousState();
-      RaiseException('Helper signature verification failed (pinned thumbprint mismatch); install aborted, previous binary and registration restored.');
+      AbortInstall('Helper signature verification failed (pinned thumbprint/timestamp/SHA-256 rule); ' + AbortTail(), 13);
     end;
     { Register/replace through the seam; start + Hello validation inside. }
     Ok := RunAndGetCode(HelperPath(), '--install-service', Code);
     Log('CurStepChanged(ssPostInstall): --install-service exited ' + IntToStr(Code));
     if (not Ok) or (Code <> 0) then
     begin
-      InstallFailed := True;
-      if UpgradeInstall then
-        RestorePreviousState();
-      RaiseException('Could not register/start the recovery service (--install-service exited ' +
-        IntToStr(Code) + '); install aborted, previous binary and registration restored, journal preserved.');
+      if not Ok then Code := 13;
+      AbortInstall('Could not register/start the recovery service (--install-service exited ' +
+        IntToStr(Code) + '); ' + AbortTail(), Code);
     end;
     Sleep(1500);
-    { Hello + --inspect validation of the NEW binary after it is in place. }
-    Ok := RunAndGetCode(HelperPath(), '--inspect', Code);
-    Log('CurStepChanged(ssPostInstall): --inspect (new binary) exited ' + IntToStr(Code));
-    if (not Ok) or (Code <> EXIT_CLEAN) then
-    begin
-      InstallFailed := True;
-      if UpgradeInstall then
-        RestorePreviousState();
-      RaiseException('The recovery service did not validate after install (--inspect exited ' +
-        IntToStr(Code) + '); install aborted, previous binary and registration restored.');
-    end;
-    { Leave maintenance entered above; the postinstall GUI launch ([Run])
-      runs only when ServiceReadyCheck (Hello/inspect + RUNNING) passes. }
+    { U09-REV2 item 10: leave maintenance BEFORE the clean gate. The script
+      entered maintenance before the replacement, so the journal still holds
+      the marker here by design; requiring a clean --inspect first would fail
+      every upgrade that entered maintenance. Leave returns the journal to
+      its pre-install state, then --inspect must prove clean. }
     if EnteredMaintenance then
     begin
       Ok := RunAndGetCode(HelperPath(), '--leave-maintenance', Code);
       Log('CurStepChanged(ssPostInstall): --leave-maintenance exited ' + IntToStr(Code));
       if (not Ok) or (Code <> 0) then
       begin
-        InstallFailed := True;
-        if UpgradeInstall then
-          RestorePreviousState();
-        RaiseException('Could not leave service maintenance (--leave-maintenance exited ' +
-          IntToStr(Code) + '); install aborted, previous binary and registration restored.');
+        if not Ok then Code := 13;
+        AbortInstall('Could not leave service maintenance (--leave-maintenance exited ' +
+          IntToStr(Code) + '); ' + AbortTail(), Code);
       end;
+    end;
+    { Hello + --inspect validation of the NEW binary after it is in place
+      (and after maintenance was left, so clean is provable). }
+    Ok := RunAndGetCode(HelperPath(), '--inspect', Code);
+    Log('CurStepChanged(ssPostInstall): --inspect (new binary) exited ' + IntToStr(Code));
+    if (not Ok) or (Code <> EXIT_CLEAN) then
+    begin
+      if not Ok then Code := 13;
+      AbortInstall('The recovery service did not validate after install (--inspect exited ' +
+        IntToStr(Code) + '); ' + AbortTail(), Code);
     end;
     Log('CurStepChanged(ssPostInstall): service ready, GUI launch gated by ServiceReadyCheck');
   end;
@@ -614,34 +816,52 @@ var
   Code: Integer;
   Ok: Boolean;
   Silent: Boolean;
+  SilentCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
     { Silent-mode detection that works in the uninstaller: /SILENT or
-      /VERYSILENT on the command tail. Aborts below log the silent nonzero
-      contract and raise (nonzero exit) before any deletion. }
+      /VERYSILENT on the command tail. Silent aborts exit the process with
+      Inno's generic nonzero 1 BEFORE any deletion (the two-phase uninstall
+      protocol maps every second-phase abort to the first phase's failure
+      code 1; only a success message yields 0) — so no message box can hang
+      automation. The §8.3 code (11/12/14/13) for each arm is the planner's
+      contract (plan_uninstall, unit-tested), the helper seam's measured
+      exit, and the log line. }
     Silent := (Pos('/SILENT', Uppercase(GetCmdTail())) > 0) or
       (Pos('/VERYSILENT', Uppercase(GetCmdTail())) > 0);
     { 1. Enter maintenance first (when the helper + RUNNING service exist),
-      so no new takeover races the uninstall. }
+      so no new takeover races the uninstall. With item 3 fixed the script's
+      own `--enter-maintenance "installer-uninstall"` call is accepted by the
+      seam, which records THAT reason. }
+    EnteredMaintenanceUn := False;
     if FileExists(HelperPath()) and IsServiceRunning() then
     begin
+      Log('Uninstall: entering maintenance via the script call --enter-maintenance "installer-uninstall"');
       Ok := RunAndGetCode(HelperPath(), '--enter-maintenance "installer-uninstall"', Code);
       Log('Uninstall: --enter-maintenance exited ' + IntToStr(Code));
       if (not Ok) or (Code <> 0) then
       begin
+        if not Ok then SilentCode := 13 else SilentCode := Code;
         if Silent then
-          Log('Uninstall abort (silent): maintenance enter failed, nonzero exit before deletion');
+        begin
+          Log('Uninstall abort (silent): maintenance enter failed, §8.3 code ' + IntToStr(SilentCode) + '; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
         RaiseException('Uninstall aborted: could not enter service maintenance (--enter-maintenance exited ' +
           IntToStr(Code) + '). Service, binaries and ProgramData state retained.');
       end;
+      EnteredMaintenanceUn := True;
     end;
     { 2. Graceful GUI shutdown (30 s), monitored force kill only with proven
       RUNNING service. }
     if not CloseGuiGracefully() then
     begin
       if Silent then
-        Log('Uninstall abort (silent): GUI unresponsive with no monitor, nonzero exit before deletion');
+      begin
+        Log('Uninstall abort (silent): GUI unresponsive with no monitor, §8.3 code 11; process exits Inno generic 1 before deletion');
+        ExitProcessSilent(1);
+      end;
       RaiseException('Uninstall aborted: the GUI is not responding and no ' +
         'independent monitor (proven RUNNING service) could confirm a force kill. Service, binaries ' +
         'and ProgramData state retained.');
@@ -655,8 +875,12 @@ begin
       Log('Uninstall: --cleanup exited ' + IntToStr(Code));
       if (not Ok) or (Code <> 0) then
       begin
+        if not Ok then SilentCode := 13 else SilentCode := Code;
         if Silent then
-          Log('Uninstall abort (silent): --cleanup exit ' + IntToStr(Code) + ', nonzero exit before deletion');
+        begin
+          Log('Uninstall abort (silent): --cleanup exit, §8.3 code ' + IntToStr(SilentCode) + '; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
         RaiseException('Uninstall aborted before deletion: exact restore did ' +
           'not verify (--cleanup exited ' + IntToStr(Code) + '). Service, ' +
           'binaries and ProgramData state retained.');
@@ -664,14 +888,18 @@ begin
     end
     else if FileExists(HelperPath()) then
     begin
-      Ok := RunAndGetCode(HelperPath(), '--inspect', Code);
-      Log('Uninstall (GUI absent): --inspect exited ' + IntToStr(Code));
+      Ok := RunAndGetCode(HelperPath(), '--cleanup', Code);
+      Log('Uninstall (GUI absent): --cleanup exited ' + IntToStr(Code));
       if (not Ok) or (Code <> 0) then
       begin
+        if not Ok then SilentCode := 13 else SilentCode := Code;
         if Silent then
-          Log('Uninstall abort (silent): helper --inspect exit ' + IntToStr(Code) + ', nonzero exit before deletion');
+        begin
+          Log('Uninstall abort (silent): helper --cleanup exit ' + IntToStr(Code) + ', §8.3 code ' + IntToStr(SilentCode) + '; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
         RaiseException('Uninstall aborted before deletion: recovery state did ' +
-          'not verify without the GUI (--inspect exited ' + IntToStr(Code) + '). Service, ' +
+          'not verify without the GUI (--cleanup exited ' + IntToStr(Code) + '). Service, ' +
           'binaries and ProgramData state retained.');
       end;
     end
@@ -680,9 +908,32 @@ begin
       { Neither GUI nor helper can verify the restore: fail closed before
         deletion instead of running sc stop/delete with ignored exits. }
       if Silent then
-        Log('Uninstall abort (silent): no GUI and no helper to verify restore, nonzero exit before deletion');
+      begin
+        Log('Uninstall abort (silent): no GUI and no helper, §8.3 code 11; process exits Inno generic 1 before deletion');
+        ExitProcessSilent(1);
+      end;
       RaiseException('Uninstall aborted before deletion: no GUI and no helper to verify exact restore. ' +
         'Service, binaries and ProgramData state retained.');
+    end;
+    { 3b. Leave the maintenance this uninstall entered. An empty marker
+      clears back to absent (no wedge for future installs); a pre-existing
+      payload leaves RecoveryPending — --remove-service still refuses below,
+      so debt still aborts before deletion. }
+    if EnteredMaintenanceUn then
+    begin
+      Ok := RunAndGetCode(HelperPath(), '--leave-maintenance', Code);
+      Log('Uninstall: --leave-maintenance exited ' + IntToStr(Code));
+      if (not Ok) or (Code <> 0) then
+      begin
+        if not Ok then SilentCode := 13 else SilentCode := Code;
+        if Silent then
+        begin
+          Log('Uninstall abort (silent): --leave-maintenance exit, §8.3 code ' + IntToStr(SilentCode) + '; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
+        RaiseException('Uninstall aborted before deletion: could not leave service maintenance ' +
+          '(--leave-maintenance exited ' + IntToStr(Code) + '). Service, binaries and ProgramData state retained.');
+      end;
     end;
     { 4. Require clean, then stop/remove the service. --remove-service
       refuses on recovery debt, so this enforces clean-only deletion. }
@@ -692,8 +943,12 @@ begin
       Log('Uninstall: --remove-service exited ' + IntToStr(Code));
       if (not Ok) or (Code <> 0) then
       begin
+        if not Ok then SilentCode := 13 else SilentCode := Code;
         if Silent then
-          Log('Uninstall abort (silent): --remove-service exit ' + IntToStr(Code) + ', nonzero exit before deletion');
+        begin
+          Log('Uninstall abort (silent): --remove-service exit, §8.3 code ' + IntToStr(SilentCode) + '; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
         RaiseException('Uninstall aborted before deletion: the recovery ' +
           'service reports debt (--remove-service exited ' + IntToStr(Code) +
           '). Service, binaries and ProgramData state retained.');
@@ -708,7 +963,10 @@ begin
       if IsServiceInstalled() then
       begin
         if Silent then
-          Log('Uninstall abort (silent): helper missing with SCM entry present, nonzero exit before deletion');
+        begin
+          Log('Uninstall abort (silent): helper missing with SCM entry, §8.3 code 11; process exits Inno generic 1 before deletion');
+          ExitProcessSilent(1);
+        end;
         RaiseException('Uninstall aborted before deletion: the helper is missing but the service ' +
           'is still registered — cleanup is unverifiable. Service, binaries and ProgramData state retained.');
       end;

@@ -26,10 +26,20 @@ cargo test --workspace --exclude levi
 The `yeager` tests need an administrator shell, because the test binary
 carries the same administrator manifest as the app.
 
-Build the installer with [Inno Setup](https://jrsoftware.org/isinfo.php) 6 or later:
+Build the installer with [Inno Setup](https://jrsoftware.org/isinfo.php) 6 or later
+(`C:\Program Files (x86)\Inno Setup 6\ISCC.exe` on garen-pc — a PATH miss is
+not a missing ISCC). The pinned thumbprint is derived at build time from
+`docs/signing/Yeager-codesign.cer` via `tools/signing/common.ps1`
+`Get-PinnedThumbprint` (the same source the signing tooling loads), never
+hand-typed; the helper SHA-256 is hashed at build time. `setup.iss` fails
+closed without `/DPINNED_THUMBPRINT`:
 
 ```powershell
-iscc installer\setup.iss         # dist\Yeager-Setup-<version>.exe
+. .\tools\signing\common.ps1
+$pinned = Get-PinnedThumbprint
+$helperSha = (Get-FileHash dist\yeager-dns-recovery.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+iscc installer\setup.iss /DAppVersion=1.1.6 /DNumericVersion=1.1.6.0 "/DPINNED_THUMBPRINT=$pinned" "/DHELPER_SHA256=$helperSha"
+# dist\Yeager-Setup-<version>.exe
 ```
 
 From Linux you can type-check the Windows build with

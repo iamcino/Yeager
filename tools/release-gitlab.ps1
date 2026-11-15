@@ -234,7 +234,11 @@ try {
             }
             if (-not $iscc) { throw 'Inno Setup not found. Run "winget install JRSoftware.InnoSetup" and try again.' }
             $numeric = ($version -replace '-.*$', '') + '.0'
-            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric"
+            # U09-REV2 item 1: the installer thumbprint is derived, never
+            # hand-typed — same source the signing tooling loads.
+            $pinnedBuild = Get-PinnedThumbprint
+            $helperShaBuild = (Get-FileHash "$dist\yeager-dns-recovery.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric" "/DPINNED_THUMBPRINT=$pinnedBuild" "/DHELPER_SHA256=$helperShaBuild"
             Step 'Signing the installer'
             Sign "$dist\$setup" "Yeager-Setup-$version-signature.json"
         } finally {

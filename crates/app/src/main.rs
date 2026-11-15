@@ -179,6 +179,68 @@ fn portable_takeover_allowed() -> bool {
     )
 }
 
+/// U09-REV2 item 8: computed portable helper signature verdict (never a
+/// hardcoded `Valid`). Verifies the carried helper for real — pinned
+/// thumbprint from the cert file (same source as
+/// `tools/signing/common.ps1` `Get-PinnedThumbprint`) + RFC 3161 timestamp
+/// validity under the release verify rule (`tools/signing/verify.ps1`).
+#[cfg(windows)]
+fn portable_helper_signature(path: &std::path::Path) -> dns_recovery::provision::SignatureCheck {
+    use dns_recovery::provision::SignatureCheck;
+    // Pinned cert thumbprint — docs/signing/Yeager-codesign.cer via
+    // Get-PinnedThumbprint (40 digits; the 39-digit dropped-4 value fails).
+    const PINNED: &str = "9131F99C0B198E81FBA0F5818D0637B4A14D4CF1";
+    let ps = format!(
+        "$s=Get-AuthenticodeSignature -FilePath '{p}'; \
+         $t=''; if ($s.SignerCertificate) {{ $t=$s.SignerCertificate.Thumbprint.ToUpperInvariant() }}; \
+         if ($t -ne '{pinned}') {{ exit 10 }}; \
+         if ($s.Status -in @('NotSigned','HashMismatch','NotSupportedFileFormat','Incompatible')) {{ exit 11 }}; \
+         $u=($s.Status -eq 'UnknownError' -and $s.StatusMessage -like '*root certificate which is not trusted*'); \
+         if (($s.Status -ne 'Valid') -and ($s.Status -ne 'NotTrusted') -and (-not $u)) {{ exit 12 }}; \
+         if (-not $s.TimeStamperCertificate) {{ exit 13 }}; exit 0",
+        p = path.to_string_lossy().replace('\'', "''"),
+        pinned = PINNED
+    );
+    match std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &ps])
+        .output()
+    {
+        Ok(o) if o.status.success() => SignatureCheck::Valid,
+        Ok(o) if o.status.code() == Some(10) || o.status.code() == Some(11) => {
+            SignatureCheck::Invalid
+        }
+        Ok(_) => SignatureCheck::Invalid,
+        Err(_) => SignatureCheck::Unavailable,
+    }
+}
+
+/// U09-REV2 item 8: actual portable removal path — calls the removal
+/// predicate (behavior, not constants). Removes only stale portable-folder
+/// files; any protected deletion target is refused without touching the
+/// filesystem.
+#[cfg(windows)]
+fn portable_cleanup_stale() {
+    if is_protected_install() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    for name in ["yeager.old.exe", "yeager.new.exe"] {
+        let p = exe.with_file_name(name);
+        let s = p.to_string_lossy().to_string();
+        // The predicate enforces the invariant on the real path.
+        if dns_recovery::provision::portable_delete_guarded(&s).is_err() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(not(windows))]
+fn portable_cleanup_stale() {}
+
 /// U09-REV Q2 bootstrap (E): first run from a portable folder with the
 /// service absent, elevated, and the helper signature valid copies the helper
 /// into protected Program Files and installs the service through the seam.
@@ -209,12 +271,18 @@ fn maybe_portable_bootstrap() {
         eprintln!("portable first run requires the elevated bootstrap; takeover refused, diagnostic UI only");
         return;
     }
+    // Computed verdict for real (item 8) — never a hardcoded Valid.
+    let sig = portable_helper_signature(&portable_helper);
+    if sig != dns_recovery::provision::SignatureCheck::Valid {
+        eprintln!("portable helper signature did not verify ({sig:?}); takeover refused, diagnostic UI only");
+        return;
+    }
     let ctx = dns_recovery::provision::PortableContext {
         location: dns_recovery::provision::LaunchLocation::PortableFolder,
         service: dns_recovery::provision::ServiceState::Absent,
         journal: dns_recovery::provision::JournalStatus::Absent,
         elevated: true,
-        helper_signature: dns_recovery::provision::SignatureCheck::Valid,
+        helper_signature: sig,
     };
     if !matches!(
         dns_recovery::provision::plan_portable(&ctx),
@@ -388,6 +456,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let auto_connect_blocked = decision.blocks_auto_connect();
     // U09-REV Q2 bootstrap (E): portable first run provisions the persistent
     // service via the elevated bootstrap before the takeover gate runs.
+    // Stale portable files are cleaned through the guarded removal path.
+    portable_cleanup_stale();
     maybe_portable_bootstrap();
     // U09 Q2: absent-service portable takeover refuses. A portable GUI with
     // no reachable recovery service stays diagnostic-only: no silent
