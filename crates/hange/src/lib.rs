@@ -21,7 +21,7 @@ mod stub;
 mod system;
 mod upstream;
 
-pub use authority::{global as dns_authority, Applied, Authority, AuthorityStatus};
+pub use authority::{global as dns_authority, owner_id as gui_owner_id, Applied, Authority, AuthorityStatus};
 pub use coordinator::{
     ChoiceBinder, CoordError, Coordinator, ListenerBinder, ManagedListener, ManagedStatus, RealBinder,
     Supervision, STOP_BOUND,
@@ -32,9 +32,9 @@ pub use plan::{
     LOOPBACK_PORT,
 };
 pub use pool::{Choice, PoolStatus, AUTO_PROVIDERS};
-pub use service::{DnsService, HostClient, PipeClient, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE};
+pub use service::{DnsService, HostClient, InspectSnapshot, LeaseCreds, OwnerSnapshot, PipeClient, Registration, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE, map_outcome};
 pub use stub::ShutdownOutcome;
-pub use system::{adapter_dns, AdapterInfo};
+pub use system::{adapter_dns, AdapterInfo, DohProperty, FamilyDns, LegacyAdapterInfo, legacy_adapter_info, loopback_port_owners};
 pub use upstream::{Stat, Transport};
 
 use common::{DohProvider, Error, Result};
@@ -86,6 +86,13 @@ pub fn restore() -> Result<AuthorityStatus> {
 /// Current authority state. Pending debt is reported, never hidden.
 pub fn authority_status() -> AuthorityStatus {
     authority::global().status()
+}
+
+/// One supervision pass over the serving listener (spec §6 listener rows).
+/// Terminal task loss closes admission and restores; with no active
+/// configuration it is idle. The app drives this periodically.
+pub fn supervise_tick() -> Option<Supervision> {
+    authority::global().supervise_tick()
 }
 
 /// Measures `provider` with one small query per address and transport

@@ -550,8 +550,7 @@ pub fn ensure_single_instance(updated: bool) -> SingleInstanceDecision {
 }
 
 /// Shows the window whenever a second launch asks for it.
-pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     if guard.show.is_null() {
@@ -761,5 +760,77 @@ fn session_window_loop() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// Whether another live Yeager GUI process exists (any session, spec §9).
+/// Toolhelp snapshot over `yeager.exe` excluding this PID: a live legacy
+/// GUI blocks automatic repair (detection only). Best effort: snapshot
+/// failure reads as unknown (`false`) so detection never blocks on a probe
+/// error — the listener evidence still gates repair.
+pub fn other_yeager_gui_live() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let this_pid = std::process::id();
+    // SAFETY: snapshot handle checked against INVALID_HANDLE_VALUE and
+    // closed; entry size initialized as the API requires.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found_other = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+                let exe = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                if (exe == "yeager.exe") && entry.th32ProcessID != this_pid {
+                    found_other = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found_other
+    }
+}
+
+/// Lowercase exe name for one PID (spec §9 process identity for the
+/// loopback owner tables). `None` when the process cannot be opened or
+/// read — treated as unidentified, never as proof of absence.
+pub fn pid_exe_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = None;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+                    out = Some(String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase());
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        out
     }
 }

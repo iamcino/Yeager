@@ -6905,6 +6905,7 @@ name = "yeager"
 version = "1.1.6"
 dependencies = [
  "common",
+ "dns-recovery",
  "embed-resource",
  "erwin",
  "hange",
@@ -6912,6 +6913,7 @@ dependencies = [
  "muda 0.17.2",
  "raw-window-handle",
  "ring",
+ "serde_json",
  "slint",
  "slint-build",
  "tray-icon",

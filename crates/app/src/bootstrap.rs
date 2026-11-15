@@ -371,26 +371,11 @@ where
     P: PersistCfg + 'static,
 {
     fn inspect(&self) -> JournalState {
-        use hange::{DnsService, PipeClient, SvcOutcome};
+        use hange::{DnsService, PipeClient};
         let mut client = PipeClient::new();
-        match client.status().outcome {
-            SvcOutcome::Success | SvcOutcome::Active => JournalState::Clean,
-            SvcOutcome::Pending | SvcOutcome::Busy => JournalState::DeferredOrUnknown {
-                reason: "service reports recovery debt; auto-connect blocked".into(),
-            },
-            SvcOutcome::Conflict => JournalState::DeferredOrUnknown {
-                reason: "service reports a foreign-administrator conflict; auto-connect blocked".into(),
-            },
-            SvcOutcome::Refused => JournalState::DeferredOrUnknown {
-                reason: "service refused inspection; auto-connect blocked".into(),
-            },
-            SvcOutcome::Unsupported => JournalState::UnsupportedSnapshot {
-                reason: "service reports an unsupported snapshot; restore stays pending".into(),
-            },
-            SvcOutcome::VerifiedRestored | SvcOutcome::Unavailable => JournalState::DeferredOrUnknown {
-                reason: "recovery service unavailable; takeover refused, diagnostic UI only".into(),
-            },
-        }
+        let snapshot = client.inspect_snapshot();
+        let liveness = snapshot.owner.as_ref().map(probe_owner_liveness);
+        classify_snapshot(&snapshot, liveness)
     }
 
     fn recover(&self) -> BootRecovery {
@@ -415,6 +400,127 @@ where
     fn shutdown(&self, kind: BootShutdownKind) -> ShutdownReport {
         self.lifecycle.shutdown(kind.into())
     }
+}
+
+/// Honest mapping from the real service snapshot to the boot journal state.
+///
+/// - `clean`/`absent` → Clean (the service reports `verified_restored`).
+/// - `owned` (and restoring/recovery_pending/maintenance with an owner) →
+///   OwnedLive or OwnedDead by owner liveness; unknown liveness stays
+///   deferred with the journal retained.
+/// - `integrity_error` → IntegrityFailure (never deleted or overwritten).
+/// - `unsupported` → UnsupportedSnapshot; everything else without an owner
+///   stays deferred and blocks auto-connect.
+pub fn classify_snapshot(
+    snapshot: &hange::InspectSnapshot,
+    liveness: Option<dns_recovery::replay::OwnerLiveness>,
+) -> JournalState {
+    use hange::SvcOutcome;
+    if snapshot.outcome == SvcOutcome::IntegrityError {
+        return JournalState::IntegrityFailure {
+            reason: if snapshot.message.is_empty() {
+                "service reports journal integrity failure; takeover refused".into()
+            } else {
+                snapshot.message.clone()
+            },
+        };
+    }
+    match snapshot.journal_state.as_deref() {
+        Some("clean") | Some("absent") => JournalState::Clean,
+        Some("owned") | Some("restoring") | Some("recovery_pending") | Some("maintenance") => {
+            let owner_label = snapshot
+                .owner
+                .as_ref()
+                .map(|o| format!("{}:{}", o.owner_id, o.pid))
+                .unwrap_or_else(|| "unknown-owner".into());
+            match liveness {
+                Some(dns_recovery::replay::OwnerLiveness::Live) => JournalState::OwnedLive {
+                    owner: owner_label,
+                },
+                Some(dns_recovery::replay::OwnerLiveness::Dead) => JournalState::OwnedDead {
+                    owner: owner_label,
+                },
+                Some(dns_recovery::replay::OwnerLiveness::Unknown(detail)) => {
+                    JournalState::DeferredOrUnknown {
+                        reason: format!("owner liveness unknown ({detail}); journal retained"),
+                    }
+                }
+                None => JournalState::DeferredOrUnknown {
+                    reason: format!("owned journal ({owner_label}) with unknown liveness; journal retained"),
+                },
+            }
+        }
+        Some(other) => JournalState::DeferredOrUnknown {
+            reason: format!("service reports journal state {other}; auto-connect blocked"),
+        },
+        None => match snapshot.outcome {
+            SvcOutcome::Success | SvcOutcome::Active | SvcOutcome::VerifiedRestored => {
+                JournalState::Clean
+            }
+            SvcOutcome::Unsupported => JournalState::UnsupportedSnapshot {
+                reason: "service reports an unsupported snapshot; restore stays pending".into(),
+            },
+            SvcOutcome::IntegrityError => JournalState::IntegrityFailure {
+                reason: "service reports journal integrity failure; takeover refused".into(),
+            },
+            SvcOutcome::Pending | SvcOutcome::Busy => JournalState::DeferredOrUnknown {
+                reason: "service reports recovery debt; auto-connect blocked".into(),
+            },
+            SvcOutcome::Conflict => JournalState::DeferredOrUnknown {
+                reason: "service reports a foreign-administrator conflict; auto-connect blocked".into(),
+            },
+            SvcOutcome::Refused => JournalState::DeferredOrUnknown {
+                reason: "service refused inspection; auto-connect blocked".into(),
+            },
+            SvcOutcome::Unavailable => JournalState::DeferredOrUnknown {
+                reason: if snapshot.message.is_empty() {
+                    "recovery service unavailable; takeover refused, diagnostic UI only".into()
+                } else {
+                    snapshot.message.clone()
+                },
+            },
+        },
+    }
+}
+
+/// Probe the recorded owner for liveness (spec §7 step 2): PID +
+/// creation FILETIME over a held handle. Production path for
+/// [`classify_snapshot`]; tests inject `FakeOwnerProbe` liveness directly.
+fn probe_owner_liveness(owner: &hange::OwnerSnapshot) -> dns_recovery::replay::OwnerLiveness {
+    #[cfg(windows)]
+    {
+        use dns_recovery::journal::OwnerIdentity;
+        use dns_recovery::replay::OwnerProbe;
+        let identity = OwnerIdentity {
+            owner_id: owner.owner_id.clone(),
+            pid: owner.pid,
+            creation_time_filetime: owner.creation_filetime,
+            user_sid: String::new(),
+            logon_luid: 0,
+            session_id: owner.session_id,
+            image_path: String::new(),
+            image_file_id: String::new(),
+            image_sha256: String::new(),
+        };
+        static PROBE: std::sync::OnceLock<dns_recovery::service_os::WindowsOwnerProbe> =
+            std::sync::OnceLock::new();
+        let probe = PROBE.get_or_init(dns_recovery::service_os::WindowsOwnerProbe::new);
+        probe.check(&identity)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = owner;
+        dns_recovery::replay::OwnerLiveness::Unknown("owner probe is Windows-only".into())
+    }
+}
+
+/// Whether this journal state needs the dead-owner/clean recovery pass
+/// before any fallible init runs (spec §7): Clean and OwnedDead only.
+pub fn needs_recovery(state: &JournalState) -> bool {
+    matches!(
+        state,
+        JournalState::Clean | JournalState::OwnedDead { .. }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,7 +1422,6 @@ mod tests {
     }
 
     // ---- diagnostics --------------------------------------------------------
-
     #[test]
     fn diagnostics_state_line_never_claims_success_with_debt() {
         let d = BootDiagnostics {
@@ -1338,5 +1443,325 @@ mod tests {
             legacy_summary: None,
         };
         assert!(d.state_line().contains("blocked"));
+    }
+
+    // ---- Exit-table behavior locks (item 4) --------------------------------
+    #[test]
+    fn cleanup_api_failure_is_pending_with_journal_retained() {
+        // The cleanup-API/readback row must assert a pending result with the
+        // journal retained — never Verified/reopened. A DnsOff that verified
+        // would reopen; a failed cleanup stays pending with no reopen.
+        let pending = crate::lifecycle::ShutdownReport {
+            kind: crate::lifecycle::ShutdownKind::DnsOff,
+            dns: crate::lifecycle::DnsOutcome::Pending("readback failed".into()),
+            engine: crate::lifecycle::EngineOutcome::Completed,
+            epoch: 3,
+            reopened: false,
+            cancelled_queued: 0,
+            ui_error: None,
+            persist_error: None,
+        };
+        assert!(!pending.successful());
+        assert!(!pending.reopened);
+        assert_eq!(
+            plan_entry(EntryPath::CleanupApiFailure).shutdown,
+            Some(BootShutdownKind::DnsOff)
+        );
+        // And the normal DnsOff toggle reopens only when verified (contrast).
+        let ctl = FakeCtl::dead_owner();
+        let verified = ctl.shutdown(BootShutdownKind::DnsOff);
+        assert!(verified.successful() && verified.reopened);
+    }
+
+    #[test]
+    fn boot_guard_drop_during_unwind_runs_shutdown() {
+        // Panic row: dropping the guard during unwinding still settles the
+        // lease exactly once (defense, never a substitute for replay).
+        use std::panic::AssertUnwindSafe;
+        let ctl = FakeCtl::dead_owner();
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = BootGuard::arm(&ctl, BootShutdownKind::ProcessQuit);
+            panic!("boom");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(*ctl.shutdowns.lock().unwrap(), 1);
+        assert_eq!(
+            ctl.events(),
+            vec![CtlEvent::Shutdown(BootShutdownKind::ProcessQuit)]
+        );
+    }
+
+    #[test]
+    fn retained_rows_never_run_coordinator_shutdown() {
+        // Window close with tray / minimize / engine toggle off / engine
+        // start error / provider change / enable failure / update failure /
+        // upstream / DNS-test / listener errors: no quit, DNS retained.
+        // Locks the behavior (not just the mapping) by asserting the
+        // shutdown is None AND the behavior text promises retention.
+        for path in [
+            EntryPath::WindowCloseWithTray,
+            EntryPath::Minimize,
+            EntryPath::EngineToggleOff,
+            EntryPath::EngineStartError,
+            EntryPath::ProviderOrLocalChange,
+            EntryPath::EnableFailure,
+            EntryPath::UpdateFailure,
+            EntryPath::UpstreamFailure,
+            EntryPath::DnsTestError,
+            EntryPath::ListenerTaskError,
+        ] {
+            let exp = plan_entry(path);
+            assert_eq!(exp.shutdown, None, "{} must not quit", path.name());
+            let b = exp.behavior.to_lowercase();
+            assert!(
+                b.contains("retain")
+                    || b.contains("hide")
+                    || b.contains("minimize")
+                    || b.contains("continue")
+                    || b.contains("untouched")
+                    || b.contains("preserv")
+                    || b.contains("supervised")
+                    || b.contains("diagnostic")
+                    || b.contains("rollback")
+                    || b.contains("roll back")
+                    || b.contains("original")
+                    || b.contains("serialized"),
+                "{} behavior must promise retention, got: {}",
+                path.name(),
+                exp.behavior
+            );
+        }
+    }
+
+    // ---- RealBootCtl against the real ServiceHost seam (item 1) ------------
+    // FakeCtl-only coverage does not count: these tests drive `HostClient`
+    // over a real `ServiceHost` (fake OS/FS/lock/clock) and feed the
+    // resulting snapshots through `RealBootCtl` classification.
+
+    use dns_recovery::clock::VirtualClock;
+    use dns_recovery::fake::FakeOs;
+    use dns_recovery::fs::FakeFs;
+    use dns_recovery::lock::{FakeLock, MachineLock};
+    use dns_recovery::model::Family;
+    use dns_recovery::protocol::PeerAuth;
+    use dns_recovery::replay::{FakeOwnerProbe, OwnerLiveness, OwnerProbe};
+    use dns_recovery::service::{ServiceConfig, ServiceHost};
+    use hange::{DnsService, HostClient};
+    use std::rc::Rc;
+
+    const TEST_DIR: &str = "C:\\ProgramData\\Yeager";
+    const TEST_MACHINE: &str = "b7d3a1f2-4c5e-4a6b-8c9d-0e1f2a3b4c5d";
+    const TEST_SERVICE: &str = "44444444-4444-4444-8444-444444444444";
+    const TEST_GUID: &str = "6329f16a-0a04-4c7b-a6a5-85f792a98aa0";
+    const TEST_PID: u32 = 4242;
+    const TEST_FILETIME: u64 = 133_000_000_000_000_000;
+
+    fn test_peer() -> PeerAuth {
+        PeerAuth {
+            pid: TEST_PID,
+            creation_filetime: TEST_FILETIME,
+            user_sid: "S-1-5-18".to_string(),
+            elevated: true,
+            session_id: 0,
+            logon_luid: 999,
+            image_path: "C:\\Program Files\\Yeager\\yeager.exe".to_string(),
+            image_file_id: "fileid-1".to_string(),
+            image_sha256: "a".repeat(64),
+            remote: false,
+            server_pid: None,
+            expected_server_pid: None,
+        }
+    }
+
+    fn test_host(
+        os: FakeOs,
+        fs: Rc<FakeFs>,
+        lock_base: FakeLock,
+        clock: VirtualClock,
+        probe: Rc<FakeOwnerProbe>,
+    ) -> ServiceHost<Rc<FakeFs>> {
+        let os_b = os.clone();
+        let os_s = os.clone();
+        let clock_b = clock.clone();
+        let clock_c = clock.clone();
+        let fs_c = Rc::clone(&fs);
+        let probe_c = Rc::clone(&probe);
+        ServiceHost::new(
+            Rc::new(move || Box::new(os_b.clone()) as Box<dyn dns_recovery::backend::DnsBackend>),
+            Rc::new(move || Box::new(os_s.clone()) as Box<dyn dns_recovery::setter::DnsSetter>),
+            Rc::new(move || Box::new(lock_base.peer(7000, 0)) as Box<dyn MachineLock>),
+            Box::new(clock_b),
+            Rc::new(move || Box::new(clock_c.clone()) as Box<dyn dns_recovery::clock::Clock>),
+            Rc::new(move || Rc::clone(&fs_c)),
+            Rc::new(move || {
+                let p: FakeOwnerProbe = (*probe_c).clone();
+                Box::new(p) as Box<dyn dns_recovery::replay::OwnerProbe>
+            }),
+            ServiceConfig {
+                dir: TEST_DIR.to_string(),
+                machine_id: TEST_MACHINE.to_string(),
+                service_instance_id: TEST_SERVICE.to_string(),
+            },
+        )
+    }
+
+    fn seed_os_with_adapter(os: &FakeOs, probe: &FakeOwnerProbe) {
+        os.add_adapter(TEST_GUID, "Ethernet");
+        os.set_configured(TEST_GUID, Family::Ipv4, "192.0.2.53", vec![]);
+        os.set_configured(TEST_GUID, Family::Ipv6, "2001:db8::53", vec![]);
+        probe.spawn(TEST_PID, TEST_FILETIME);
+    }
+
+    #[test]
+    fn real_boot_ctl_clean_journal_maps_to_clean_and_needs_recovery() {
+        let os = FakeOs::new();
+        let fs = Rc::new(FakeFs::new());
+        let lock_base = FakeLock::new();
+        let clock = VirtualClock::new(1_763_000_000_000);
+        let probe = Rc::new(FakeOwnerProbe::new());
+        let mut host = test_host(os, Rc::clone(&fs), lock_base, clock, Rc::clone(&probe));
+        let peer = test_peer();
+        let mut client = HostClient::new(&mut host, peer);
+        let snapshot = client.inspect_snapshot();
+        // Absent journal: the service reports verified_restored with no owner.
+        assert_eq!(snapshot.journal_state.as_deref(), Some("absent"));
+        let state = classify_snapshot(&snapshot, None);
+        assert_eq!(state, JournalState::Clean);
+        assert!(needs_recovery(&state));
+    }
+
+    #[test]
+    fn real_boot_ctl_owned_dead_maps_to_owned_dead_and_needs_recovery() {
+        let os = FakeOs::new();
+        let fs = Rc::new(FakeFs::new());
+        let lock_base = FakeLock::new();
+        let clock = VirtualClock::new(1_763_000_000_000);
+        let probe = Rc::new(FakeOwnerProbe::new());
+        seed_os_with_adapter(&os, &probe);
+        let mut host = test_host(os.clone(), Rc::clone(&fs), lock_base, clock, Rc::clone(&probe));
+        let peer = test_peer();
+        // Register + apply through the real host to record an owned journal.
+        let owner_id = hange::gui_owner_id();
+        let reg = {
+            let mut client = HostClient::new(&mut host, peer.clone());
+            client
+                .register_owner(&owner_id, 0, Some(&"a".repeat(64)), Some("fileid-1"))
+                .expect("register against the real host")
+        };
+        {
+            let mut client = HostClient::new(&mut host, peer.clone());
+            let creds = hange::LeaseCreds {
+                owner_id: owner_id.clone(),
+                token: reg.token.clone(),
+                epoch: reg.epoch,
+            };
+            let _ = client.health(&creds, true, 1);
+            let plan = hange::desired_plan(
+                hange::Choice::Fixed(common::DohProvider::Cloudflare),
+                &hange::ListenerPlan::for_mode(hange::ListenerMode::Dual),
+                1,
+            );
+            let apply = client.apply(&creds, &[TEST_GUID.to_string()], &plan);
+            assert!(apply.is_ok(), "real service accepts the dual plan: {apply:?}");
+        }
+        // Kill the owner: PID gone proves death.
+        probe.kill(TEST_PID);
+        let snapshot = {
+            let mut client = HostClient::new(&mut host, peer);
+            client.inspect_snapshot()
+        };
+        assert_eq!(snapshot.journal_state.as_deref(), Some("owned"));
+        let owner = snapshot.owner.clone().expect("owned journal carries an owner");
+        // Dead liveness comes from the same probe the service uses.
+        let liveness = if probe
+            .clone()
+            .check(&dns_recovery::journal::OwnerIdentity {
+                owner_id: owner.owner_id.clone(),
+                pid: owner.pid,
+                creation_time_filetime: owner.creation_filetime,
+                user_sid: String::new(),
+                logon_luid: 0,
+                session_id: owner.session_id,
+                image_path: String::new(),
+                image_file_id: String::new(),
+                image_sha256: String::new(),
+            }) == OwnerLiveness::Dead
+        {
+            OwnerLiveness::Dead
+        } else {
+            OwnerLiveness::Unknown("probe disagrees".into())
+        };
+        let state = classify_snapshot(&snapshot, Some(liveness));
+        assert!(matches!(state, JournalState::OwnedDead { .. }), "got {state:?}");
+        assert!(needs_recovery(&state));
+    }
+
+    #[test]
+    fn real_boot_ctl_owned_live_maps_to_owned_live_and_skips_recovery() {
+        let os = FakeOs::new();
+        let fs = Rc::new(FakeFs::new());
+        let lock_base = FakeLock::new();
+        let clock = VirtualClock::new(1_763_000_000_000);
+        let probe = Rc::new(FakeOwnerProbe::new());
+        seed_os_with_adapter(&os, &probe);
+        let mut host = test_host(os.clone(), Rc::clone(&fs), lock_base, clock, Rc::clone(&probe));
+        let peer = test_peer();
+        let owner_id = hange::gui_owner_id();
+        let reg = {
+            let mut client = HostClient::new(&mut host, peer.clone());
+            client
+                .register_owner(&owner_id, 0, Some(&"a".repeat(64)), Some("fileid-1"))
+                .expect("register against the real host")
+        };
+        {
+            let mut client = HostClient::new(&mut host, peer.clone());
+            let creds = hange::LeaseCreds {
+                owner_id: owner_id.clone(),
+                token: reg.token.clone(),
+                epoch: reg.epoch,
+            };
+            let _ = client.health(&creds, true, 1);
+            let plan = hange::desired_plan(
+                hange::Choice::Fixed(common::DohProvider::Cloudflare),
+                &hange::ListenerPlan::for_mode(hange::ListenerMode::Dual),
+                1,
+            );
+            let apply = client.apply(&creds, &[TEST_GUID.to_string()], &plan);
+            assert!(apply.is_ok(), "real service accepts the dual plan: {apply:?}");
+        }
+        // Owner stays live: the probe still holds (pid, filetime).
+        let snapshot = {
+            let mut client = HostClient::new(&mut host, peer);
+            client.inspect_snapshot()
+        };
+        assert_eq!(snapshot.journal_state.as_deref(), Some("owned"));
+        let state = classify_snapshot(&snapshot, Some(OwnerLiveness::Live));
+        assert!(matches!(state, JournalState::OwnedLive { .. }), "got {state:?}");
+        assert!(!needs_recovery(&state));
+    }
+
+    #[test]
+    fn real_boot_ctl_integrity_error_maps_to_integrity_failure() {
+        use hange::{InspectSnapshot, SvcOutcome};
+        // integrity_error is a distinct wire outcome (map_outcome arm), never
+        // collapsed into Unavailable.
+        assert_eq!(
+            hange::map_outcome("integrity_error"),
+            SvcOutcome::IntegrityError
+        );
+        let snapshot = InspectSnapshot {
+            outcome: SvcOutcome::IntegrityError,
+            generation: 0,
+            journal_state: None,
+            owner: None,
+            message: "journal reconciliation failed: digest mismatch".into(),
+        };
+        let state = classify_snapshot(&snapshot, None);
+        assert!(matches!(
+            state,
+            JournalState::IntegrityFailure { .. }
+        ));
+        assert!(!needs_recovery(&state));
+        assert!(classify_boot(&state).blocks_auto_connect());
     }
 }

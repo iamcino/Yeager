@@ -50,6 +50,49 @@ pub fn adapter_dns() -> Result<Vec<AdapterInfo>> {
         .collect())
 }
 
+/// One DoH server property as configured on the interface (spec §9 input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DohProperty {
+    pub version: u32,
+    pub index: u32,
+    pub prop_type: u32,
+    pub template: Option<String>,
+    pub flags: u64,
+}
+
+/// One address family's configured servers plus their DoH properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyDns {
+    pub servers: Vec<String>,
+    pub properties: Vec<DohProperty>,
+}
+
+/// One adapter's configured DNS for legacy detection: both families with
+/// full server lists and DoH properties (unlike [`adapter_dns`], which sees
+/// effective addresses only). Empty when the family is not configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyAdapterInfo {
+    pub guid: String,
+    pub name: String,
+    pub v4: Option<FamilyDns>,
+    pub v6: Option<FamilyDns>,
+}
+
+/// Configured DNS with DoH properties for every adapter (spec §9 input).
+/// Unlike [`adapter_dns`], this carries templates/flags, so an exact legacy
+/// shape can classify as `ExactCandidate` when the facts say so. Read-only.
+pub fn legacy_adapter_info() -> Result<Vec<LegacyAdapterInfo>> {
+    win::legacy_adapters()
+}
+
+/// PIDs holding loopback port 53 (spec §9 listener evidence): TCP and UDP
+/// owners of 127.0.0.1:53 via the owner tables with process identity.
+/// `None` per family means unknown/free. Read-only; used to tell our own
+/// stub from a live legacy GUI or an unidentified foreign listener.
+pub fn loopback_port_owners() -> (Option<u32>, Option<u32>) {
+    win::loopback_owners()
+}
+
 /// Checks that Windows itself resolves through Yeager: every online adapter
 /// lists only `local` and the provider's resolvers, the latter with DoH on.
 /// Returns the adapters verified, or says which one is not.
@@ -307,6 +350,189 @@ mod win {
         unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(p, len)) }
     }
 
+    fn family_settings(guid: &GUID, ipv6: bool) -> Result<super::FamilyDns> {
+        let mut settings: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
+        settings.Version = DNS_INTERFACE_SETTINGS_VERSION3;
+        settings.Flags = if ipv6 { DNS_SETTING_IPV6 as u64 } else { 0 };
+        let status = unsafe {
+            GetInterfaceDnsSettings(
+                *guid,
+                (&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast(),
+            )
+        };
+        if status != NO_ERROR {
+            unsafe { FreeInterfaceDnsSettings((&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast()) };
+            return Err(Error::new(common::t!("GetInterfaceDnsSettings lỗi {status}.", "GetInterfaceDnsSettings failed ({status}).")));
+        }
+        let servers: Vec<String> = unsafe { wstr(settings.NameServer) }
+            .split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        let mut properties = Vec::new();
+        for i in 0..settings.cServerProperties as usize {
+            let p = unsafe { &*settings.ServerProperties.add(i) };
+            let template = unsafe { p.Property.DohSettings.as_ref() }.and_then(|d| {
+                if d.Template.is_null() {
+                    None
+                } else {
+                    Some(unsafe { wstr(d.Template) })
+                }
+            });
+            let flags = unsafe { p.Property.DohSettings.as_ref() }.map_or(0, |d| d.Flags);
+            properties.push(super::DohProperty {
+                version: p.Version,
+                index: p.ServerIndex,
+                prop_type: p.Type as u32,
+                template,
+                flags,
+            });
+        }
+        unsafe { FreeInterfaceDnsSettings((&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast()) };
+        if servers.is_empty() && properties.is_empty() {
+            // Family not configured: leave absent so classification treats it
+            // as unsupported rather than as an empty exact shape.
+            return Err(Error::new("family not configured"));
+        }
+        Ok(super::FamilyDns { servers, properties })
+    }
+
+    pub fn legacy_adapters() -> Result<Vec<super::LegacyAdapterInfo>> {
+        let mut out = Vec::new();
+        for a in adapters()? {
+            let guid_str = a.guid_string();
+            let v4 = family_settings(&a.guid, false).ok();
+            let v6 = family_settings(&a.guid, true).ok();
+            if v4.is_none() && v6.is_none() {
+                continue;
+            }
+            out.push(super::LegacyAdapterInfo {
+                guid: guid_str,
+                name: a.name,
+                v4,
+                v6,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Owner PIDs for 127.0.0.1:53 from the TCP/UDP owner tables (spec §9).
+    /// Returns `(tcp_owner, udp_owner)`; `None` means no entry or unknown.
+    pub fn loopback_owners() -> (Option<u32>, Option<u32>) {
+        (tcp_loopback_owner(), udp_loopback_owner())
+    }
+
+    const LOOPBACK_V4: u32 = 0x0100007f; // 127.0.0.1 as little-endian u32
+    const PORT53_NET: u32 = 0x3500; // 53 in network byte order (low 16 bits)
+
+    fn tcp_loopback_owner() -> Option<u32> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+        let mut size: u32 = 0;
+        // Size query first.
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        // 122 == ERROR_INSUFFICIENT_BUFFER: size now holds the need.
+        if rc != 122 || size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let table = unsafe { &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
+        let n = table.dwNumEntries as usize;
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                (&table.table as *const _) as *const MIB_TCPROW_OWNER_PID,
+                n.min(4096),
+            )
+        };
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID;
+        let mut found: Option<u32> = None;
+        for r in rows {
+            // dwLocalAddr is network-order IPv4; dwLocalPort holds the port
+            // in network byte order in its low 16 bits.
+            if r.dwLocalAddr == LOOPBACK_V4 && (r.dwLocalPort & 0xffff) == PORT53_NET {
+                found = Some(r.dwOwningPid);
+                break;
+            }
+        }
+        found
+    }
+
+    fn udp_loopback_owner() -> Option<u32> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedUdpTable, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+        let mut size: u32 = 0;
+        let rc = unsafe {
+            GetExtendedUdpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+        if rc != 122 || size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetExtendedUdpTable(
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                AF_INET as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let table = unsafe { &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID) };
+        let n = table.dwNumEntries as usize;
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                (&table.table as *const _) as *const MIB_UDPROW_OWNER_PID,
+                n.min(4096),
+            )
+        };
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_UDPROW_OWNER_PID;
+        let mut found: Option<u32> = None;
+        for r in rows {
+            if r.dwLocalAddr == LOOPBACK_V4 && (r.dwLocalPort & 0xffff) == PORT53_NET {
+                found = Some(r.dwOwningPid);
+                break;
+            }
+        }
+        found
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -348,5 +574,13 @@ mod win {
 
     pub fn servers_without_doh(_: &(), _: bool, _: &[&str]) -> Result<Vec<String>> {
         unsupported()
+    }
+
+    pub fn legacy_adapters() -> Result<Vec<super::LegacyAdapterInfo>> {
+        unsupported()
+    }
+
+    pub fn loopback_owners() -> (Option<u32>, Option<u32>) {
+        (None, None)
     }
 }

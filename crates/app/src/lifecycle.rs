@@ -344,6 +344,32 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
         self.dns.status()
     }
 
+    /// Session query-end (WM_QUERYENDSESSION): start quiesce without
+    /// restoring yet. Closes admission (epoch bump, drain queued work) and
+    /// runs the DNS-side quiesce immediately; the bounded end-session cleanup
+    /// or a cancel joins the same in-flight shutdown via `shutdown`, which
+    /// finishes the current restoration without reopening the old epoch.
+    /// Never reopens: a pure quiesce leaves `open == false` until an explicit
+    /// fresh enable or a `DnsOff` verified restore reopens on a new epoch.
+    pub fn quiesce_for_session(&self) {
+        let cancelled = {
+            let mut s = self.lock();
+            // If a shutdown is already in flight or done, joining it covers
+            // the session path; do not bump the epoch twice.
+            if !matches!(s.shutdown, Slot::Idle) {
+                s.queue.drain(..).count()
+            } else {
+                s.open = false;
+                s.epoch += 1;
+                let cancelled = s.queue.drain(..).count();
+                s.engine_queue.clear();
+                cancelled
+            }
+        };
+        let _ = cancelled;
+        self.dns.quiesce();
+    }
+
     /// Shared admission path for enable and change. A successful request
     /// invalidates a completed pure-off result (slot `Done` -> `Idle`) so a
     /// later off runs fresh; it never writes `Idle` over an in-flight
@@ -1564,7 +1590,6 @@ mod tests {
     }
 
     // ---- U07-REV test 17: status reports pending/conflict -----------------
-
     #[test]
     fn status_read_reports_pending_and_conflict_health() {
         for outcome in [
@@ -1594,5 +1619,31 @@ mod tests {
             assert!(lc.snapshot().admission_open);
             assert_eq!(lc.status(), outcome);
         }
+    }
+
+    // ---- U08-REV item 5: session quiesce never reopens --------------------
+
+    #[test]
+    fn session_quiesce_closes_admission_without_reopen_and_quit_joins() {
+        // WM_QUERYENDSESSION starts quiesce only (no restore, no reopen);
+        // a canceled end (JoinOnly) finishes via the quit-kind path without
+        // reopening the old epoch.
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let lc = fixture(&world, EngineMode::Return);
+        assert!(lc.snapshot().admission_open);
+        lc.quiesce_for_session();
+        assert!(!lc.snapshot().admission_open);
+        assert!(world.lock().unwrap().contains(&WorldEvent::Quiesce));
+        assert!(!world.lock().unwrap().contains(&WorldEvent::Restore));
+        // Queued work is drained at quiesce: a later enable is refused.
+        assert!(lc.request_enable(auto().0, auto().1).is_err());
+        // Joining via the quit-kind path finishes the current restoration
+        // without reopening.
+        let report = lc.shutdown(ShutdownKind::ProcessQuit);
+        assert!(!report.reopened);
+        assert!(world.lock().unwrap().contains(&WorldEvent::Restore));
+        // A second quiesce after shutdown does not reopen either.
+        lc.quiesce_for_session();
+        assert!(!lc.snapshot().admission_open);
     }
 }

@@ -439,6 +439,65 @@ pub fn resume_target_after_crash() -> RepairTarget {
     RepairTarget::Automatic
 }
 
+/// Durable approved-repair intent (spec §9): the GUI records the exact
+/// candidate it approved (behind Q3 elevated approval) before clearing, so
+/// a crash replays the automatic target instead of the dead loopback.
+/// Stored as tiny JSON next to the journal dir; replay returns the recorded
+/// families when present.
+pub fn intent_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("legacy-repair-intent.json")
+}
+
+/// Record an approved repair intent. Overwrites any previous intent for the
+/// same adapter. IO errors are returned as strings for the diagnostics UI.
+pub fn record_repair_intent(
+    dir: &std::path::Path,
+    guid: &str,
+    families: &[String],
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "guid": guid,
+        "families": families,
+        "target": "automatic",
+        "recorded_at_utc": chrono_stamp(),
+    });
+    let text = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::write(intent_file(dir), text).map_err(|e| e.to_string())
+}
+
+/// Replay a recorded intent after a crash: returns the recorded adapter +
+/// families plus the automatic target. `None` when no intent was recorded.
+/// A crash never resumes the dead loopback — only this recorded automatic
+/// target.
+pub fn replay_repair_intent(dir: &std::path::Path) -> Option<(String, Vec<String>, RepairTarget)> {
+    let text = std::fs::read_to_string(intent_file(dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if v.get("target").and_then(|t| t.as_str()) != Some("automatic") {
+        return None;
+    }
+    let guid = v.get("guid").and_then(|g| g.as_str())?.to_string();
+    let families = v
+        .get("families")
+        .and_then(|f| f.as_array())?
+        .iter()
+        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+        .collect::<Vec<_>>();
+    if guid.is_empty() || families.is_empty() {
+        return None;
+    }
+    Some((guid, families, RepairTarget::Automatic))
+}
+
+fn chrono_stamp() -> String {
+    // No chrono dependency in this crate: seconds since epoch is enough to
+    // order intents for diagnostics.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
 /// Truthful description of an approved repair result. The word "original"
 /// never appears here: nothing original was — or could be — restored.
 pub fn describe_repair(guid: &str, families: &[String]) -> String {
@@ -746,6 +805,31 @@ mod tests {
         assert!(warning.contains("cannot be reconstructed") || warning.contains("not recorded"));
         // Crash resume: the automatic target, never the dead loopback.
         assert_eq!(resume_target_after_crash(), RepairTarget::Automatic);
+    }
+
+    #[test]
+    fn approved_intent_is_recorded_and_replayed_as_automatic() {
+        // Item 6: crash-resume replays the recorded intent instead of the
+        // dead loopback. Record an approved repair, drop everything (the
+        // crash), then replay from disk.
+        let dir = std::env::temp_dir().join(format!(
+            "yeager-legacy-intent-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        record_repair_intent(&dir, "g1", &["ipv4".to_string()]).expect("record intent");
+        // Simulate the crash: no in-memory state survives, only the file.
+        let replayed = replay_repair_intent(&dir).expect("intent replays after crash");
+        assert_eq!(replayed.0, "g1");
+        assert_eq!(replayed.1, vec!["ipv4".to_string()]);
+        assert_eq!(replayed.2, RepairTarget::Automatic);
+        // The resume target is always automatic, never the dead loopback.
+        assert_eq!(resume_target_after_crash(), RepairTarget::Automatic);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            replay_repair_intent(&dir).is_none(),
+            "no intent means no replay"
+        );
     }
 
     #[test]

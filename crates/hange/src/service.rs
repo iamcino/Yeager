@@ -51,6 +51,7 @@ pub enum SvcOutcome {
     Busy,
     Unsupported,
     Unavailable,
+    IntegrityError,
 }
 
 /// One mutating/read call result.
@@ -88,6 +89,7 @@ pub fn map_outcome(outcome: &str) -> SvcOutcome {
         "busy" => SvcOutcome::Busy,
         "unsupported" => SvcOutcome::Unsupported,
         "unavailable" => SvcOutcome::Unavailable,
+        "integrity_error" => SvcOutcome::IntegrityError,
         _ => SvcOutcome::Unavailable,
     }
 }
@@ -116,6 +118,67 @@ impl SvcReport {
     /// plan, so it is not `is_ok` here — match those outcomes explicitly.
     pub fn is_ok(&self) -> bool {
         matches!(self.outcome, SvcOutcome::Active)
+    }
+}
+
+/// Owner identity surfaced by `status`/`inspect` for boot classification.
+/// `creation_filetime` is the recorded process creation time (0 when the
+/// service predates the field); liveness needs pid + filetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSnapshot {
+    pub owner_id: String,
+    pub pid: u32,
+    pub creation_filetime: u64,
+    pub session_id: u32,
+}
+
+/// Rich inspection snapshot for truthful boot classification: the mapped
+/// outcome plus the raw journal state and owner the service reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectSnapshot {
+    pub outcome: SvcOutcome,
+    pub generation: u64,
+    pub journal_state: Option<String>,
+    pub owner: Option<OwnerSnapshot>,
+    pub message: String,
+}
+
+fn snapshot_from_reply(reply: &Reply) -> InspectSnapshot {
+    let outcome = map_outcome(&reply.outcome);
+    let body = &reply.body;
+    let journal_state = body
+        .get("journal_state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let owner = body.get("owner").and_then(|o| {
+        if o.is_null() {
+            return None;
+        }
+        Some(OwnerSnapshot {
+            owner_id: o
+                .get("owner_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            pid: o.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            creation_filetime: o
+                .get("creation_time_filetime")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            session_id: o.get("session_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        })
+    });
+    let message = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    InspectSnapshot {
+        outcome,
+        generation: reply.generation,
+        journal_state,
+        owner,
+        message,
     }
 }
 
@@ -157,6 +220,20 @@ pub trait DnsService {
     /// fakes return `None` (no real journal; epoch checks are mocked).
     fn journal_epoch(&mut self) -> Option<u64> {
         None
+    }
+    /// Rich inspection snapshot (outcome + journal state + owner) for
+    /// truthful boot classification. Default falls back to `status()` with
+    /// no journal detail (scripted fakes); real clients override to parse
+    /// the service `Status` body.
+    fn inspect_snapshot(&mut self) -> InspectSnapshot {
+        let rep = self.status();
+        InspectSnapshot {
+            outcome: rep.outcome,
+            generation: rep.generation,
+            journal_state: None,
+            owner: None,
+            message: rep.message,
+        }
     }
 }
 
@@ -370,6 +447,17 @@ impl<F: dns_recovery::fs::JournalFs + 'static> DnsService for HostClient<'_, F> 
         let reply = self.roundtrip(req);
         reply.body.get("epoch").and_then(|v| v.as_u64())
     }
+
+    fn inspect_snapshot(&mut self) -> InspectSnapshot {
+        let req = Request::new(
+            new_request_id(),
+            Operation::Status,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        snapshot_from_reply(&self.roundtrip(req))
+    }
 }
 
 /// Production Windows named-pipe client: one frame per call with a real
@@ -551,6 +639,26 @@ impl DnsService for PipeClient {
             .ok()
             .and_then(|reply| reply.body.get("epoch").and_then(|v| v.as_u64()))
     }
+
+    fn inspect_snapshot(&mut self) -> InspectSnapshot {
+        let req = Request::new(
+            new_request_id(),
+            Operation::Status,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        match self.roundtrip(req) {
+            Ok(reply) => snapshot_from_reply(&reply),
+            Err(e) => InspectSnapshot {
+                outcome: e.outcome,
+                generation: 0,
+                journal_state: None,
+                owner: None,
+                message: e.message,
+            },
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -596,6 +704,7 @@ mod tests {
         assert_eq!(map_outcome("busy"), SvcOutcome::Busy);
         assert_eq!(map_outcome("unsupported"), SvcOutcome::Unsupported);
         assert_eq!(map_outcome("unavailable"), SvcOutcome::Unavailable);
+        assert_eq!(map_outcome("integrity_error"), SvcOutcome::IntegrityError);
         assert_eq!(map_outcome("escalate_privileges"), SvcOutcome::Unavailable);
         assert_eq!(map_outcome(""), SvcOutcome::Unavailable);
     }
@@ -616,6 +725,7 @@ mod tests {
             SvcOutcome::Busy,
             SvcOutcome::Unsupported,
             SvcOutcome::Unavailable,
+            SvcOutcome::IntegrityError,
         ] {
             assert!(!SvcReport { outcome, generation: 1, message: String::new() }.is_ok());
         }

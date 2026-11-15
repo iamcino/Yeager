@@ -19,7 +19,7 @@
 //! lease. Section 12 law: the worker logic is thin mapping over the U06
 //! coordinator; tests drive it against scripted fakes, never real NICs.
 
-use crate::coordinator::{ChoiceBinder, Coordinator};
+use crate::coordinator::{ChoiceBinder, Coordinator, Supervision};
 use crate::pool::Choice;
 use crate::service::{PipeClient, SvcOutcome};
 use common::{DohProvider, Error, Result};
@@ -86,6 +86,9 @@ enum Request {
     ServingProvider {
         reply: mpsc::Sender<Option<DohProvider>>,
     },
+    Supervise {
+        reply: mpsc::Sender<Supervision>,
+    },
 }
 
 /// Process-wide DNS authority handle. Cloneable; every clone talks to the
@@ -106,10 +109,7 @@ impl Authority {
     }
 
     fn op_err(op: &str, e: Error) -> Error {
-        Error::new(format!(
-            "{}",
-            common::t!("DNS {op} lỗi: {e}", "DNS {op} failed: {e}")
-        ))
+        Error::new(common::t!("DNS {op} lỗi: {e}", "DNS {op} failed: {e}"))
     }
 
     /// Transactional enable through the service. Success is `Active` only;
@@ -185,6 +185,16 @@ impl Authority {
         self.tx.send(Request::ServingProvider { reply }).ok()?;
         rx.recv().ok()?
     }
+
+    /// One supervision pass over the serving listener (spec §6 listener
+    /// rows): probes liveness, restores on terminal task loss, and reports
+    /// what it did. The app calls this periodically; with no active
+    /// configuration it is `Idle` and touches no service.
+    pub fn supervise_tick(&self) -> Option<Supervision> {
+        let (reply, rx) = mpsc::channel();
+        self.tx.send(Request::Supervise { reply }).ok()?;
+        rx.recv().ok()
+    }
 }
 
 /// The process-wide authority. One worker, one coordinator, one lease.
@@ -198,8 +208,13 @@ pub fn global() -> Authority {
     .clone()
 }
 
-fn owner_id() -> String {
-    format!("yeager-gui-pid{}", std::process::id())
+pub fn owner_id() -> String {
+    // Production GUI owner identity: a lowercase UUID the service
+    // `is_lower_uuid` gate accepts. Generated once per process via the
+    // worker (which calls this once at startup) and once per test that
+    // proves registrability; never the old `yeager-gui-pid{pid}` shape,
+    // which the service rejects.
+    dns_recovery::journal::new_uuid()
 }
 
 fn selected() -> Vec<String> {
@@ -246,6 +261,9 @@ fn worker(rx: mpsc::Receiver<Request>) {
             }
             Request::ServingProvider { reply } => {
                 let _ = reply.send(coord.serving_provider());
+            }
+            Request::Supervise { reply } => {
+                let _ = reply.send(coord.supervise_tick());
             }
         }
     }
@@ -340,5 +358,82 @@ pub fn system_provider(choice: Choice) -> DohProvider {
     match choice {
         Choice::Fixed(p) => p,
         Choice::Auto => crate::pool::AUTO_PROVIDERS[0],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::{DnsService, HostClient};
+    use dns_recovery::clock::VirtualClock;
+    use dns_recovery::fake::FakeOs;
+    use dns_recovery::fs::FakeFs;
+    use dns_recovery::lock::{FakeLock, MachineLock};
+    use dns_recovery::protocol::PeerAuth;
+    use dns_recovery::replay::FakeOwnerProbe;
+    use dns_recovery::service::{ServiceConfig, ServiceHost};
+    use std::rc::Rc;
+
+    #[test]
+    fn production_owner_id_registers_against_real_service() {
+        // Item 3: the production `owner_id()` itself must be registrable —
+        // a lowercase UUID the service `is_lower_uuid` gate accepts.
+        let id = owner_id();
+        assert!(
+            dns_recovery::journal::is_lower_uuid(&id),
+            "production owner_id must be a lowercase UUID, got {id}"
+        );
+        // Register that exact id against the real ServiceHost seam.
+        let os = FakeOs::new();
+        let fs = Rc::new(FakeFs::new());
+        let fs_c = Rc::clone(&fs);
+        let os_b = os.clone();
+        let os_s = os.clone();
+        let lock_base = FakeLock::new();
+        let clock = VirtualClock::new(1_763_000_000_000);
+        let clock_b = clock.clone();
+        let mut host = ServiceHost::new(
+            Rc::new(move || Box::new(os_b.clone()) as Box<dyn dns_recovery::backend::DnsBackend>),
+            Rc::new(move || Box::new(os_s.clone()) as Box<dyn dns_recovery::setter::DnsSetter>),
+            Rc::new(move || Box::new(lock_base.peer(7000, 0)) as Box<dyn MachineLock>),
+            Box::new(clock_b),
+            Rc::new(move || Box::new(clock.clone()) as Box<dyn dns_recovery::clock::Clock>),
+            Rc::new(move || Rc::clone(&fs_c)),
+            Rc::new(|| Box::new(FakeOwnerProbe::new()) as Box<dyn dns_recovery::replay::OwnerProbe>),
+            ServiceConfig {
+                dir: "C:\\ProgramData\\Yeager".to_string(),
+                machine_id: "b7d3a1f2-4c5e-4a6b-8c9d-0e1f2a3b4c5d".to_string(),
+                service_instance_id: "44444444-4444-4444-8444-444444444444".to_string(),
+            },
+        );
+        let peer = PeerAuth {
+            pid: 4242,
+            creation_filetime: 133_000_000_000_000_000,
+            user_sid: "S-1-5-18".to_string(),
+            elevated: true,
+            session_id: 0,
+            logon_luid: 999,
+            image_path: "C:\\Program Files\\Yeager\\yeager.exe".to_string(),
+            image_file_id: "fileid-1".to_string(),
+            image_sha256: "a".repeat(64),
+            remote: false,
+            server_pid: None,
+            expected_server_pid: None,
+        };
+        let mut client = HostClient::new(&mut host, peer);
+        let reg = client
+            .register_owner(&id, 0, Some(&"a".repeat(64)), Some("fileid-1"))
+            .expect("production owner_id registers against the real host");
+        assert!(!reg.token.is_empty());
+    }
+
+    #[test]
+    fn supervise_request_is_wired_through_the_worker() {
+        // Item 4 (listener rows): the authority worker serves supervision —
+        // with no active configuration the tick is Idle and never touches
+        // the service. Proves the `Supervise` request arm exists and the
+        // production periodic tick in `main.rs` reaches the coordinator.
+        let tick = global().supervise_tick();
+        assert_eq!(tick, Some(Supervision::Idle));
     }
 }

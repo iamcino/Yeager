@@ -523,6 +523,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
                                 serde_json::json!({
                                     "owner_id": t.owner.owner_id,
                                     "pid": t.owner.pid,
+                                    "creation_time_filetime": t.owner.creation_time_filetime,
                                     "session_id": t.owner.session_id,
                                 })
                             }),
