@@ -244,7 +244,8 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     ///
     /// Success is `Active` only. `verified_restored` means the engine rolled
     /// the attempted plan back to the pre-takeover original, so the new plan
-    /// is NOT in effect and the call fails with the previous listener kept.
+    /// is NOT in effect and the call fails with the previous listener
+    /// stopped (bounded): loopback is no longer the configured reference.
     pub fn enable(
         &mut self,
         choice: Choice,
@@ -1612,7 +1613,7 @@ mod tests {
         let peer = world.peer();
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut co = Coordinator::new(
-            HostClient::new(&mut host, peer),
+            HostClient::new(&mut host, peer.clone()),
             stack_binder(Rc::clone(&log)),
             OWNER,
             vec![GUID_A.to_string()],
@@ -1659,6 +1660,18 @@ mod tests {
             log.borrow().iter().any(|c| matches!(c, FakeCall::Shutdown(_))),
             "verified restore stops the previous listener (bounded)"
         );
+        // U06-REV3 item 1: the verified rollback leaves no journal
+        // transaction behind, so the server lease must be gone too. The next
+        // `register_owner` for the same owner on this same `ServiceHost`
+        // must succeed; it answers `busy` if the lease was not released.
+        drop(co);
+        let mut client = HostClient::new(&mut host, peer);
+        match client.register_owner(OWNER, 0, Some(&"a".repeat(64)), Some("fileid-1")) {
+            Ok(reg) => assert!(!reg.token.is_empty(), "re-register mints a fresh lease"),
+            Err(e) => panic!(
+                "register after verified reconfigure rollback must succeed, got {e:?} (lease not released)"
+            ),
+        }
     }
 
     #[test]

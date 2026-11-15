@@ -871,6 +871,15 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             serde_json::json!({"errors": errors}),
         );
         self.dedup_store(req.request_id.clone(), reply.clone());
+        // Clean rollback releases the lease: the journal transaction is gone
+        // (tombstone), so the next `register_owner` for the same owner id
+        // must succeed instead of answering `busy` forever. Same as
+        // `op_restore`. Pending/Conflict keep the lease.
+        if matches!(report.outcome, Outcome::VerifiedRestored)
+            && let Some(owner_id) = req.owner_id.clone()
+        {
+            self.leases.remove(&owner_id);
+        }
         reply
     }
 
@@ -930,6 +939,13 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             serde_json::json!({"errors": report.errors.len()}),
         );
         self.dedup_store(req.request_id.clone(), reply.clone());
+        // Same lease release as `op_apply`: a verified rollback leaves no
+        // transaction behind, so the owner id must be free to re-register.
+        if matches!(report.outcome, Outcome::VerifiedRestored)
+            && let Some(owner_id) = req.owner_id.clone()
+        {
+            self.leases.remove(&owner_id);
+        }
         reply
     }
 
@@ -1000,10 +1016,10 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
         // 3). Mirrors the `health(responding == false)` path, which removes
         // the lease before restoring. Pending/Conflict keep the lease: the
         // transaction (and its debt) is still recorded.
-        if matches!(report.outcome, Outcome::VerifiedRestored) {
-            if let Some(owner_id) = req.owner_id.clone() {
-                self.leases.remove(&owner_id);
-            }
+        if matches!(report.outcome, Outcome::VerifiedRestored)
+            && let Some(owner_id) = req.owner_id.clone()
+        {
+            self.leases.remove(&owner_id);
         }
         reply
     }
