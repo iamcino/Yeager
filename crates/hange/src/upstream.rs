@@ -151,6 +151,11 @@ impl Upstream {
         self.current.lock().unwrap().as_ref().map(|c| c.stat)
     }
 
+    /// Why the last query failed, until one succeeds again. U08: retained
+    /// as an operator diagnostic. Resolve reports SERVFAIL without
+    /// attributing it to one upstream (spec: upstream outage alone never
+    /// quits anything), so no normal path reads this yet.
+    #[allow(dead_code)]
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().unwrap().clone()
     }

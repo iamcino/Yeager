@@ -130,8 +130,8 @@ pub fn desired_plan(
 }
 
 /// The local resolver references Windows is pointed at for `plan`: the
-/// loopback IPs only, matching the existing `system::apply` rule (local stub
-/// first, provider resolvers after it). Windows-only carries no references.
+/// loopback IPs only (local stub first, provider resolvers after it).
+/// Windows-only carries no references.
 pub fn local_refs(plan: &ListenerPlan) -> Vec<String> {
     plan.addrs.iter().map(|a| a.ip().to_string()).collect()
 }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn local_refs_match_existing_system_rules() {
         // Existing rule: stub in front lists the stub IPs first; without a
-        // stub only provider resolvers are used (system::apply with local=[]).
+        // stub only provider resolvers are used (Windows-only plan).
         let dual = ListenerPlan::for_mode(ListenerMode::Dual);
         assert_eq!(local_refs(&dual), vec!["127.0.0.1".to_string(), "::1".to_string()]);
         for r in local_refs(&dual) {

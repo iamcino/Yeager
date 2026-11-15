@@ -139,11 +139,6 @@ impl Pool {
         }
     }
 
-    pub fn last_error(&self) -> Option<String> {
-        let i = self.active();
-        self.members.lock().unwrap()[i].last_error()
-    }
-
     /// Sends `query` to the provider in use, falling over to the other one
     /// as described on [`Pool`].
     pub async fn query(self: &Arc<Self>, query: &Message) -> Result<(Message, Transport), String> {

@@ -1,80 +1,53 @@
-//! Windows side: which resolvers each network adapter uses, and Windows'
-//! own DNS over HTTPS settings for them.
+//! Windows side: readback of which resolvers each network adapter uses,
+//! and Windows' own DNS over HTTPS settings for them.
 //!
-//! Everything goes through the documented IP Helper API
-//! (`GetAdaptersAddresses`, `SetInterfaceDnsSettings`), the same calls the
-//! Settings app makes, rather than scripting PowerShell and the registry:
-//! a hidden encoded PowerShell rewriting DNS is exactly what antivirus
-//! behaviour engines flag as a DNS hijacker.
+//! U08: this module is read-only. The pre-U08 direct writer (`apply` with
+//! its leading heuristic reset, and `reset` itself) is deleted — every DNS
+//! mutation goes through the privileged service via the single
+//! [`crate::authority`]. What remains is selection (`online_guids`),
+//! configured readback (`verify`, `servers_without_doh`) and identity
+//! parsing: the evidence side, never the mutation side. A hidden encoded
+//! PowerShell rewriting DNS is exactly what antivirus behaviour engines
+//! flag as a DNS hijacker; so is a heuristic clear, which is why it is
+//! gone rather than kept as a fallback.
 
 use common::{DohProvider, Error, Result};
 use std::net::IpAddr;
 
-/// Points every online adapter at `local` (Yeager's loopback stub, if
-/// running) followed by the provider's resolvers, each set to DoH with no
-/// plaintext fallback, so that if the stub stops answering Windows falls back
-/// to its own DoH instead of plaintext. Returns the adapters changed.
-///
-/// Every adapter is first cleared of resolvers from an earlier run, so the
-/// system never mixes two providers.
-pub fn apply(provider: DohProvider, local: &[&str]) -> Result<Vec<String>> {
-    reset();
-    let encrypted = encrypted_servers(provider, local);
-    let online: Vec<_> = win::adapters()?.into_iter().filter(|a| a.online).collect();
-    if online.is_empty() {
-        return Err(Error::new(common::lang::tr(
-            "Không tìm thấy card mạng đang có kết nối Internet.",
-            "No network adapter with an Internet connection was found.",
-        )));
-    }
-    for ipv6 in [false, true] {
-        let family = |s: &&str| s.contains(':') == ipv6;
-        let servers: Vec<&str> = local
-            .iter()
-            .chain(&encrypted)
-            .copied()
-            .filter(family)
-            .collect();
-        let doh: Vec<usize> = servers
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !local.contains(s))
-            .map(|(i, _)| i)
-            .collect();
-        for adapter in &online {
-            let set = win::set_dns(&adapter.guid, ipv6, &servers, &doh, provider.template());
-            // IPv6 may be switched off on the adapter; IPv4 must work.
-            if !ipv6 {
-                set.map_err(|e| {
-                    Error::new(common::t!("Không đặt được DNS cho {}: {e}", "Could not set DNS on {}: {e}", adapter.name))
-                })?;
-            }
-        }
-    }
-    win::flush_cache();
-    Ok(online.into_iter().map(|a| a.name).collect())
+/// GUID strings (lowercase, brace-free) of every currently online adapter:
+/// the selection the single DNS authority publishes to the service before
+/// each mutating call. Selection only — recovery considers all recorded
+/// GUIDs even when disconnected, and arrival alone never enrolls a new
+/// adapter (spec §1).
+pub fn online_guids() -> Result<Vec<String>> {
+    Ok(win::adapters()?
+        .into_iter()
+        .filter(|a| a.online)
+        .map(|a| a.guid_string())
+        .collect())
 }
 
-/// Undoes [`apply`] on every adapter, connected or not, whose DNS still
-/// points at one of Yeager's resolvers: back to DHCP-provided DNS.
-pub fn reset() {
-    let ours: Vec<IpAddr> = DohProvider::ALL
-        .iter()
-        .flat_map(|p| p.servers())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let Ok(adapters) = win::adapters() else {
-        return;
-    };
-    for adapter in adapters
-        .iter()
-        .filter(|a| a.dns.iter().any(|ip| ours.contains(ip)))
-    {
-        for ipv6 in [false, true] {
-            let _ = win::set_dns(&adapter.guid, ipv6, &[], &[], "");
-        }
-    }
-    win::flush_cache();
+/// Effective (static or DHCP) DNS per adapter, for diagnostics and legacy
+/// detection evidence. Read-only: names with their configured resolver
+/// lists. This sees effective addresses only — not provenance or DoH
+/// properties — so legacy classification from this input alone can never
+/// reach "exact candidate" (see `legacy::classify_family`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInfo {
+    pub name: String,
+    pub dns: Vec<String>,
+}
+
+/// All adapters with their effective DNS. Off Windows this reports the
+/// platform error instead of guessing.
+pub fn adapter_dns() -> Result<Vec<AdapterInfo>> {
+    Ok(win::adapters()?
+        .into_iter()
+        .map(|a| AdapterInfo {
+            name: a.name,
+            dns: a.dns.iter().map(|ip| ip.to_string()).collect(),
+        })
+        .collect())
 }
 
 /// Checks that Windows itself resolves through Yeager: every online adapter
@@ -158,6 +131,27 @@ mod win {
         pub dns: Vec<IpAddr>,
     }
 
+    impl Adapter {
+        /// Lowercase brace-free GUID string: the identity the journal keys
+        /// entries on (never display name or index).
+        pub fn guid_string(&self) -> String {
+            format!(
+                "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                self.guid.data1,
+                self.guid.data2,
+                self.guid.data3,
+                self.guid.data4[0],
+                self.guid.data4[1],
+                self.guid.data4[2],
+                self.guid.data4[3],
+                self.guid.data4[4],
+                self.guid.data4[5],
+                self.guid.data4[6],
+                self.guid.data4[7],
+            )
+        }
+    }
+
     pub fn adapters() -> Result<Vec<Adapter>> {
         let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
         let mut size = 16 * 1024u32;
@@ -213,60 +207,6 @@ mod win {
         Ok(list)
     }
 
-    /// Sets one address family's static resolvers on an adapter; `servers`
-    /// empty reverts to DHCP. Servers at the `doh` indices use `template`
-    /// with DoH required (no plaintext fallback); all others have DoH off.
-    pub fn set_dns(
-        guid: &GUID,
-        ipv6: bool,
-        servers: &[&str],
-        doh: &[usize],
-        template: &str,
-    ) -> Result<()> {
-        let mut name_server = wide(&servers.join(","));
-        let mut template = wide(template);
-        let mut doh_settings = DNS_DOH_SERVER_SETTINGS {
-            Template: template.as_mut_ptr(),
-            Flags: DNS_DOH_SERVER_SETTINGS_ENABLE as u64,
-        };
-        let mut properties: Vec<DNS_SERVER_PROPERTY> = doh
-            .iter()
-            .map(|&i| DNS_SERVER_PROPERTY {
-                Version: DNS_SERVER_PROPERTY_VERSION1,
-                ServerIndex: i as u32,
-                Type: DnsServerDohProperty,
-                Property: DNS_SERVER_PROPERTY_TYPES {
-                    DohSettings: &mut doh_settings,
-                },
-            })
-            .collect();
-
-        let mut settings: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
-        settings.Version = DNS_INTERFACE_SETTINGS_VERSION3;
-        settings.Flags = (DNS_SETTING_NAMESERVER
-            | DNS_SETTING_DOH
-            | if ipv6 { DNS_SETTING_IPV6 } else { 0 }) as u64;
-        settings.NameServer = name_server.as_mut_ptr();
-        settings.cServerProperties = properties.len() as u32;
-        settings.ServerProperties = if properties.is_empty() {
-            ptr::null_mut()
-        } else {
-            properties.as_mut_ptr()
-        };
-
-        let status = unsafe {
-            SetInterfaceDnsSettings(*guid, (&settings as *const DNS_INTERFACE_SETTINGS3).cast())
-        };
-        if status == NO_ERROR {
-            Ok(())
-        } else {
-            Err(Error::new(common::t!(
-                "SetInterfaceDnsSettings lỗi {status}. Yeager cần quyền Administrator.",
-                "SetInterfaceDnsSettings failed ({status}). Yeager needs administrator rights."
-            )))
-        }
-    }
-
     /// Those of `expected` configured on the adapter for this family without
     /// DoH required (not set at all, DoH off, or plaintext fallback allowed).
     pub fn servers_without_doh(guid: &GUID, ipv6: bool, expected: &[&str]) -> Result<Vec<String>> {
@@ -318,19 +258,6 @@ mod win {
             .collect())
     }
 
-    pub fn flush_cache() {
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-        unsafe {
-            let lib = LoadLibraryA(b"dnsapi.dll\0".as_ptr());
-            if !lib.is_null() {
-                if let Some(proc) = GetProcAddress(lib, b"DnsFlushResolverCache\0".as_ptr()) {
-                    let func: unsafe extern "system" fn() -> i32 = std::mem::transmute(proc);
-                    func();
-                }
-            }
-        }
-    }
-
     /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` → GUID.
     fn parse_guid(s: &str) -> Option<GUID> {
         let hex: String = s.trim_matches(['{', '}']).split('-').collect();
@@ -380,10 +307,6 @@ mod win {
         unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(p, len)) }
     }
 
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(Some(0)).collect()
-    }
-
     #[cfg(test)]
     mod tests {
         #[test]
@@ -409,6 +332,12 @@ mod win {
         pub dns: Vec<IpAddr>,
     }
 
+    impl Adapter {
+        pub fn guid_string(&self) -> String {
+            String::new()
+        }
+    }
+
     fn unsupported<T>() -> Result<T> {
         Err(Error::new(common::lang::tr("Chỉ hỗ trợ Windows.", "Windows only.")))
     }
@@ -417,13 +346,7 @@ mod win {
         unsupported()
     }
 
-    pub fn set_dns(_: &(), _: bool, _: &[&str], _: &[usize], _: &str) -> Result<()> {
-        unsupported()
-    }
-
     pub fn servers_without_doh(_: &(), _: bool, _: &[&str]) -> Result<Vec<String>> {
         unsupported()
     }
-
-    pub fn flush_cache() {}
 }

@@ -125,6 +125,50 @@ impl ListenerBinder for RealBinder {
     }
 }
 
+/// U08 production binder: binds the real stub like [`RealBinder`], but the
+/// choice follows the latest mutating call instead of construction time.
+///
+/// The app's single DNS authority owns one [`Coordinator`] for the process
+/// lifetime and serves many enable/change calls with different choices.
+/// Rebuilding the coordinator per call would drop the lease and the serving
+/// listener; this binder lets the authority retarget the choice under a
+/// mutex before each call while the coordinator (which lives on the
+/// authority worker thread) keeps its lease and sockets.
+pub struct ChoiceBinder {
+    choice: std::sync::Mutex<Choice>,
+}
+
+impl ChoiceBinder {
+    pub fn new(choice: Choice) -> Self {
+        Self {
+            choice: std::sync::Mutex::new(choice),
+        }
+    }
+
+    /// Point future binds at `choice`. In-flight serving listeners are
+    /// retargeted by [`Coordinator`] itself on install; this only affects
+    /// the next fresh bind.
+    pub fn set(&self, choice: Choice) {
+        *self.choice.lock().unwrap_or_else(|e| e.into_inner()) = choice;
+    }
+
+    pub fn get(&self) -> Choice {
+        *self.choice.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ListenerBinder for ChoiceBinder {
+    fn bind(&self, plan: &ListenerPlan) -> Result<Box<dyn ManagedListener>, BindError> {
+        if !plan.serves_local() {
+            return Err(BindError("windows-only plan binds no listener".into()));
+        }
+        let choice = self.get();
+        crate::stub::Stub::start(crate::pool::Pool::new(choice), &plan.addrs)
+            .map(|s| Box::new(s) as Box<dyn ManagedListener>)
+            .map_err(|e| BindError(e.to_string()))
+    }
+}
+
 /// What enable/change/disable reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedStatus {
@@ -388,6 +432,50 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     pub fn status(&mut self) -> ManagedStatus {
         let _ = self.service.status();
         self.status_local()
+    }
+
+    /// U08: refresh the adapter selection before the next mutating call.
+    /// Arrival alone never enrolls a new adapter (spec §1); the app
+    /// authority recomputes the online set at each call site and publishes
+    /// it here, so the service always commits against a fresh selection.
+    /// Existing entries stay consistent: the service refuses incoherent
+    /// reconfigures with unresolved debt.
+    pub fn set_selected(&mut self, selected: Vec<String>) {
+        self.selected = selected;
+    }
+
+    /// U08: idempotent DNS-side admission close for the shutdown path.
+    /// When this coordinator holds a lease, the service is asked to quiesce
+    /// (reject new work for our owner); with no lease there is nothing to
+    /// close, which reads as success — never as a failure that would block
+    /// the restore behind it.
+    pub fn quiesce_side(&mut self) -> SvcReport {
+        match self.lease.clone() {
+            Some(creds) => self.service.quiesce(&creds),
+            None => SvcReport {
+                outcome: SvcOutcome::Success,
+                generation: self.service.journal_epoch().unwrap_or(0),
+                message: "no lease held; admission already closed".into(),
+            },
+        }
+    }
+
+    /// U08: bounded serving-listener stop for the verified-restore path.
+    /// Idempotent: with no serving listener there is nothing to stop.
+    /// Only ever called after a verified restore (spec §6 step 4); the
+    /// pending/conflict branch keeps the listener and calls
+    /// [`Coordinator::note_handoff`] instead.
+    pub fn stop_listeners_bounded(&mut self) {
+        self.stop_active_bounded();
+    }
+
+    /// U08: explicit service handoff for the pending/conflict branch. The
+    /// listener is retained and DNS authority stays alive elsewhere; the
+    /// pending text is kept so status never reads as success.
+    pub fn note_handoff(&mut self, reason: &str) {
+        if self.pending.is_none() {
+            self.pending = Some(format!("handoff: {reason}"));
+        }
     }
 
     // ---- supervision ------------------------------------------------------
@@ -750,6 +838,23 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     pub fn serving_desired(&self) -> Option<DesiredPlan> {
         self.active.as_ref().map(|entry| {
             plan::desired_plan(entry.choice, &entry.plan, entry.readiness)
+        })
+    }
+
+    /// U08: the provider the serving configuration actually answers with.
+    /// Prefers the live listener's forwarder (which retargets on reuse);
+    /// falls back to the committed choice with the Auto rule. `None` with
+    /// no active configuration.
+    pub fn serving_provider(&self) -> Option<common::DohProvider> {
+        self.active.as_ref().map(|entry| {
+            entry
+                .listener
+                .as_ref()
+                .and_then(|l| l.effective_provider())
+                .unwrap_or_else(|| match entry.choice {
+                    Choice::Fixed(p) => p,
+                    Choice::Auto => crate::pool::AUTO_PROVIDERS[0],
+                })
         })
     }
 }
