@@ -7,6 +7,7 @@
 slint::include_modules!();
 
 mod engine;
+mod lifecycle;
 #[cfg(windows)]
 mod platform;
 mod updater;
