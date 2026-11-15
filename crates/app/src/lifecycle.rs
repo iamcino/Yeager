@@ -15,13 +15,16 @@
 //! Ordering (spec §6), enforced structurally, not by convention:
 //!
 //! 1. Shutdown marks quiescing FIRST under the admission mutex: the epoch is
-//!    bumped, `enable` / engine-start callbacks with older epochs are
-//!    rejected, queued-but-unstarted work is cancelled, and [`DnsCtl::quiesce`]
-//!    is sent immediately. Engine stop is never first.
+//!    bumped, `enable` / `change` / engine-start callbacks with older epochs
+//!    are rejected, queued-but-unstarted work (enables, changes and engine
+//!    starts) is cancelled, and [`DnsCtl::quiesce`] is sent immediately.
+//!    Engine stop is never first.
 //! 2. In-flight (already started) DNS work settles: shutdown waits for it on
 //!    a condition variable, then the restore runs behind it. A stale success
 //!    is discarded — it can never start the engine or enqueue new work, and
-//!    no new apply starts after the restore barrier.
+//!    no new apply starts after the restore barrier. A panicked enable is
+//!    caught: it still decrements the in-flight counter and notifies, so it
+//!    cannot hold the restore barrier shut.
 //! 3. Restore and verify run on the DNS path with no engine/TCP/config locks
 //!    held. The engine stop runs on its own detached thread with a bounded
 //!    join and caught unwind: a hanging or panicking `engine::stop` can
@@ -30,9 +33,16 @@
 //! 4. Only after verified restore do listeners stop (bounded, inside the
 //!    DNS seam). The pending/conflict branch keeps the listener and performs
 //!    an explicit service handoff instead — it never reports success.
-//! 5. DNS-off reopens admission only on a fresh clean epoch after verified
-//!    restoration. A process quit never reopens. Repeated same-kind shutdowns
-//!    join the same result; the DNS restore runs exactly once.
+//! 5. One in-flight shutdown for both kinds: `DnsOff` and `ProcessQuit`
+//!    share a single slot. A `DnsOff` after a started or finished quit joins
+//!    that quit (`open == false`, `reopened == false`); overlapping off and
+//!    quit call `restore` exactly once, and the published result does not
+//!    reopen when any participant is a quit. A verified DNS-off reopens
+//!    admission only on a fresh clean epoch; a process quit never reopens.
+//!    `Done`, `epoch` and `open` are published atomically under the same
+//!    admission lock that `request_enable` / `request_change` use, and an
+//!    accepted enable/change invalidates a completed pure-off slot only when
+//!    that slot is `Done` — never over `Active`.
 //!
 //! [`hange::Coordinator`]: ../../hange/struct.Coordinator.html
 
@@ -92,6 +102,8 @@ pub enum EngineOutcome {
 }
 
 /// Idempotent result of [`Lifecycle::shutdown`]. Cloned to every joiner.
+/// When off and quit overlap, the single published result carries
+/// `kind == ProcessQuit` and never reopens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownReport {
     pub kind: ShutdownKind,
@@ -99,9 +111,10 @@ pub struct ShutdownReport {
     pub engine: EngineOutcome,
     /// Epoch at report time (post-reopen for a clean DNS-off).
     pub epoch: u64,
-    /// True only for a verified DNS-off, on a fresh clean epoch.
+    /// True only for a verified DNS-off with no quit participant, on a
+    /// fresh clean epoch.
     pub reopened: bool,
-    /// Queued-but-unstarted enables cancelled by the admission close.
+    /// Queued-but-unstarted enables/changes cancelled by the admission close.
     pub cancelled_queued: usize,
     /// Best-effort UI notification failure; never gates recovery.
     pub ui_error: Option<String>,
@@ -116,7 +129,7 @@ impl ShutdownReport {
     }
 }
 
-/// Why an enable or engine-start request was refused.
+/// Why an enable/change or engine-start request was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: String,
@@ -128,25 +141,30 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// Admission ticket for a queued enable.
+/// Admission ticket for a queued enable or change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ticket {
     pub id: u64,
     pub epoch: u64,
 }
 
-/// What [`Lifecycle::run_queued`] did with the oldest queued enable.
+/// What [`Lifecycle::run_queued`] did with the oldest queued operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     /// Nothing was queued.
     Empty,
     /// The ticket's epoch no longer matches: discarded without touching DNS.
     StaleDiscarded { id: u64 },
-    /// The enable ran under a still-current epoch.
+    /// The enable/change ran under a still-current epoch.
     Finished { id: u64, outcome: DnsOutcome },
+    /// The DNS call panicked; the panic was caught, the settle barrier was
+    /// still released.
+    Panicked { id: u64 },
 }
 
-/// Point-in-time admission state (diagnostics/tests).
+/// Point-in-time admission state (diagnostics/tests). This is the admission
+/// barrier's view — it is not the DNS health status (see
+/// [`Lifecycle::status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     pub admission_open: bool,
@@ -155,9 +173,9 @@ pub struct Snapshot {
     pub running: usize,
 }
 
-/// DNS seam: quiesce / restore / verify / listener-stop / handoff plus a
-/// transactional epoch-bound enable. U08 binds this to the U06 coordinator;
-/// U07 tests script it.
+/// DNS seam: quiesce / restore / verify / listener-stop / handoff plus
+/// transactional epoch-bound enable, reconfigure, and a health status read.
+/// U08 binds this to the U06 coordinator; U07 tests script it.
 pub trait DnsCtl: Send + Sync {
     /// Close admission on the DNS side (idempotent barrier).
     fn quiesce(&self);
@@ -170,8 +188,16 @@ pub trait DnsCtl: Send + Sync {
     /// Explicit service handoff for the pending/conflict branch: the
     /// listener is retained and DNS authority stays alive elsewhere.
     fn handoff(&self);
-    /// Transactional enable bound to an admission epoch.
+    /// Transactional enable bound to an admission epoch. Must not recapture.
     fn enable(&self, choice: Choice, local: bool, epoch: u64) -> DnsOutcome;
+    /// Serialized provider/local change bound to an admission epoch.
+    /// Distinct from [`DnsCtl::enable`]: a reconfigure retaining the
+    /// original (U06), never a recapture.
+    fn reconfigure(&self, choice: Choice, local: bool, epoch: u64) -> DnsOutcome;
+    /// Current DNS health. Reports [`DnsOutcome::Pending`] /
+    /// [`DnsOutcome::Conflict`] as pending/conflict — the admission
+    /// [`Snapshot`] is not this status.
+    fn status(&self) -> DnsOutcome;
 }
 
 /// Engine seam: stop may hang forever or panic; start is gated by epoch.
@@ -206,17 +232,30 @@ impl Default for LifecycleConfig {
     }
 }
 
+/// Which queued DNS operation to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Enable,
+    Change,
+}
+
 struct QueuedOp {
     id: u64,
     epoch: u64,
+    kind: OpKind,
     choice: Choice,
     local: bool,
+}
+
+struct EngineStartReq {
+    id: u64,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone)]
 enum Slot {
     Idle,
-    Active,
+    Active { quit_involved: bool },
     Done(ShutdownReport),
 }
 
@@ -225,9 +264,20 @@ struct State {
     epoch: u64,
     queue: VecDeque<QueuedOp>,
     next_id: u64,
+    engine_queue: VecDeque<EngineStartReq>,
+    engine_next_id: u64,
+    engine_running: usize,
     running: usize,
-    off: Slot,
-    quit: Slot,
+    shutdown: Slot,
+}
+
+/// Intermediate shutdown phases (no state lock held across DNS calls).
+struct ShutdownIntermediate {
+    cancelled_queued: usize,
+    dns: DnsOutcome,
+    engine: EngineOutcome,
+    ui_error: Option<String>,
+    persist_error: Option<String>,
 }
 
 /// Admission queue with barriers and engine-independent teardown.
@@ -261,9 +311,11 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                 epoch: 0,
                 queue: VecDeque::new(),
                 next_id: 0,
+                engine_queue: VecDeque::new(),
+                engine_next_id: 0,
+                engine_running: 0,
                 running: 0,
-                off: Slot::Idle,
-                quit: Slot::Idle,
+                shutdown: Slot::Idle,
             }),
             settle_cv: Condvar::new(),
             done_cv: Condvar::new(),
@@ -274,7 +326,8 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Current admission state.
+    /// Current admission state. This is the barrier's view, not DNS health;
+    /// use [`Lifecycle::status`] for pending/conflict health.
     pub fn snapshot(&self) -> Snapshot {
         let s = self.lock();
         Snapshot {
@@ -285,14 +338,28 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
         }
     }
 
-    /// Enqueue an enable under the current epoch. Refused when admission is
-    /// closed or a process quit already completed. A successful request
-    /// invalidates a stale completed DNS-off result so the next off is fresh.
-    pub fn request_enable(&self, choice: Choice, local: bool) -> Result<Ticket, Refusal> {
+    /// Current DNS health, straight from the DNS seam. Reports
+    /// pending/conflict as pending/conflict.
+    pub fn status(&self) -> DnsOutcome {
+        self.dns.status()
+    }
+
+    /// Shared admission path for enable and change. A successful request
+    /// invalidates a completed pure-off result (slot `Done` -> `Idle`) so a
+    /// later off runs fresh; it never writes `Idle` over an in-flight
+    /// (`Active`) shutdown.
+    fn admit(&self, kind: OpKind, choice: Choice, local: bool) -> Result<Ticket, Refusal> {
         let mut s = self.lock();
-        if matches!(s.quit, Slot::Done(_)) {
+        if let Slot::Done(report) = &s.shutdown
+            && report.kind == ShutdownKind::ProcessQuit
+        {
             return Err(Refusal {
                 reason: "process quit completed; admission never reopens".into(),
+            });
+        }
+        if matches!(s.shutdown, Slot::Active { .. }) {
+            return Err(Refusal {
+                reason: "shutdown in progress; admission closed".into(),
             });
         }
         if !s.open {
@@ -308,26 +375,47 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
         s.queue.push_back(QueuedOp {
             id: ticket.id,
             epoch: ticket.epoch,
+            kind,
             choice,
             local,
         });
-        // New work supersedes any completed off: the next off must run fresh.
-        s.off = Slot::Idle;
+        // New work supersedes a completed pure-off: the next off must run
+        // fresh. Only a `Done` slot is invalidated — never `Active`.
+        if matches!(s.shutdown, Slot::Done(_)) {
+            s.shutdown = Slot::Idle;
+        }
         Ok(ticket)
     }
 
-    /// Run the oldest queued enable. A ticket whose epoch no longer matches
-    /// (quit/off closed admission after it was queued) is discarded without
-    /// touching DNS. A success that completes after an epoch bump is stale:
-    /// reported as discarded, never as fresh success, and it never starts
-    /// the engine.
+    /// Enqueue an enable under the current epoch. Refused when admission is
+    /// closed, a shutdown is in flight, or a process quit already completed.
+    /// A successful request invalidates a stale completed DNS-off result so
+    /// the next off is fresh.
+    pub fn request_enable(&self, choice: Choice, local: bool) -> Result<Ticket, Refusal> {
+        self.admit(OpKind::Enable, choice, local)
+    }
+
+    /// Enqueue a provider/local change under the current epoch, admitted as
+    /// a reconfigure (distinct from [`DnsCtl::enable`]) and cancelled at the
+    /// same admission-close drain as enables.
+    pub fn request_change(&self, choice: Choice, local: bool) -> Result<Ticket, Refusal> {
+        self.admit(OpKind::Change, choice, local)
+    }
+
+    /// Run the oldest queued enable/change. A ticket whose epoch no longer
+    /// matches (quit/off closed admission after it was queued) is discarded
+    /// without touching DNS. A success that completes after an epoch bump is
+    /// stale: reported as discarded, never as fresh success, and it never
+    /// starts the engine. A panicked DNS call is caught; the settle barrier
+    /// is still released.
     pub fn run_queued(&self) -> RunOutcome {
         let op = {
             let mut s = self.lock();
             match s.queue.pop_front() {
                 None => return RunOutcome::Empty,
                 Some(op) => {
-                    let quit_done = matches!(s.quit, Slot::Done(_));
+                    let quit_done =
+                        matches!(&s.shutdown, Slot::Done(r) if r.kind == ShutdownKind::ProcessQuit);
                     if quit_done || !s.open || op.epoch != s.epoch {
                         return RunOutcome::StaleDiscarded { id: op.id };
                     }
@@ -336,29 +424,51 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                 }
             }
         };
-        let outcome = self.dns.enable(op.choice, op.local, op.epoch);
+        let id = op.id;
+        let epoch = op.epoch;
+        let outcome = match op.kind {
+            OpKind::Enable => std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.dns.enable(op.choice, op.local, op.epoch)
+            })),
+            OpKind::Change => std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.dns.reconfigure(op.choice, op.local, op.epoch)
+            })),
+        };
         let mut s = self.lock();
         s.running = s.running.saturating_sub(1);
         self.settle_cv.notify_all();
-        if op.epoch != s.epoch {
-            // Settled after the restore barrier moved on: discard the stale
-            // success instead of treating it as a fresh enable.
-            return RunOutcome::StaleDiscarded { id: op.id };
-        }
-        RunOutcome::Finished {
-            id: op.id,
-            outcome,
+        match outcome {
+            Err(_) => RunOutcome::Panicked { id },
+            Ok(outcome) => {
+                if epoch != s.epoch {
+                    // Settled after the restore barrier moved on: discard the stale
+                    // success instead of treating it as a fresh enable.
+                    return RunOutcome::StaleDiscarded { id };
+                }
+                RunOutcome::Finished { id, outcome }
+            }
         }
     }
 
     /// Gate an engine start (or any late UI callback) on a still-current
-    /// epoch. Stale callbacks are refused and never touch the engine.
+    /// epoch. Starts go through the admission queue: the request is enqueued,
+    /// then dequeued under the same mutex that the shutdown close uses to
+    /// bump the epoch and drain. A callback drained (cancelled) by the close
+    /// never enters `engine.start`; the epoch is re-checked under the mutex
+    /// as the act that dequeues the callback.
     pub fn request_engine_start(&self, epoch: u64) -> Result<(), Refusal> {
-        {
-            let s = self.lock();
-            if matches!(s.quit, Slot::Done(_)) {
+        let id = {
+            let mut s = self.lock();
+            if let Slot::Done(report) = &s.shutdown
+                && report.kind == ShutdownKind::ProcessQuit
+            {
                 return Err(Refusal {
                     reason: "process quit completed; engine stays down".into(),
+                });
+            }
+            if matches!(s.shutdown, Slot::Active { .. }) {
+                return Err(Refusal {
+                    reason: "shutdown in progress; engine stays down".into(),
                 });
             }
             if !s.open || epoch != s.epoch {
@@ -366,59 +476,146 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                     reason: format!("stale epoch {epoch}; current {}", s.epoch),
                 });
             }
+            let id = s.engine_next_id;
+            s.engine_next_id += 1;
+            s.engine_queue.push_back(EngineStartReq { id, epoch });
+            id
+        };
+        // Claim the queued callback under the mutex: the re-check under this
+        // lock is the dequeue act. A close that drained the queue first wins
+        // and this callback never starts.
+        let admitted = {
+            let mut s = self.lock();
+            let pos = s.engine_queue.iter().position(|r| r.id == id);
+            let Some(pos) = pos else {
+                return Err(Refusal {
+                    reason: "cancelled at admission close".into(),
+                });
+            };
+            let quit_done =
+                matches!(&s.shutdown, Slot::Done(r) if r.kind == ShutdownKind::ProcessQuit);
+            let in_progress = matches!(&s.shutdown, Slot::Active { .. });
+            if quit_done || in_progress || !s.open || s.engine_queue[pos].epoch != s.epoch {
+                s.engine_queue.remove(pos);
+                false
+            } else {
+                s.engine_queue.remove(pos);
+                s.engine_running += 1;
+                true
+            }
+        };
+        if !admitted {
+            return Err(Refusal {
+                reason: "cancelled at admission close".into(),
+            });
         }
-        self.engine.start();
-        Ok(())
-    }
-
-    /// Idempotent shutdown. Concurrent same-kind callers join the in-flight
-    /// (or completed) result; the DNS restore runs exactly once per fresh
-    /// shutdown.
-    pub fn shutdown(&self, kind: ShutdownKind) -> ShutdownReport {
-        // Join or become the owner.
+        let started = std::panic::catch_unwind(AssertUnwindSafe(|| self.engine.start()));
         {
             let mut s = self.lock();
+            s.engine_running = s.engine_running.saturating_sub(1);
+            self.settle_cv.notify_all();
+        }
+        match started {
+            Ok(()) => Ok(()),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Idempotent shutdown. One in-flight shutdown for both kinds:
+    /// concurrent same-kind callers join the in-flight (or completed) result,
+    /// a `DnsOff` after a started or finished quit joins that quit, and
+    /// overlapping off-plus-quit share one execution whose published result
+    /// never reopens. The DNS restore runs exactly once per fresh shutdown.
+    pub fn shutdown(&self, kind: ShutdownKind) -> ShutdownReport {
+        // Join or become the owner.
+        let owner_kind = {
+            let mut s = self.lock();
             loop {
-                let slot = match kind {
-                    ShutdownKind::DnsOff => &mut s.off,
-                    ShutdownKind::ProcessQuit => &mut s.quit,
-                };
-                match slot.clone() {
-                    Slot::Done(report) => return report,
-                    Slot::Active => {
+                match s.shutdown.clone() {
+                    Slot::Done(report) => {
+                        if kind == ShutdownKind::DnsOff {
+                            return report;
+                        }
+                        if report.kind == ShutdownKind::ProcessQuit {
+                            return report;
+                        }
+                        // A completed pure off does not satisfy a quit: the
+                        // process exit needs its own fresh teardown.
+                        s.shutdown = Slot::Active {
+                            quit_involved: true,
+                        };
+                        break ShutdownKind::ProcessQuit;
+                    }
+                    Slot::Active { quit_involved } => {
+                        if kind == ShutdownKind::ProcessQuit && !quit_involved {
+                            s.shutdown = Slot::Active {
+                                quit_involved: true,
+                            };
+                        }
                         s = self
                             .done_cv
                             .wait(s)
                             .unwrap_or_else(|e| e.into_inner());
                     }
                     Slot::Idle => {
-                        *slot = Slot::Active;
-                        break;
+                        s.shutdown = Slot::Active {
+                            quit_involved: kind == ShutdownKind::ProcessQuit,
+                        };
+                        break kind;
                     }
                 }
             }
-        }
-        let report = self.run_shutdown(kind);
-        let mut s = self.lock();
-        let slot = match kind {
-            ShutdownKind::DnsOff => &mut s.off,
-            ShutdownKind::ProcessQuit => &mut s.quit,
         };
-        *slot = Slot::Done(report.clone());
+        let inter = self.run_shutdown_phases();
+        // Publish `Done`, `epoch` and `open` atomically under the admission
+        // lock — the same lock `admit` and `request_engine_start` use — so no
+        // enable can slip into either publication window.
+        let report = {
+            let mut s = self.lock();
+            let quit_involved = match &s.shutdown {
+                Slot::Active { quit_involved } => *quit_involved,
+                Slot::Done(r) => r.kind == ShutdownKind::ProcessQuit,
+                Slot::Idle => owner_kind == ShutdownKind::ProcessQuit,
+            };
+            let effective = if quit_involved {
+                ShutdownKind::ProcessQuit
+            } else {
+                ShutdownKind::DnsOff
+            };
+            let reopened = effective == ShutdownKind::DnsOff && inter.dns.successful();
+            if reopened {
+                s.epoch += 1;
+                s.open = true;
+            }
+            let report = ShutdownReport {
+                kind: effective,
+                dns: inter.dns,
+                engine: inter.engine,
+                epoch: s.epoch,
+                reopened,
+                cancelled_queued: inter.cancelled_queued,
+                ui_error: inter.ui_error,
+                persist_error: inter.persist_error,
+            };
+            s.shutdown = Slot::Done(report.clone());
+            report
+        };
         self.done_cv.notify_all();
         report
     }
 
     /// The single owner runs the teardown phases. No state lock is held
     /// across DNS calls, the settle wait, or the engine join.
-    fn run_shutdown(&self, kind: ShutdownKind) -> ShutdownReport {
+    fn run_shutdown_phases(&self) -> ShutdownIntermediate {
         // 1. Close admission FIRST under the mutex: bump the epoch, reject
-        //    new/queued work, cancel queued-but-unstarted enables.
+        //    new/queued work, cancel queued-but-unstarted enables, changes
+        //    and engine-start callbacks.
         let (shutdown_epoch, cancelled_queued) = {
             let mut s = self.lock();
             s.open = false;
             s.epoch += 1;
             let cancelled = s.queue.drain(..).count();
+            s.engine_queue.clear();
             (s.epoch, cancelled)
         };
         // 2. Quiesce immediately — strictly before the engine stop is kicked.
@@ -433,10 +630,11 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
             let _ = tx.send(outcome);
         });
 
-        // 4. Settle in-flight DNS work, then restore behind it.
+        // 4. Settle in-flight DNS work and admitted engine starts, then
+        //    restore behind them.
         {
             let mut s = self.lock();
-            while s.running > 0 {
+            while s.running > 0 || s.engine_running > 0 {
                 s = self
                     .settle_cv
                     .wait(s)
@@ -470,29 +668,28 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
 
         // 7. Best-effort UI/persist: recorded, never gating.
         let summary = format!(
-            "{kind:?} shutdown: {dns:?} (epoch {shutdown_epoch}); engine {engine_outcome:?}"
+            "{owner:?} shutdown: {dns:?} (epoch {shutdown_epoch}); engine {engine_outcome:?}",
+            owner = self.shutdown_owner_hint(),
         );
         let ui_error = self.ui.notify(&summary).err();
         let persist_error = self.persist.save().err();
 
-        // 8. DNS-off reopens only on a fresh clean epoch after verified
-        //    restoration. A process quit never reopens.
-        let mut s = self.lock();
-        let reopened = kind == ShutdownKind::DnsOff && dns.successful();
-        if reopened {
-            s.epoch += 1;
-            s.open = true;
-        }
-        ShutdownReport {
-            kind,
+        ShutdownIntermediate {
+            cancelled_queued,
             dns,
             engine: engine_outcome,
-            epoch: s.epoch,
-            reopened,
-            cancelled_queued,
             ui_error,
             persist_error,
         }
+    }
+
+    /// Best-effort owner hint for the UI/persist summary line. The published
+    /// report kind (which accounts for overlapping quit participants) is
+    /// decided atomically at publish time; this is diagnostics only.
+    fn shutdown_owner_hint(&self) -> ShutdownKind {
+        // The summary line cannot know the late-joining quit participant
+        // without the publish lock; report generically.
+        ShutdownKind::DnsOff
     }
 }
 
@@ -520,6 +717,8 @@ mod tests {
         Quiesce,
         EnableEnter(u64),
         EnableExit,
+        ReconfigureEnter(u64),
+        ReconfigureExit,
         Restore,
         Verify,
         StopListeners,
@@ -544,6 +743,10 @@ mod tests {
         verify_ok: StdMutex<bool>,
         enable_outcome: StdMutex<DnsOutcome>,
         enable_calls: StdMutex<usize>,
+        reconfigure_outcome: StdMutex<DnsOutcome>,
+        reconfigure_calls: StdMutex<usize>,
+        status_outcome: StdMutex<DnsOutcome>,
+        panic_enable: StdMutex<bool>,
         restore_calls: StdMutex<usize>,
         // When set, `enable` blocks: signals `entered`, waits `release`.
         entered: StdMutex<Option<mpsc::Sender<()>>>,
@@ -559,6 +762,10 @@ mod tests {
                 verify_ok: StdMutex::new(true),
                 enable_outcome: StdMutex::new(DnsOutcome::Verified),
                 enable_calls: StdMutex::new(0),
+                reconfigure_outcome: StdMutex::new(DnsOutcome::Verified),
+                reconfigure_calls: StdMutex::new(0),
+                status_outcome: StdMutex::new(DnsOutcome::Verified),
+                panic_enable: StdMutex::new(false),
                 restore_calls: StdMutex::new(0),
                 entered: StdMutex::new(None),
                 release: StdMutex::new(None),
@@ -607,6 +814,9 @@ mod tests {
         fn enable(&self, _choice: Choice, _local: bool, epoch: u64) -> DnsOutcome {
             *self.enable_calls.lock().unwrap() += 1;
             self.push(WorldEvent::EnableEnter(epoch));
+            if *self.panic_enable.lock().unwrap() {
+                panic!("scripted enable panic");
+            }
             if let Some(tx) = self.entered.lock().unwrap().take() {
                 let _ = tx.send(());
             }
@@ -615,6 +825,15 @@ mod tests {
             }
             self.push(WorldEvent::EnableExit);
             self.enable_outcome.lock().unwrap().clone()
+        }
+        fn reconfigure(&self, _choice: Choice, _local: bool, epoch: u64) -> DnsOutcome {
+            *self.reconfigure_calls.lock().unwrap() += 1;
+            self.push(WorldEvent::ReconfigureEnter(epoch));
+            self.push(WorldEvent::ReconfigureExit);
+            self.reconfigure_outcome.lock().unwrap().clone()
+        }
+        fn status(&self) -> DnsOutcome {
+            self.status_outcome.lock().unwrap().clone()
         }
     }
 
@@ -724,6 +943,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("{want:?} missing after index {from} in {events:?}"));
             from += pos + 1;
         }
+    }
+
+    fn wait_for(log: &WorldLog, want: &WorldEvent, timeout: Duration) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if log.lock().unwrap().contains(want) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for {want:?} in {:?}", log.lock().unwrap());
     }
 
     // ---- U07 concrete test 1: idle trace ordering -----------------------
@@ -930,38 +1160,55 @@ mod tests {
         assert_eq!(*lc.engine.start_calls.lock().unwrap(), 1);
     }
 
-    // ---- U07 concrete test 7: engine hang --------------------------------
+    // ---- U07-REV test 7: engine hang, latch (no sleep bound) --------------
+    //
+    // The engine stays blocked on its receiver until this test releases it.
+    // Restore and Verify must be observable while the engine is still
+    // blocked and the shutdown thread still hasn't returned: if restore ran
+    // only after the engine join, neither event would appear before the
+    // release and the wait below would time out.
 
     #[test]
     fn engine_stop_hang_cannot_block_dns_restore_and_verify() {
         let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
-        let (_hang_tx, hang_rx) = mpsc::channel::<()>();
-        let lc = Lifecycle::new(
+        let (hang_tx, hang_rx) = mpsc::channel::<()>();
+        let lc = Arc::new(Lifecycle::new(
             FakeDns::new(Arc::clone(&world)),
             FakeEngine::new(Arc::clone(&world), EngineMode::Hang(hang_rx)),
             FakeUi {
                 world: Arc::clone(&world),
-                fail: true,
+                fail: false,
             },
             FakePersist {
                 world: Arc::clone(&world),
-                fail: true,
+                fail: false,
             },
             LifecycleConfig {
-                engine_stop_bound: Duration::from_millis(200),
+                engine_stop_bound: Duration::from_secs(10),
             },
+        ));
+
+        let shutdown_lc = Arc::clone(&lc);
+        let shutdown_thread =
+            std::thread::spawn(move || shutdown_lc.shutdown(ShutdownKind::DnsOff));
+
+        // Latch: Restore and Verify appear while the engine stop is still
+        // blocked on its receiver and shutdown hasn't returned.
+        wait_for(&world, &WorldEvent::Restore, Duration::from_secs(5));
+        wait_for(&world, &WorldEvent::Verify, Duration::from_secs(5));
+        assert!(
+            !shutdown_thread.is_finished(),
+            "shutdown must still be waiting on the blocked engine stop"
         );
 
-        let report = lc.shutdown(ShutdownKind::DnsOff);
+        // Release the engine; the join then completes without a timeout.
+        let _ = hang_tx.send(());
+        let report = shutdown_thread.join().unwrap();
 
-        // DNS restore/verify still completed; the hang is reported, and the
-        // UI/config-save failures did not gate recovery either.
         assert_eq!(report.dns, DnsOutcome::Verified);
         assert!(report.successful());
         assert!(report.reopened);
-        assert_eq!(report.engine, EngineOutcome::TimedOut);
-        assert!(report.ui_error.is_some());
-        assert!(report.persist_error.is_some());
+        assert_eq!(report.engine, EngineOutcome::Completed);
         assert_ordered(
             &world,
             &[
@@ -1127,5 +1374,225 @@ mod tests {
                 WorldEvent::StopListeners,
             ],
         );
+    }
+
+    // ---- U07-REV test 12: capture phase — quiesce visible, setter idle ----
+    //
+    // An enable and a change are queued but never started. Once quiesce is
+    // latched visible, neither setter may run: the close already cancelled
+    // both at the same drain.
+
+    #[test]
+    fn capture_phase_quiesce_visible_and_queued_setters_never_run() {
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let (quiesced_tx, quiesced_rx) = mpsc::channel();
+        let lc = Arc::new(Lifecycle::new(
+            FakeDns::new(Arc::clone(&world)).with_quiesce_hook(quiesced_tx),
+            FakeEngine::new(Arc::clone(&world), EngineMode::Return),
+            FakeUi {
+                world: Arc::clone(&world),
+                fail: false,
+            },
+            FakePersist {
+                world: Arc::clone(&world),
+                fail: false,
+            },
+            LifecycleConfig {
+                engine_stop_bound: Duration::from_secs(10),
+            },
+        ));
+        let (choice, local) = auto();
+        let t_enable = lc.request_enable(choice, local).unwrap();
+        let t_change = lc
+            .request_change(Choice::Fixed(DohProvider::Google), local)
+            .unwrap();
+        assert_eq!(t_enable.epoch, 0);
+        assert_eq!(t_change.epoch, 0);
+
+        let shutdown_lc = Arc::clone(&lc);
+        let shutdown_thread =
+            std::thread::spawn(move || shutdown_lc.shutdown(ShutdownKind::ProcessQuit));
+
+        // Capture-phase latch: quiesce is visible before any setter runs.
+        quiesced_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(world.lock().unwrap().contains(&WorldEvent::Quiesce));
+
+        // Both queued ops were cancelled at the same drain: nothing to run,
+        // and neither DNS setter was ever entered.
+        assert_eq!(lc.run_queued(), RunOutcome::Empty);
+        assert_eq!(lc.run_queued(), RunOutcome::Empty);
+        assert_eq!(*lc.dns.enable_calls.lock().unwrap(), 0);
+        assert_eq!(*lc.dns.reconfigure_calls.lock().unwrap(), 0);
+        assert!(!world
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorldEvent::EnableEnter(_) | WorldEvent::ReconfigureEnter(_))));
+
+        let report = shutdown_thread.join().unwrap();
+        assert!(report.successful());
+        assert!(!report.reopened);
+        assert_eq!(report.cancelled_queued, 2);
+        assert_eq!(*lc.dns.restore_calls.lock().unwrap(), 1);
+    }
+
+    // ---- U07-REV test 13: quit-then-off joins without reopen --------------
+
+    #[test]
+    fn quit_then_off_joins_single_restore_without_reopen() {
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let lc = fixture(&world, EngineMode::Return);
+
+        let quit = lc.shutdown(ShutdownKind::ProcessQuit);
+        assert!(quit.successful());
+        assert!(!quit.reopened);
+
+        let off = lc.shutdown(ShutdownKind::DnsOff);
+        assert_eq!(off, quit);
+        assert_eq!(off.kind, ShutdownKind::ProcessQuit);
+        assert!(!off.reopened);
+        assert_eq!(*lc.dns.restore_calls.lock().unwrap(), 1);
+        assert!(!lc.snapshot().admission_open);
+    }
+
+    // ---- U07-REV test 14: overlapping off-plus-quit -----------------------
+
+    #[test]
+    fn overlapping_off_and_quit_restore_once_without_reopen() {
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let lc = Arc::new(fixture(&world, EngineMode::Return));
+
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let (lc_off, gate_off) = (Arc::clone(&lc), Arc::clone(&gate));
+        let off_thread =
+            std::thread::spawn(move || {
+                gate_off.wait();
+                lc_off.shutdown(ShutdownKind::DnsOff)
+            });
+        let (lc_quit, gate_quit) = (Arc::clone(&lc), Arc::clone(&gate));
+        let quit_thread =
+            std::thread::spawn(move || {
+                gate_quit.wait();
+                lc_quit.shutdown(ShutdownKind::ProcessQuit)
+            });
+        gate.wait();
+        let off = off_thread.join().unwrap();
+        let quit = quit_thread.join().unwrap();
+
+        // One in-flight shutdown for both kinds: a single restore, a single
+        // shared result, and no reopen because a quit participated.
+        assert_eq!(off, quit);
+        assert_eq!(off.kind, ShutdownKind::ProcessQuit);
+        assert!(!off.reopened);
+        assert_eq!(*lc.dns.restore_calls.lock().unwrap(), 1);
+        assert!(!lc.snapshot().admission_open);
+    }
+
+    // ---- U07-REV test 15: panicked enable releases the barrier ------------
+
+    #[test]
+    fn panicked_enable_cannot_hold_restore_barrier() {
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let lc = Arc::new(Lifecycle::new(
+            FakeDns::new(Arc::clone(&world)),
+            FakeEngine::new(Arc::clone(&world), EngineMode::Return),
+            FakeUi {
+                world: Arc::clone(&world),
+                fail: false,
+            },
+            FakePersist {
+                world: Arc::clone(&world),
+                fail: false,
+            },
+            LifecycleConfig {
+                engine_stop_bound: Duration::from_secs(10),
+            },
+        ));
+        *lc.dns.panic_enable.lock().unwrap() = true;
+        let (choice, local) = auto();
+        let ticket = lc.request_enable(choice, local).unwrap();
+
+        let worker = Arc::clone(&lc);
+        let run_thread = std::thread::spawn(move || worker.run_queued());
+        assert_eq!(run_thread.join().unwrap(), RunOutcome::Panicked { id: ticket.id });
+
+        // The panic was caught and the settle barrier released: a later
+        // shutdown restores exactly once instead of hanging on `running`.
+        let report = lc.shutdown(ShutdownKind::DnsOff);
+        assert!(report.successful());
+        assert!(report.reopened);
+        assert_eq!(*lc.dns.restore_calls.lock().unwrap(), 1);
+        let events = world.lock().unwrap().clone();
+        assert!(events.contains(&WorldEvent::EnableEnter(0)));
+        assert!(!events.contains(&WorldEvent::EnableExit));
+    }
+
+    // ---- U07-REV test 16: change admitted as reconfigure ------------------
+
+    #[test]
+    fn change_admitted_as_reconfigure_distinct_from_enable() {
+        let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+        let lc = fixture(&world, EngineMode::Return);
+        let (choice, local) = auto();
+
+        let ticket = lc
+            .request_change(choice, local)
+            .expect("change admitted on the fresh epoch");
+        assert_eq!(
+            lc.run_queued(),
+            RunOutcome::Finished {
+                id: ticket.id,
+                outcome: DnsOutcome::Verified,
+            }
+        );
+        assert_eq!(*lc.dns.reconfigure_calls.lock().unwrap(), 1);
+        assert_eq!(*lc.dns.enable_calls.lock().unwrap(), 0);
+        assert!(world
+            .lock()
+            .unwrap()
+            .contains(&WorldEvent::ReconfigureEnter(ticket.epoch)));
+        assert!(!world
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorldEvent::EnableEnter(_))));
+
+        // After a quit the change path is refused like the enable path.
+        let quit = lc.shutdown(ShutdownKind::ProcessQuit);
+        assert!(!quit.reopened);
+        assert!(lc.request_change(choice, local).is_err());
+    }
+
+    // ---- U07-REV test 17: status reports pending/conflict -----------------
+
+    #[test]
+    fn status_read_reports_pending_and_conflict_health() {
+        for outcome in [
+            DnsOutcome::Verified,
+            DnsOutcome::Pending("adapter gone".into()),
+            DnsOutcome::Conflict("foreign admin edit".into()),
+        ] {
+            let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
+            let lc = Lifecycle::new(
+                FakeDns::new(Arc::clone(&world)),
+                FakeEngine::new(Arc::clone(&world), EngineMode::Return),
+                FakeUi {
+                    world: Arc::clone(&world),
+                    fail: false,
+                },
+                FakePersist {
+                    world: Arc::clone(&world),
+                    fail: false,
+                },
+                LifecycleConfig {
+                    engine_stop_bound: Duration::from_secs(10),
+                },
+            );
+            *lc.dns.status_outcome.lock().unwrap() = outcome.clone();
+            // The admission snapshot stays open on a fresh fixture while the
+            // DNS health read reports whatever the seam reports.
+            assert!(lc.snapshot().admission_open);
+            assert_eq!(lc.status(), outcome);
+        }
     }
 }
