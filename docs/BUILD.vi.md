@@ -15,8 +15,11 @@ cho toolchain MSVC, hoặc `windres` từ
 
 ```powershell
 ./build.ps1                      # build và chép ứng dụng ra dist\yeager.exe
+                                 # VÀ service khôi phục DNS ra
+                                 # dist\yeager-dns-recovery.exe (U09: cả hai đều phát hành)
 
 cargo build --release            # target\release\yeager.exe
+cargo build --release -p dns-recovery  # target\release\yeager-dns-recovery.exe
 cargo build --release -p levi    # target\release\levi.exe, engine bản dòng lệnh
 cargo test --workspace --exclude levi
 ```
@@ -96,10 +99,33 @@ tiên của `master` trên GitLab. Nó dùng remote `gl` (GitLab) và `origin`
    hành trên GitHub, đăng cùng bản phát hành đó lên GitHub.
 
 Mỗi bản phát hành có cùng bộ file ở cả hai nơi: `Yeager-Setup-<phiên bản>.exe`,
-`Yeager-<phiên bản>-portable-x64.zip`, file `yeager.exe` riêng mà trình cập nhật
-trong ứng dụng tải về, `SHA256SUMS.txt`, các báo cáo `*-signature.json`,
+`Yeager-<phiên bản>-portable-x64.zip` (bên trong có sẵn
+`yeager-dns-recovery.exe` đã ký — bản portable dựng service thường trực qua
+bootstrap elevated, Q2 đã chốt), file `yeager.exe` riêng mà trình cập nhật
+trong ứng dụng tải về, file service `yeager-dns-recovery.exe` riêng,
+`SHA256SUMS.txt` (hash cho bộ cài, bản portable, GUI và helper),
+các báo cáo `*-signature.json` (mỗi binary đã ký gồm helper và bộ cài),
 `Yeager-codesign.cer`, `LICENSE` và `THIRD-PARTY-NOTICES.md`. Trên GitHub còn
 có thêm báo cáo VirusTotal (`virustotal-v<phiên bản>.json`) được đính kèm sau.
+
+Helper và bộ cài được kiểm tra theo đúng chính sách hash + chữ ký ghim như
+binary của ứng dụng, và bản mirror GitHub kiểm tra helper trong portable phải
+giống từng byte với helper phát hành riêng.
+
+## Bằng chứng service DNS (U09) và cập nhật đổi service
+
+U09 phát hành service khôi phục DNS. Các gate giả lập chạy trong
+`cargo test --workspace` (không bao giờ đụng NIC thật). Chu trình thật duy
+nhất của chính service (install → Hello/inspection → maintenance
+enter/leave → upgrade-replace → clean uninstall, journal rỗng, không takeover
+DNS) được ghi ở `C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`.
+
+**Cập nhật đổi service:** nếu Yeager đang cài chưa có recovery service (hoặc
+ghi chú phát hành nêu đổi service/protocol/schema), hãy cập nhật bằng bộ cài
+đã ký, đừng dùng nút cập nhật single-exe trong ứng dụng. Trình cập nhật kiểm
+tra tương thích service TRƯỚC khi thay file và sẽ từ chối bản đổi service,
+chỉ bạn sang bộ cài; bản GUI-only tương thích vẫn phải restore/verify trước
+restart, cleanup lỗi thì hủy restart. Chi tiết ở `docs/DNS-RECOVERY.md`.
 
 ## Đăng trên GitLab
 

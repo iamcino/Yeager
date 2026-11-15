@@ -14,8 +14,11 @@ compiler for the embedded icon and administrator manifest: the Windows SDK
 
 ```powershell
 ./build.ps1                      # builds and copies the app to dist\yeager.exe
+                                 # AND the DNS recovery service to
+                                 # dist\yeager-dns-recovery.exe (U09: both ship)
 
 cargo build --release            # target\release\yeager.exe
+cargo build --release -p dns-recovery  # target\release\yeager-dns-recovery.exe
 cargo build --release -p levi    # target\release\levi.exe, the command-line engine
 cargo test --workspace --exclude levi
 ```
@@ -96,10 +99,44 @@ pass `-GitLab` / `-GitHub` for other names.
    workflow, which publishes the same release on GitHub.
 
 Every release ships the same set of files on both sites: `Yeager-Setup-<version>.exe`,
-`Yeager-<version>-portable-x64.zip`, the bare `yeager.exe` the in-app updater
-downloads, `SHA256SUMS.txt`, the `*-signature.json` reports,
-`Yeager-codesign.cer`, `LICENSE` and `THIRD-PARTY-NOTICES.md`. On GitHub a
+`Yeager-<version>-portable-x64.zip` (which carries the signed
+`yeager-dns-recovery.exe` inside — the portable provisions the persistent
+service via its elevated bootstrap, Q2 ruled), the bare `yeager.exe` the in-app updater
+downloads, the bare `yeager-dns-recovery.exe` service binary, `SHA256SUMS.txt`
+(hashes for the installer, the portable, the GUI and the helper),
+the `*-signature.json` reports (one per signed binary including the helper
+and the installer), `Yeager-codesign.cer`, `LICENSE` and `THIRD-PARTY-NOTICES.md`. On GitHub a
 VirusTotal report (`virustotal-v<version>.json`) is added afterwards.
+
+The helper and the installer are verified under the same hash +
+pinned-signature trust policy as the app binaries: the release scripts sign
+every binary (`tools/signing/sign.ps1`) and record its hash
+(`*-signature.json` via `tools/signing/verify.ps1 -JsonPath`), and the GitHub
+mirror checks every file against `SHA256SUMS.txt`, the pinned signature, and
+the byte-identical helper/portable contents (the portable's helper must hash
+exactly like the standalone helper artifact).
+
+## DNS service evidence (U09) and service-changing migration
+
+U09 ships the DNS recovery service (`crates/dns-recovery`, installer
+`[Code]` sequence, updater gate). The fake-backed gates
+(`dns-recovery/src/provision.rs` installer/uninstall/portable planner plus
+schema/compat checks, `crates/app/src/updater.rs` service gate) run in the
+normal `cargo test --workspace` suite — `cargo test` never mutates real NICs.
+The one controlled real cycle of the product's OWN service (install →
+Hello/inspection → maintenance enter/leave → upgrade-replace → clean
+uninstall, with an empty journal and no DNS takeover) is recorded in
+`C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`. Real NIC mutation, destructive
+faults and power-loss simulation are U10's disposable-VM gate.
+
+**Service-changing updates:** if the installed Yeager predates the recovery
+service (or the release notes name a service/protocol/schema change), update
+with the signed installer, not the in-app single-exe update. The single-exe
+updater checks service compatibility BEFORE installing a replacement and
+refuses service-changing replacements, directing you to the installer; a
+compatible GUI-only update still restores/verifies before restart, and a
+failed cleanup cancels the restart. See `docs/DNS-RECOVERY.md` for the full
+operator reference.
 
 ## Publishing on GitLab
 

@@ -101,16 +101,33 @@ foreach ($line in Get-Content $sumsFile) {
     Write-Host "  $name OK"
 }
 $exe = Join-Path $out 'yeager.exe'
+$helper = Join-Path $out 'yeager-dns-recovery.exe'
 $setup = Get-ChildItem $out -Filter 'Yeager-Setup-*.exe' | Select-Object -First 1
 $zip = Get-ChildItem $out -Filter 'Yeager-*-portable-x64.zip' | Select-Object -First 1
-if (-not (Test-Path $exe) -or -not $setup -or -not $zip) { throw 'yeager.exe, the installer or the portable zip is missing' }
+if (-not (Test-Path $exe) -or -not (Test-Path $helper) -or -not $setup -or -not $zip) { throw 'yeager.exe, yeager-dns-recovery.exe, the installer or the portable zip is missing' }
 & $verify -Path $exe -ExpectedThumbprint $thumb -ProjectName Yeager
+# U09: the helper shares the app's pinned-signature trust policy.
+& $verify -Path $helper -ExpectedThumbprint $thumb -ProjectName Yeager
 & $verify -Path $setup.FullName -ExpectedThumbprint $thumb -ProjectName Yeager
 $check = Join-Path $repo "target\release-github\$Tag-zip"
 Remove-Item -Recurse -Force $check -ErrorAction SilentlyContinue
 Expand-Archive $zip.FullName $check -Force
 foreach ($inner in Get-ChildItem $check -Recurse -Filter *.exe) {
     & $verify -Path $inner.FullName -ExpectedThumbprint $thumb -ProjectName Yeager
+}
+# U09: the portable's helper must be byte-identical to the standalone helper.
+$innerHelper = Get-ChildItem $check -Recurse -Filter 'yeager-dns-recovery.exe' | Select-Object -First 1
+if (-not $innerHelper) { throw 'the portable zip does not carry yeager-dns-recovery.exe' }
+$outerHash = (Get-FileHash $helper -Algorithm SHA256).Hash.ToLower()
+$innerHash = (Get-FileHash $innerHelper.FullName -Algorithm SHA256).Hash.ToLower()
+if ($outerHash -ne $innerHash) { throw 'portable helper is not byte-identical to the standalone helper' }
+Write-Host "  portable helper byte-identical OK"
+$innerGui = Get-ChildItem $check -Recurse -Filter 'yeager.exe' | Select-Object -First 1
+if ($innerGui) {
+    $outerGuiHash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+    $innerGuiHash = (Get-FileHash $innerGui.FullName -Algorithm SHA256).Hash.ToLower()
+    if ($outerGuiHash -ne $innerGuiHash) { throw 'portable yeager.exe is not byte-identical to the standalone yeager.exe' }
+    Write-Host "  portable yeager.exe byte-identical OK"
 }
 Remove-Item -Recurse -Force $check
 

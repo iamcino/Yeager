@@ -1,6 +1,18 @@
 //! Updates `yeager.exe` in place from the project's releases, the way EasyKey
 //! does.
 //!
+//! U09 service gate (SPEC-DNS-FIX.md §10 item 4): service capability and
+//! compatibility are checked BEFORE installing a replacement, not merely
+//! before spawning. A compatible GUI-only update may retain the service but
+//! must restore/verify before replacement/restart; a service-changing update
+//! routes to the signed installer and its maintenance sequence — the
+//! single-exe updater never leaves an incompatible service or schema behind.
+//! Protocol/schema compatibility is checked before updates and downgrades;
+//! an unknown newer journal blocks the older service. Download/install
+//! failure leaves the current active DNS untouched; a failed cleanup cancels
+//! the restart. The helper and the installer are verified under the same
+//! hash + pinned-signature trust policy as the app binaries.
+//!
 //! Every release is published on GitHub and on GitLab. Both are asked at once;
 //! the newest version either of them has wins, and if one site cannot be
 //! reached (blocked, down, or the repository unavailable) the other one is
@@ -229,6 +241,12 @@ fn download(source: Source, version: &str) -> std::result::Result<Vec<u8>, Failu
 /// Downloads `version`, checks it and puts it in place of the running exe,
 /// from the site the check found it on, or the other one if that fails.
 /// Returns the path to start. Blocking; run it off the UI thread.
+///
+/// U09 gate: the caller MUST run [`gate_update`] first (service capability
+/// and compatibility BEFORE the replacement is installed, not merely before
+/// spawning). This function itself performs no service mutation: a download
+/// or install failure returns before any replacement step, leaving the
+/// current active DNS untouched.
 pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failure> {
     let mut failure = None;
     let mut exe = None;
@@ -287,6 +305,88 @@ pub fn restart(path: &Path, connect: bool) {
         cmd.current_dir(dir);
     }
     let _ = cmd.spawn();
+}
+
+// ---- U09 update / service compatibility gate ----------------------------------
+//
+// Pure policy over explicit inputs (fake-backed in tests). Production feeds
+// the running service's Hello/inspect via the `ServiceProbe` below; the
+// decision itself never touches the network, the SCM or the journal.
+
+pub use dns_recovery::provision::{
+    check_update_compat, JournalStatus, ServiceInfo, ServiceState, UpdateDecision,
+    UpdateManifest,
+};
+
+/// Failed cleanup cancels the restart (spec §10 item 4): the replacement may
+/// restart only after a verified restore. Delegates to the provision seam so
+/// the updater, the installer and the tests share one gate.
+pub fn may_restart_after_cleanup(cleanup_verified: bool) -> bool {
+    dns_recovery::provision::may_restart_after_cleanup(cleanup_verified)
+}
+
+/// What the update release at `version` requires. For the current release
+/// line the service binary is unchanged (GUI-only); a future service-changing
+/// release sets `requires_service_binary` and/or bumps the required
+/// protocol/journal, which routes the single-exe updater to the installer.
+pub fn manifest_for_version(version: (u32, u32, u32), requires_service_binary: bool) -> UpdateManifest {
+    UpdateManifest {
+        version,
+        required_protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+        required_journal: dns_recovery::journal::JOURNAL_VERSION,
+        requires_service_binary,
+    }
+}
+
+/// Minimal service probe for the update gate: the production implementation
+/// consults the running service (Hello/inspect) and the journal version; the
+/// tests script it. `None` means no service information could be obtained
+/// (absent service) — the gate refuses the GUI-only path.
+pub trait ServiceProbe {
+    fn service_info(&self) -> Option<ServiceInfo>;
+    fn journal_version(&self) -> Option<u32>;
+}
+
+/// Check service capability and compatibility BEFORE installing a
+/// replacement. Returns the routing decision; the caller installs a
+/// replacement only on `GuiOnlyProceed`, routes to the signed installer on
+/// `RouteToInstaller`, and refuses (leaving DNS untouched) otherwise.
+pub fn gate_update<P: ServiceProbe>(
+    probe: &P,
+    current_app: (u32, u32, u32),
+    update: &UpdateManifest,
+) -> UpdateDecision {
+    check_update_compat(
+        probe.service_info().as_ref(),
+        probe.journal_version(),
+        current_app,
+        update,
+    )
+}
+
+/// Gated download-and-install: the service gate runs BEFORE any download or
+/// file mutation. A refused or installer-routed update returns a `Failure`
+/// without touching the running exe, the service or the journal — the
+/// current active DNS is untouched. A compatible GUI-only update still
+/// requires the epilogue's restore/verify before restart (see `main.rs`:
+/// the restart runs only when the coordinator shutdown verifies).
+pub fn download_and_install_gated<P: ServiceProbe>(
+    probe: &P,
+    current_app: (u32, u32, u32),
+    version: &str,
+    requires_service_binary: bool,
+) -> std::result::Result<PathBuf, Failure> {
+    let target = parse_version(version).ok_or_else(|| Failure::Download(Error::new("invalid update version")))?;
+    let manifest = manifest_for_version(target, requires_service_binary);
+    match gate_update(probe, current_app, &manifest) {
+        UpdateDecision::GuiOnlyProceed { .. } => download_and_install(version),
+        UpdateDecision::RouteToInstaller { reason } => Err(Failure::Install(Error::new(format!(
+            "service-changing update; use the signed installer ({reason})"
+        )))),
+        UpdateDecision::Refused { reason, .. } => Err(Failure::Install(Error::new(format!(
+            "update refused; DNS untouched ({reason})"
+        )))),
+    }
 }
 
 /// On start: remove the exe an update left behind. After an update the old
@@ -581,5 +681,112 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(OLD_EXE)).unwrap(), b"old");
         assert!(!dir.join(NEW_EXE).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- U09 service-compatibility gate ---------------------------------------
+
+    struct FakeProbe {
+        service: Option<ServiceInfo>,
+        journal: Option<u32>,
+    }
+
+    impl ServiceProbe for FakeProbe {
+        fn service_info(&self) -> Option<ServiceInfo> {
+            self.service.clone()
+        }
+        fn journal_version(&self) -> Option<u32> {
+            self.journal
+        }
+    }
+
+    fn running_service() -> ServiceInfo {
+        ServiceInfo {
+            protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+            journal_version: dns_recovery::journal::JOURNAL_VERSION,
+            service_version: (1, 1, 6),
+            state: ServiceState::Running,
+            journal: JournalStatus::Clean,
+        }
+    }
+
+    #[test]
+    fn gui_only_update_proceeds_with_verify_before_restart() {
+        let probe = FakeProbe {
+            service: Some(running_service()),
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+        };
+        match gate_update(
+            &probe,
+            (1, 1, 6),
+            &manifest_for_version((1, 1, 7), false),
+        ) {
+            UpdateDecision::GuiOnlyProceed {
+                verify_before_restart,
+            } => assert!(verify_before_restart),
+            other => panic!("GUI-only update must proceed with verify: {other:?}"),
+        }
+        assert!(may_restart_after_cleanup(true));
+        assert!(!may_restart_after_cleanup(false));
+    }
+
+    #[test]
+    fn service_changing_update_routes_to_installer_before_any_replacement() {
+        let probe = FakeProbe {
+            service: Some(running_service()),
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+        };
+        // The gate refuses the single-exe path BEFORE any download/replacement.
+        match gate_update(
+            &probe,
+            (1, 1, 6),
+            &manifest_for_version((1, 2, 0), true),
+        ) {
+            UpdateDecision::RouteToInstaller { .. } => {}
+            other => panic!("service-changing update must route to installer: {other:?}"),
+        }
+        // The gated installer refuses without touching the exe: an invalid
+        // version never reaches the download step.
+        assert!(download_and_install_gated(&probe, (1, 1, 6), "not-a-version", false).is_err());
+    }
+
+    #[test]
+    fn unknown_schema_downgrade_refuses() {
+        let probe = FakeProbe {
+            service: None,
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION + 1),
+        };
+        assert!(matches!(
+            gate_update(&probe, (1, 1, 6), &manifest_for_version((1, 1, 6), false)),
+            UpdateDecision::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn absent_service_refuses_gui_only_update() {
+        let probe = FakeProbe {
+            service: None,
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+        };
+        assert!(matches!(
+            gate_update(&probe, (1, 1, 6), &manifest_for_version((1, 1, 7), false)),
+            UpdateDecision::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn helper_and_installer_share_app_trust_policy() {
+        // Same hash + pinned-signature policy as the app binaries: the Rust
+        // seam is provision::verify_artifact (the release pipeline enforces
+        // it via verify.ps1 for every artifact — see docs/BUILD.md).
+        use dns_recovery::provision::{verify_artifact, ArtifactCheck};
+        let pass = |sha: bool, sig: bool| {
+            verify_artifact(&ArtifactCheck {
+                sha256_matches: sha,
+                signature_pinned_valid: sig,
+            })
+        };
+        assert!(pass(true, true));
+        assert!(!pass(true, false));
+        assert!(!pass(false, true));
     }
 }

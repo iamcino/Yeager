@@ -12,6 +12,8 @@
 //!   LocalSystem automatic service with 1 s/5 s/30 s failure actions +
 //!   preshutdown, start it and validate Hello over the pipe.
 //! - `--remove-service`: refuse on recovery debt; otherwise stop and delete.
+//! - `--enter-maintenance` / `--leave-maintenance` (U09 installer seams):
+//!   enter/leave service maintenance over the protected pipe (admin only).
 //!
 //! Exit codes (§8.3): 0 verified clean/success; 10 live-owner/busy;
 //! 11 pending/unavailable; 12 conflict; 13 privilege/service/auth;
@@ -336,10 +338,113 @@ mod win {
         }));
         std::process::exit(0);
     }
+
+    /// U09 installer seam: enter service maintenance over the protected pipe
+    /// (admin only). Mirrors the installer's preflight step
+    /// (`provision::InstallStep::EnterMaintenanceOrOfflineRecover`): new
+    /// takeover is rejected while maintenance holds, and the call is audited
+    /// with the caller's reason. Quiesces any live owner lease first so the
+    /// upgrade preflight never races an active takeover.
+    pub fn cmd_enter_maintenance() -> ! {
+        if !service_os::is_elevated() {
+            fail("enter-maintenance", 13, "enter-maintenance requires elevation".into());
+        }
+        let outcome = (|| -> Result<(String, u64), String> {
+            let mut last = "no attempt".to_string();
+            for _ in 0..3 {
+                let pid = service_os::scm_service_pid()?.ok_or("service has no PID")?;
+                let req = Request::new(
+                    dns_recovery::journal::new_uuid(),
+                    Operation::EnterMaintenance,
+                    None,
+                    None,
+                    serde_json::json!({"reason": "u09-own-service-cycle", "quiesce_owner": true}),
+                );
+                let frame = protocol::encode_frame(&req).map_err(|e| e.to_string())?;
+                match service_os::pipe_roundtrip(&frame, Some(pid)).and_then(|raw| {
+                    protocol::decode_reply(&raw).map_err(|e| e.to_string())
+                }) {
+                    Ok(reply) if reply.request_id == req.request_id => {
+                        return Ok((reply.outcome, reply.generation));
+                    }
+                    Ok(_) => last = "reply ID mismatch".into(),
+                    Err(e) => last = e,
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(last)
+        })();
+        match outcome {
+            Ok((o, generation)) if o == "success" => {
+                out(&serde_json::json!({
+                    "mode": "enter-maintenance",
+                    "outcome": "success",
+                    "exit": 0,
+                    "generation": generation,
+                }));
+                std::process::exit(0);
+            }
+            Ok((o, generation)) => {
+                let exit = protocol::exit_code_for_outcome(&o);
+                fail("enter-maintenance", exit, format!("maintenance refused: {o} (generation {generation})"));
+            }
+            Err(e) => fail("enter-maintenance", 13, format!("maintenance call failed: {e}")),
+        }
+    }
+
+    /// U09 installer seam: leave service maintenance over the protected pipe
+    /// (admin only). The installer calls this after a validated upgrade;
+    /// the postinstall GUI launches only after the service is ready again.
+    pub fn cmd_leave_maintenance() -> ! {
+        if !service_os::is_elevated() {
+            fail("leave-maintenance", 13, "leave-maintenance requires elevation".into());
+        }
+        let outcome = (|| -> Result<(String, u64), String> {
+            let mut last = "no attempt".to_string();
+            for _ in 0..3 {
+                let pid = service_os::scm_service_pid()?.ok_or("service has no PID")?;
+                let req = Request::new(
+                    dns_recovery::journal::new_uuid(),
+                    Operation::LeaveMaintenance,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                let frame = protocol::encode_frame(&req).map_err(|e| e.to_string())?;
+                match service_os::pipe_roundtrip(&frame, Some(pid)).and_then(|raw| {
+                    protocol::decode_reply(&raw).map_err(|e| e.to_string())
+                }) {
+                    Ok(reply) if reply.request_id == req.request_id => {
+                        return Ok((reply.outcome, reply.generation));
+                    }
+                    Ok(_) => last = "reply ID mismatch".into(),
+                    Err(e) => last = e,
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(last)
+        })();
+        match outcome {
+            Ok((o, generation)) if o == "success" => {
+                out(&serde_json::json!({
+                    "mode": "leave-maintenance",
+                    "outcome": "success",
+                    "exit": 0,
+                    "generation": generation,
+                }));
+                std::process::exit(0);
+            }
+            Ok((o, generation)) => {
+                let exit = protocol::exit_code_for_outcome(&o);
+                fail("leave-maintenance", exit, format!("leave-maintenance refused: {o} (generation {generation})"));
+            }
+            Err(e) => fail("leave-maintenance", 13, format!("leave-maintenance call failed: {e}")),
+        }
+    }
 }
 
 fn usage() -> ! {
-    eprintln!("usage: yeager-dns-recovery --service|--inspect|--recover-offline|--install-service|--remove-service");
+    eprintln!("usage: yeager-dns-recovery --service|--inspect|--recover-offline|--install-service|--remove-service|--enter-maintenance|--leave-maintenance");
     std::process::exit(2);
 }
 
@@ -355,6 +460,8 @@ fn main() -> ExitCode {
         "--recover-offline" => win::cmd_recover_offline(),
         "--install-service" => win::cmd_install_service(),
         "--remove-service" => win::cmd_remove_service(),
+        "--enter-maintenance" => win::cmd_enter_maintenance(),
+        "--leave-maintenance" => win::cmd_leave_maintenance(),
         _ => usage(),
     }
     #[cfg(not(windows))]

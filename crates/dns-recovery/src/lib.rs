@@ -95,6 +95,7 @@ pub mod lock;
 pub mod model;
 pub mod plan;
 pub mod protocol;
+pub mod provision;
 pub mod replay;
 pub mod security;
 pub mod service;

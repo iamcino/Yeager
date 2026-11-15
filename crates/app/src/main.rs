@@ -60,6 +60,104 @@ fn spawn<T: Send + 'static>(
     });
 }
 
+/// U09 production service probe for the update gate (§10 item 4): service
+/// capability and compatibility are checked BEFORE installing a replacement.
+/// Best-effort mapping over the pipe `status`: an unreachable service reads
+/// as absent (`None`); an integrity failure escalates to an unknown-newer
+/// journal so the gate refuses. The installed service version is not
+/// reported by Hello/status, so a reachable service is assumed to match this
+/// binary's protocol/journal (same release line); service-changing releases
+/// are detected through the release manifest (`requires_service_binary` /
+/// required protocol/journal), which routes the single-exe updater to the
+/// signed installer.
+struct LiveServiceProbe;
+
+impl updater::ServiceProbe for LiveServiceProbe {
+    fn service_info(&self) -> Option<updater::ServiceInfo> {
+        use hange::DnsService as _;
+        let mut client = hange::PipeClient::new();
+        let rep = client.status();
+        let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
+        match rep.outcome {
+            hange::SvcOutcome::Unavailable => None,
+            hange::SvcOutcome::IntegrityError => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION + 1,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::UnknownVersion(
+                    dns_recovery::journal::JOURNAL_VERSION + 1,
+                ),
+            }),
+            hange::SvcOutcome::Unsupported => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::IntegrityError,
+            }),
+            hange::SvcOutcome::Pending => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Pending,
+            }),
+            hange::SvcOutcome::Conflict => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Conflict,
+            }),
+            hange::SvcOutcome::Busy => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::OwnedActive,
+            }),
+            _ => Some(updater::ServiceInfo {
+                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+                journal_version: dns_recovery::journal::JOURNAL_VERSION,
+                service_version: current,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Clean,
+            }),
+        }
+    }
+
+    fn journal_version(&self) -> Option<u32> {
+        self.service_info().map(|s| s.journal_version)
+    }
+}
+
+/// U09: protected-install detection (Q2 ruled). The installer distribution
+/// runs from `%ProgramFiles%\Yeager`; anything else is the portable
+/// distribution. This is a UI-gating heuristic only — the real protection is
+/// the service ACL plus the invariant that portable cleanup never deletes
+/// the protected binary or ProgramData state
+/// (`dns_recovery::provision::portable_removal_scope`).
+fn is_protected_install() -> bool {
+    std::env::current_exe()
+        .map(|p| {
+            let s = p.to_string_lossy().to_lowercase();
+            s.contains("program files") && s.contains("yeager")
+        })
+        .unwrap_or(false)
+}
+
+/// U09 Q2: absent-service portable takeover refuses. A portable GUI with no
+/// reachable recovery service must not take over (no silent install, no
+/// watchdog from a writable folder) — diagnostic UI only.
+fn portable_takeover_allowed() -> bool {
+    use crate::updater::ServiceProbe as _;
+    if is_protected_install() {
+        return true;
+    }
+    LiveServiceProbe.service_info().is_some()
+}
+
 fn scope_from_index(i: i32) -> Scope {
     match i {
         1 => Scope::HostList,
@@ -202,6 +300,16 @@ fn main() -> Result<(), slint::PlatformError> {
         None => bootstrap::classify_boot(&journal),
     };
     let auto_connect_blocked = decision.blocks_auto_connect();
+    // U09 Q2: absent-service portable takeover refuses. A portable GUI with
+    // no reachable recovery service stays diagnostic-only: no silent
+    // install, no watchdog from a writable folder. The installer
+    // distribution provisions the service; the portable first run provisions
+    // it via the elevated bootstrap into protected Program Files.
+    let portable_blocked = !portable_takeover_allowed();
+    if portable_blocked {
+        eprintln!("portable without an installed recovery service; takeover refused, diagnostic UI only");
+    }
+    let auto_connect_blocked = auto_connect_blocked || portable_blocked;
     let boot_diagnostic = bootstrap::BootDiagnostics {
         decision: decision.clone(),
         recovery: recovery.clone(),
@@ -1052,7 +1160,13 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_busy(true);
             ui.set_log(t!("Đang tải Yeager {version}…", "Downloading Yeager {version}…").into());
             let restart = restart.clone();
-            spawn(w.clone(), move || updater::download_and_install(&version), move |ui, res| {
+            // U09 gate: service capability and compatibility are checked
+            // BEFORE installing a replacement. A service-changing update is
+            // refused here with directions to the signed installer; a
+            // compatible GUI-only update still restores/verifies in the
+            // epilogue before any restart (failed cleanup cancels it).
+            let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
+            spawn(w.clone(), move || updater::download_and_install_gated(&LiveServiceProbe, current, &version, false), move |ui, res| {
                 ui.set_update_busy(false);
                 match res {
                     Ok(path) => {
@@ -1220,8 +1334,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let _ = erwin::restore();
     drop(update_timer);
     let restart = restart.lock().unwrap().take();
+    // U09: failed cleanup cancels the restart through the shared gate
+    // (updater::may_restart_after_cleanup); an unverified restore never
+    // launches the replacement.
     if let Some((path, connect)) = restart
-        && report.successful() {
+        && updater::may_restart_after_cleanup(report.successful()) {
         updater::restart(&path, connect);
     }
     Ok(())

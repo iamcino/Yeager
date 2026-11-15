@@ -991,6 +991,67 @@ fn maintenance_blocks_takeover_and_leaves_cleanly() {
 }
 
 #[test]
+fn maintenance_round_trip_with_committed_transaction_leaves_cleanly() {
+    // U09 installer path (fake-backed, synthetic GUID only): with a
+    // committed transaction, enter blocks takeover and leave returns the
+    // journal to RecoveryPending — the full round-trip the live cycle
+    // cannot perform without touching real NICs.
+    let w = SvcWorld::new();
+    w.static_adapter();
+    let mut host = w.host();
+    let peer = w.peer();
+    let reg = w.register(&mut host, OWNER_ID);
+    let token = w.token_of(&reg);
+
+    // Commit a transaction through the fake OS (Windows-only plan, no
+    // loopback listeners needed).
+    let applied = host.dispatch(
+        &peer,
+        &request(
+            Operation::Apply,
+            Some(OWNER_ID),
+            None,
+            w.apply_body(&token, 0),
+        ),
+    );
+    assert_eq!(applied.outcome, "active", "takeover commits: {applied:?}");
+    assert_eq!(w.journal_state(), Some(JournalState::Owned));
+
+    let enter = host.dispatch(
+        &peer,
+        &request(
+            Operation::EnterMaintenance,
+            None,
+            None,
+            json!({"reason": "u09-installer", "quiesce_owner": true}),
+        ),
+    );
+    assert_eq!(enter.outcome, "success");
+    assert_eq!(w.journal_state(), Some(JournalState::Maintenance));
+
+    // Takeover is refused while maintenance holds: the original lease was
+    // revoked by the audited enter, so even the original token refuses (and
+    // a fresh owner would meet the live recorded owner with `busy`).
+    let denied = host.dispatch(
+        &peer,
+        &request(
+            Operation::Apply,
+            Some(OWNER_ID),
+            None,
+            w.apply_body(&token, 0),
+        ),
+    );
+    assert_eq!(denied.outcome, "refused");
+
+    let leave = host.dispatch(
+        &peer,
+        &request(Operation::LeaveMaintenance, None, None, json!({})),
+    );
+    assert_eq!(leave.outcome, "success");
+    assert_eq!(w.journal_state(), Some(JournalState::RecoveryPending));
+}
+
+#[test]
 fn offline_guard_refuses_anything_but_proven_stopped() {
     assert!(ServiceHost::<Rc<FakeFs>>::offline_precheck(ScmServiceState::Stopped).is_ok());
     assert!(ServiceHost::<Rc<FakeFs>>::offline_precheck(ScmServiceState::Running).is_err());
