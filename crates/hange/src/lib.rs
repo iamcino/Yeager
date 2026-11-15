@@ -32,7 +32,7 @@ pub use plan::{
     LOOPBACK_PORT,
 };
 pub use pool::{Choice, PoolStatus, AUTO_PROVIDERS};
-pub use service::{DnsService, HostClient, InspectSnapshot, LeaseCreds, OwnerSnapshot, PipeClient, Registration, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE, map_outcome};
+pub use service::{DnsService, HostClient, InspectSnapshot, LeaseCreds, OwnerSnapshot, PipeClient, Registration, ServiceVersions, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE, map_outcome};
 pub use stub::ShutdownOutcome;
 pub use system::{adapter_dns, AdapterInfo, DohProperty, FamilyDns, LegacyAdapterInfo, legacy_adapter_info, loopback_port_owners};
 pub use upstream::{Stat, Transport};

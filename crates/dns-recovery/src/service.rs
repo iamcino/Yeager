@@ -480,6 +480,8 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             "success",
             serde_json::json!({
                 "protocol": protocol::PROTOCOL_VERSION,
+                "journal_version": journal::JOURNAL_VERSION,
+                "service_version": env!("CARGO_PKG_VERSION"),
                 "service_instance": self.config.service_instance_id,
                 "pipe": protocol::PIPE_NAME,
             }),
@@ -546,6 +548,9 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
                         "epoch": epoch,
                         "owner": owner,
                         "candidates": rec.candidates.len(),
+                        "protocol": protocol::PROTOCOL_VERSION,
+                        "journal_version": journal::JOURNAL_VERSION,
+                        "service_version": env!("CARGO_PKG_VERSION"),
                     }),
                 )
             }
@@ -1341,9 +1346,57 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
     }
 
     fn op_leave_maintenance(&mut self, _peer: &PeerAuth, req: &Request) -> Reply {
-        // commit_admin runs journal::validate: leaving maintenance on a
-        // journal with no transaction and no clean tombstone is a schema
-        // violation, so a genesis journal honestly refuses here.
+        // Empty-maintenance clear (U09-REV B): entering maintenance on an
+        // absent/empty journal creates a bare genesis marker with no
+        // transaction and no clean tombstone. Leaving it must succeed by
+        // clearing the marker back to absent — no manual `sc delete` +
+        // `rmdir` may be required for the round-trip. This is the specified
+        // clearing step: the seam (`--leave-maintenance`), the installer flow
+        // (`LeaveMaintenance`), and the fake-backed round-trip all exercise
+        // it.
+        let empty_maintenance = match self.open_store().and_then(|s| {
+            s.reconcile()
+                .map_err(|e| crate::store::StoreError::Integrity(e.to_string()))
+        }) {
+            Ok(rec) => match &rec.current {
+                Some(c) => {
+                    c.env.payload.journal_state == JournalState::Maintenance
+                        && c.env.payload.transaction.is_none()
+                        && c.env.payload.last_completed.is_none()
+                }
+                None => true,
+            },
+            Err(_) => false,
+        };
+        if empty_maintenance {
+            // Clear under the machine lock so an empty marker never wedges
+            // the journal: delete every primary/stage/backup candidate.
+            let lock = (self.lock_factory)();
+            match lock.acquire(crate::lock::LOCK_BUDGET) {
+                Err(e) => {
+                    return self.reply(
+                        req,
+                        self.journal_generation(),
+                        "unavailable",
+                        serde_json::json!({"error": format!("leave-maintenance lock failed: {e:?}")}),
+                    )
+                }
+                Ok(_guard) => {
+                    let fs = (self.fs_factory)();
+                    if let Ok(cands) = fs.list_candidates(&self.config.dir) {
+                        for p in cands {
+                            let _ = fs.delete(&p);
+                        }
+                    }
+                    return self.reply(
+                        req,
+                        0,
+                        "success",
+                        serde_json::json!({"maintenance": "left", "cleared_empty": true}),
+                    );
+                }
+            }
+        }
         match self.commit_admin(|env| {
             env.payload.maintenance = None;
             if env.payload.transaction.is_some() {

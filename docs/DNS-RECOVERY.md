@@ -41,25 +41,26 @@ service-changing updates migrate.
 Q2 is RULED (Cino, 2026-11-13): BOTH distributions carry the signed
 recovery helper.
 
-| Distribution | How the service is provisioned |
+| Distribution | How the service is provisioned (shipped behavior) |
 |---|---|
-| Installer (`Yeager-Setup-<version>.exe`) | Provisions the service directly: stages/verifies the signed helper in the protected path, enters service maintenance (or offline-recovers with proven STOPPED), requires CLEAN before replacing the binary, configures the quoted SCM path/ACL/restart actions, starts and validates Hello/inspection. |
-| Portable (`Yeager-<version>-portable-x64.zip`) | Carries the signed helper inside the zip. First run provisions/maintains the persistent service in protected Program Files via the elevated bootstrap. |
+| Installer (`Yeager-Setup-<version>.exe`) | Provisions through the `--install-service` seam after the copy: verifies the NEW helper's pinned signature, handles clean install AND upgrade replace (quoted SCM path, protected binary-dir ACL, 1 s / 5 s / 30 s + non-crash flag + preshutdown, start, Hello), validates `--inspect` of the NEW binary, rolls back exe + registration on failure. Pre-copy: backup, `--inspect` CLEAN gate (helper-exists-even-without-service included), `--enter-maintenance`/`--recover-offline` with proven STOPPED, graceful GUI exit, `sc stop` + STOPPED poll. |
+| Portable (`Yeager-<version>-portable-x64.zip`) | Carries the signed helper inside the zip. `main` runs the Q2 bootstrap on portable first run: service absent + elevated + helper present → `plan_portable` allows `ProvisionViaElevatedBootstrap` → spawns the carried helper's `--install-service` (copies into protected Program Files, ACLs, registers, Hello-validates). Unelevated or bad-signature refuses; no silent install, no watchdog from a writable folder. |
 
-Rules that always hold:
+Rules that always hold (enforced by the shipped code, not only the planner):
 
 - Moving or deleting the portable GUI can never remove the protected
   recovery executable (`%ProgramFiles%\Yeager\yeager-dns-recovery.exe`) or
-  the ProgramData state. Portable cleanup deletes only the portable folder's
-  own files (`dns_recovery::provision::portable_removal_scope`).
-- Absent-service portable takeover refuses: with no installed recovery
-  service the portable GUI stays diagnostic-only. No silent persistent
-  software is installed from a portable run except through the elevated
-  bootstrap, and no watchdog runs from a writable folder.
-- The installer never force-kills the GUI blindly: graceful shutdown first,
-  up to 30 s wait, and a monitored force kill only with a confirmed
-  independent monitor (the service watchdog), followed by waiting for the
-  restore.
+  the ProgramData state. `portable_removal_scope` names the invariant and
+  `portable_path_is_protected_deletion_target` enforces it in the cleanup
+  path: protected and ProgramData locations are never deletion targets.
+- Absent-service portable takeover refuses: `portable_takeover_allowed`
+  requires proven Running + Clean from the live pipe probe. Pending,
+  conflict and busy pipe outcomes are not healthy; a path-string match is
+  not a service check. Both distributions require the same proof.
+- The installer never force-kills the GUI blindly: already-gone GUI returns
+  immediately (tasklist output, not exit 0), graceful first, up to 30 s
+  wait, monitored force kill only with proven RUNNING service (not `sc
+  query` exit 0), force-kill exit checked, restore polled via `--inspect`.
 
 ## Conflicts and recovery debt
 
@@ -97,54 +98,78 @@ original restoration.
 
 ## Install, upgrade and uninstall behavior
 
-Install/upgrade (`installer/setup.iss` `[Code]`, mirroring
-`dns_recovery::provision::plan_install`):
+Install/upgrade (`installer/setup.iss` `[Code]` calls the helper seams;
+the planner `dns_recovery::provision::plan_install` is the fake-backed
+policy the `[Code]` mirrors step-for-step):
 
-1. Stage/verify the signed helper in the protected path.
-2. First service introduction closes the legacy GUI gracefully (Q3 legacy
-   policy: detection/reporting only).
-3. Enter service maintenance (or offline-recover with proven STOPPED),
-   reject new takeover, notify the GUI, request coordinator exit, wait up to
-   30 s. Force kill only with a confirmed independent monitor, then wait for
-   the restore.
-4. Require CLEAN before replacing/removing the service binary. Pending
-   adapters, conflicts and API failures abort the preflight and preserve the
-   old helper and the journal. No cleanup error is hidden through installer
-   flags.
-5. Stop the service only after the clean/maintenance acknowledgement,
-   replace the protected binaries, configure the quoted SCM path, ACL and
-   restart actions (1 s / 5 s / 30 s plus preshutdown), start and validate
-   Hello/inspection. Failure rolls back the executable and the registration
-   and restarts the previous compatible service. The journal survives every
-   branch.
-6. Leave maintenance; the postinstall GUI launches only after ready. A
-   failed service installation/start fails the install — no takeover race.
+1. Before any copy: back up the previous helper executable + SCM registration;
+   run `--inspect` whenever the helper file exists (including the
+   helper-exists-but-service-absent path) and abort on any non-clean exit —
+   Maintenance (live exit 11 pending) blocks like any other debt, preserving
+   the old helper and the journal.
+2. On upgrade paths: `--enter-maintenance` when RUNNING (rejecting new
+   takeover) or `--recover-offline` when STOPPED (proven STOPPED; any other
+   SCM state aborts); then graceful GUI exit (already-gone GUI returns
+   immediately, no 30 s wait), `sc stop` with abort on failure and a
+   STOPPED poll before proceeding.
+3. Inno copies the new binaries (no raise on a missing helper at `ssInstall`
+   — the old raise aborted every clean install before registration).
+4. After the copy (`ssPostInstall`): verify the NEW helper's Authenticode
+   thumbprint against the pinned certificate, then register through the
+   `--install-service` seam — which handles clean install AND upgrade replace
+   (quoted SCM path, protected binary-dir ACL, 1 s / 5 s / 30 s restarts,
+   non-crash failure flag, preshutdown, start, Hello). Validate Hello +
+   `--inspect` of the NEW binary in place; on start/Hello failure restore
+   both the executable and the registration and restart the previous
+   service. The journal survives every branch.
+5. `--leave-maintenance` when entered (empty-marker clears back to absent
+   with no manual `sc delete` + `rmdir`); the postinstall GUI launches only
+   when `ServiceReadyCheck` proves RUNNING + `--inspect` clean. A failed
+   service installation/start fails the install — no takeover race. No
+   cleanup error is hidden through installer flags.
 
-Uninstall (clean-only, mirroring `plan_uninstall`):
+Uninstall (clean-only; `[Code]` drives result-checked seams):
 
-1. Maintenance → graceful GUI shutdown → optional monitored force kill →
-   exact restore/verify → separate TCP/logon cleanup → require clean →
-   stop/remove service → delete binaries/preferences.
+1. `--enter-maintenance` first when RUNNING → graceful GUI shutdown
+   (proven-RUNNING monitor required for any force kill; force-kill exit
+   checked; restore polled via `--inspect`, not a fixed 2 s sleep) →
+   exact restore/verify (`--cleanup` when the GUI exists, else
+   `--inspect` through the helper — never skipped when `yeager.exe` is
+   absent) → separate TCP/logon cleanup → `--remove-service` (refuses debt)
+   → delete binaries/preferences.
 2. Pending recovery aborts BEFORE deletion, retaining the service, the
-   binaries and the ProgramData state. Silent mode returns the §8.3 nonzero
-   exit (11 pending/unavailable, 12 conflict, 14 integrity/unknown version).
+   binaries and the ProgramData state. Silent mode (`/SILENT`/`/VERYSILENT`)
+   returns the measured §8.3 nonzero exit (11 pending/unavailable, 12
+   conflict, 14 integrity/unknown version). A helper-missing path with an
+   SCM entry still aborts (unverifiable cleanup) instead of running
+   `sc stop`/`sc delete` with ignored exits and deleting.
 3. No unconditional taskkill/`--cleanup` chain with ignored failures;
    `ProgramData\Yeager` is never deleted by the uninstaller.
 
 ## Updates and migration
 
-- The single-exe in-app updater checks service capability and compatibility
-  BEFORE installing a replacement (`crates/app/src/updater.rs` gate). A
-  compatible GUI-only update may retain the service but must restore/verify
-  before replacement/restart; a failed cleanup cancels the restart and the
-  current active DNS is untouched by download/install failures.
-- A service-changing update (new service binary, protocol or journal schema)
-  routes to the signed installer and its maintenance sequence — the
-  single-exe updater never leaves an incompatible service or schema behind.
+- The single-exe in-app updater (`crates/app/src/updater.rs` +
+  `LiveServiceProbe` in `crates/app/src/main.rs`) checks service capability
+  and compatibility BEFORE installing a replacement. The probe reads the
+  service's actual protocol/journal/binary versions from the pipe Hello
+  reply (never this binary's constants); an unreachable service reads as
+  absent. The target release's requirements come from its published
+  `manifest.json` sidecar (fail-closed to the installer when unavailable) —
+  never a hardcoded `false` or this binary's own protocol/journal. A
+  compatible GUI-only update restores/verifies BEFORE the exe replacement
+  (`verify_restore`: only Running + Clean proceeds) and again before the
+  restart; a failed cleanup cancels the restart and download/install
+  failures leave the current active DNS untouched (no service/journal/exe
+  mutation on the failure path).
+- A service-changing update (new service binary, protocol or journal schema
+  per the release manifest) routes to the signed installer and its
+  maintenance sequence before any replacement — the single-exe updater never
+  leaves an incompatible service or schema behind.
 - Protocol/schema compatibility is checked before updates AND downgrades;
   an unknown newer journal blocks the older service. The helper and the
   installer are verified under the same hash + pinned-signature trust policy
-  as the app binaries (`SHA256SUMS.txt` plus `verify.ps1`).
+  as the app binaries (`SHA256SUMS.txt` plus `verify.ps1`; the installer
+  `[Code]` pins the same thumbprint after the copy).
 
 **Migration note (existing users):** if your installed Yeager predates the
 recovery service, the next update is service-changing: use the signed

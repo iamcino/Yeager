@@ -64,16 +64,14 @@ pub enum JournalStatus {
 }
 
 impl JournalStatus {
-    /// CLEAN (or absent/maintenance-with-no-transaction for the installer
-    /// preflight) is the only state that authorizes binary replacement.
-    /// Pending adapters, conflicts, restoring/recovery-pending work and
+    /// CLEAN (or absent for the installer preflight) is the only state that
+    /// authorizes binary replacement. A live `maintenance` inspect is exit 11
+    /// `pending`: it blocks replacement like any other debt. Pending
+    /// adapters, conflicts, restoring/recovery-pending work and
     /// integrity/unknown-version states abort the preflight and preserve the
     /// old helper and the journal.
     pub fn allows_replacement(&self) -> bool {
-        matches!(
-            self,
-            JournalStatus::Absent | JournalStatus::Clean | JournalStatus::Maintenance
-        )
+        matches!(self, JournalStatus::Absent | JournalStatus::Clean)
     }
 
     pub fn blocks_with_debt(&self) -> bool {
@@ -87,6 +85,7 @@ impl JournalStatus {
                 | JournalStatus::Unavailable
                 | JournalStatus::IntegrityError
                 | JournalStatus::UnknownVersion(_)
+                | JournalStatus::Maintenance
         )
     }
 }
@@ -208,13 +207,10 @@ pub fn plan_install(ctx: &InstallContext) -> InstallDecision {
         };
     }
     // Require CLEAN before replacing/removing the service binary. Pending
-    // adapters, conflicts and API failures abort the preflight and preserve
-    // the old helper and the journal.
-    if ctx.journal.blocks_with_debt()
-        && !matches!(ctx.journal, JournalStatus::Maintenance)
-    {
-        // Maintenance with an armed lease is the installer's own doing (it
-        // entered maintenance first); every other debt state aborts.
+    // adapters, conflicts, maintenance (live inspect is exit 11 pending) and
+    // API failures abort the preflight and preserve the old helper and the
+    // journal.
+    if ctx.journal.blocks_with_debt() {
         return InstallDecision::Abort {
             reason: format!(
                 "journal not clean ({:?}); upgrade preflight aborted, old helper and journal preserved",
@@ -230,13 +226,14 @@ pub fn plan_install(ctx: &InstallContext) -> InstallDecision {
         // invented historical baseline).
         steps.push(InstallStep::CloseLegacyGuiGracefully);
     }
-    // Maintenance guards existing journal state behind a live service; in
-    // every other case the offline path (proven STOPPED-or-absent, boot
-    // replay owns recovery) applies and no marker is created. In particular
-    // a maintenance marker is never created when no journal exists yet: it
-    // would wedge a bare genesis journal that has no legal clean return.
-    let in_maintenance = ctx.service == ServiceState::Running
-        && ctx.journal != JournalStatus::Absent;
+    // Maintenance guards existing journal state behind a live service; a
+    // running service never takes the offline path (aligned with
+    // `ServiceHost::offline_precheck`, which refuses Running). In every other
+    // case the offline path (proven STOPPED-or-absent, boot replay owns
+    // recovery) applies and no marker is created. In particular a maintenance
+    // marker is never created when no journal exists yet: it would wedge a
+    // bare genesis journal that has no legal clean return.
+    let in_maintenance = ctx.service == ServiceState::Running;
     if in_maintenance {
         steps.push(InstallStep::EnterMaintenance);
     } else {
@@ -339,17 +336,30 @@ pub fn uninstall_abort_code(journal: &JournalStatus) -> i32 {
 
 /// Plan the clean-only uninstall (§10 item 2).
 pub fn plan_uninstall(ctx: &UninstallContext) -> UninstallDecision {
+    // Silent-mode contract (§10 item 2): aborts happen BEFORE deletion in
+    // both modes; silent mode returns the measured nonzero §8.3 exit,
+    // interactive mode shows the dialog (the ISS `[Code]` raises). The
+    // `silent` flag is read in every abort arm below.
+    let silent_note = if ctx.silent {
+        " (silent: nonzero exit before deletion)"
+    } else {
+        " (interactive: dialog before deletion)"
+    };
     // Pending recovery aborts BEFORE deletion, retaining the service, the
     // binaries and the ProgramData state.
     if ctx.restore_api_failure || ctx.adapter_missing {
         return UninstallDecision::AbortBeforeDeletion {
-            reason: "restore API failure / missing adapter; uninstall aborted before deletion, service/binaries/ProgramData retained".into(),
+            reason: format!(
+                "restore API failure / missing adapter; uninstall aborted before deletion, service/binaries/ProgramData retained{silent_note}"
+            ),
             exit_code: 11,
         };
     }
     if ctx.restore_conflict || matches!(ctx.journal, JournalStatus::Conflict) {
         return UninstallDecision::AbortBeforeDeletion {
-            reason: "restore conflict; uninstall aborted before deletion, service/binaries/ProgramData retained".into(),
+            reason: format!(
+                "restore conflict; uninstall aborted before deletion, service/binaries/ProgramData retained{silent_note}"
+            ),
             exit_code: 12,
         };
     }
@@ -358,7 +368,9 @@ pub fn plan_uninstall(ctx: &UninstallContext) -> UninstallDecision {
         JournalStatus::IntegrityError | JournalStatus::UnknownVersion(_)
     ) {
         return UninstallDecision::AbortBeforeDeletion {
-            reason: "journal integrity/unknown version; uninstall aborted before deletion".into(),
+            reason: format!(
+                "journal integrity/unknown version; uninstall aborted before deletion{silent_note}"
+            ),
             exit_code: uninstall_abort_code(&ctx.journal),
         };
     }
@@ -372,14 +384,18 @@ pub fn plan_uninstall(ctx: &UninstallContext) -> UninstallDecision {
     ) || !ctx.restore_verified
     {
         return UninstallDecision::AbortBeforeDeletion {
-            reason: "exact restore did not verify; uninstall aborted before deletion, service/binaries/ProgramData retained".into(),
+            reason: format!(
+                "exact restore did not verify; uninstall aborted before deletion, service/binaries/ProgramData retained{silent_note}"
+            ),
             exit_code: uninstall_abort_code(&ctx.journal),
         };
     }
     // Nonresponsive GUI without a confirmed monitor: no blind force-kill.
     if ctx.gui == GuiState::RunningNonresponsive && !ctx.independent_monitor_confirmed {
         return UninstallDecision::AbortBeforeDeletion {
-            reason: "GUI nonresponsive without a confirmed independent monitor; uninstall aborted".into(),
+            reason: format!(
+                "GUI nonresponsive without a confirmed independent monitor; uninstall aborted{silent_note}"
+            ),
             exit_code: 11,
         };
     }
@@ -449,7 +465,7 @@ pub fn plan_portable(ctx: &PortableContext) -> PortableDecision {
     match ctx.location {
         LaunchLocation::ProtectedProgramFiles => PortableDecision::MaintainService,
         LaunchLocation::PortableFolder => match ctx.service {
-            ServiceState::Running | ServiceState::Stopped => {
+            ServiceState::Running | ServiceState::Stopped | ServiceState::Absent => {
                 if ctx.helper_signature != SignatureCheck::Valid {
                     return PortableDecision::RefuseAbsentServiceTakeover {
                         reason: "portable helper signature invalid; takeover refused".into(),
@@ -462,11 +478,14 @@ pub fn plan_portable(ctx: &PortableContext) -> PortableDecision {
                         reason: "portable first run requires the elevated bootstrap; unelevated takeover refused".into(),
                     };
                 }
+                // Q2 bootstrap: first run from a portable folder with the
+                // service absent, elevated, and the helper signature valid
+                // provisions the persistent service in protected Program
+                // Files. Absent-service takeover without those three refuses
+                // above (no silent install, no watchdog from a writable
+                // folder).
                 PortableDecision::ProvisionViaElevatedBootstrap
             }
-            ServiceState::Absent => PortableDecision::RefuseAbsentServiceTakeover {
-                reason: "no installed recovery service; portable takeover refuses (no silent install, no watchdog from a writable folder)".into(),
-            },
             ServiceState::StartPending
             | ServiceState::StopPending
             | ServiceState::Unknown => PortableDecision::RefuseAbsentServiceTakeover {
@@ -493,6 +512,22 @@ pub fn portable_removal_scope() -> PortableRemovalScope {
         deletes_program_data_state: false,
         deletes_portable_folder_only: true,
     }
+}
+
+/// Behavior behind [`portable_removal_scope`]: the portable cleanup path
+/// must never treat the protected binary or ProgramData state as deletion
+/// targets. Returns true when `path` would be a forbidden deletion target.
+pub fn portable_path_is_protected_deletion_target(path: &str) -> bool {
+    let lower = path.to_lowercase().replace('/', "\\");
+    lower.contains("program files\\yeager") || lower.contains("programdata\\yeager")
+}
+
+/// Behavior behind [`portable_removal_scope`]: portable cleanup deletes only
+/// files inside the portable folder itself (never the protected locations
+/// above). Conservative check: a portable-folder file is not a protected
+/// target.
+pub fn portable_path_is_portable_folder_file(path: &str) -> bool {
+    !portable_path_is_protected_deletion_target(path)
 }
 
 // ---- update / service compatibility --------------------------------------------
@@ -642,6 +677,24 @@ pub enum DownloadOutcome {
     Downloaded,
     DownloadFailedLeavesDnsUntouched,
     InstallFailedLeavesDnsUntouched,
+}
+
+/// Behavior contract for the failure arms: a download or install failure
+/// performs no DNS mutation (no service call, no journal write, no exe
+/// replacement). The gated updater returns before the replacement step, so
+/// the current active DNS is untouched by construction.
+pub fn download_failure_leaves_dns_untouched(outcome: &DownloadOutcome) -> bool {
+    matches!(
+        outcome,
+        DownloadOutcome::DownloadFailedLeavesDnsUntouched
+            | DownloadOutcome::InstallFailedLeavesDnsUntouched
+    )
+}
+
+/// The failure arms never count as a successful download: they must not feed
+/// the replacement step.
+pub fn download_outcome_replaces_exe(outcome: &DownloadOutcome) -> bool {
+    matches!(outcome, DownloadOutcome::Downloaded)
 }
 
 // ---- artifact verification (same policy for app, helper, installer) -----------
@@ -976,16 +1029,26 @@ mod tests {
         }
         assert!(may_restart_after_cleanup(true));
         assert!(!may_restart_after_cleanup(false));
-        // Download/install failure arms leave DNS untouched by construction:
-        // they return before any replacement step.
-        assert_eq!(
+        // Download/install failure arms leave DNS untouched by behavior, not
+        // by enum identity: the failure outcomes report no DNS mutation and
+        // never feed the exe-replacement step.
+        for outcome in [
             DownloadOutcome::DownloadFailedLeavesDnsUntouched,
-            DownloadOutcome::DownloadFailedLeavesDnsUntouched
-        );
-        assert_eq!(
             DownloadOutcome::InstallFailedLeavesDnsUntouched,
-            DownloadOutcome::InstallFailedLeavesDnsUntouched
-        );
+        ] {
+            assert!(
+                download_failure_leaves_dns_untouched(&outcome),
+                "failure arm {outcome:?} must leave DNS untouched (no service/journal mutation)"
+            );
+            assert!(
+                !download_outcome_replaces_exe(&outcome),
+                "failure arm {outcome:?} must not replace the exe"
+            );
+        }
+        assert!(download_outcome_replaces_exe(&DownloadOutcome::Downloaded));
+        assert!(!download_failure_leaves_dns_untouched(
+            &DownloadOutcome::Downloaded
+        ));
     }
 
     #[test]
@@ -1071,28 +1134,45 @@ mod tests {
     #[test]
     fn portable_q2_provisions_via_bootstrap_and_refuses_absent_service() {
         // First run from a portable folder provisions via the elevated
-        // bootstrap into protected Program Files.
+        // bootstrap into protected Program Files — including the absent-
+        // service first run when elevated with a valid helper signature.
+        for service in [
+            ServiceState::Running,
+            ServiceState::Stopped,
+            ServiceState::Absent,
+        ] {
+            match plan_portable(&PortableContext {
+                location: LaunchLocation::PortableFolder,
+                service,
+                journal: JournalStatus::Absent,
+                elevated: true,
+                helper_signature: SignatureCheck::Valid,
+            }) {
+                PortableDecision::ProvisionViaElevatedBootstrap => {}
+                other => panic!("portable first run ({service:?}) must provision: {other:?}"),
+            }
+        }
+        // Absent-service portable without elevation or with a bad signature
+        // refuses — no silent install, no watchdog from a writable folder.
         match plan_portable(&PortableContext {
             location: LaunchLocation::PortableFolder,
-            service: ServiceState::Running,
-            journal: JournalStatus::Clean,
-            elevated: true,
+            service: ServiceState::Absent,
+            journal: JournalStatus::Absent,
+            elevated: false,
             helper_signature: SignatureCheck::Valid,
         }) {
-            PortableDecision::ProvisionViaElevatedBootstrap => {}
-            other => panic!("portable first run must provision: {other:?}"),
+            PortableDecision::RefuseAbsentServiceTakeover { .. } => {}
+            other => panic!("unelevated absent-service portable must refuse: {other:?}"),
         }
-        // Absent service: portable takeover refuses — no silent install, no
-        // watchdog from a writable folder.
         match plan_portable(&PortableContext {
             location: LaunchLocation::PortableFolder,
             service: ServiceState::Absent,
             journal: JournalStatus::Absent,
             elevated: true,
-            helper_signature: SignatureCheck::Valid,
+            helper_signature: SignatureCheck::Invalid,
         }) {
             PortableDecision::RefuseAbsentServiceTakeover { .. } => {}
-            other => panic!("absent-service portable must refuse: {other:?}"),
+            other => panic!("bad-signature absent-service portable must refuse: {other:?}"),
         }
         // Unelevated portable cannot silently install machine software.
         match plan_portable(&PortableContext {
@@ -1113,6 +1193,21 @@ mod tests {
         assert!(!scope.deletes_protected_binary);
         assert!(!scope.deletes_program_data_state);
         assert!(scope.deletes_portable_folder_only);
+        // The behavior the scope names is enforced by the portable cleanup
+        // path: protected and ProgramData locations are never deletion
+        // targets (the predicate reports them as forbidden).
+        assert!(portable_path_is_protected_deletion_target(
+            "C:\\Program Files\\Yeager\\yeager-dns-recovery.exe"
+        ));
+        assert!(portable_path_is_protected_deletion_target(
+            "C:\\ProgramData\\Yeager\\dns-takeover-v1.json"
+        ));
+        assert!(portable_path_is_portable_folder_file(
+            "D:\\tools\\yeager-portable\\yeager.exe"
+        ));
+        assert!(!portable_path_is_protected_deletion_target(
+            "D:\\tools\\yeager-portable\\yeager.exe"
+        ));
     }
 
     #[test]

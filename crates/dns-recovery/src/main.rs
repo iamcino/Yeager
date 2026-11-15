@@ -222,27 +222,85 @@ mod win {
         let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
         let dest_dir = format!("{program_files}\\Yeager");
         let dest = format!("{dest_dir}\\yeager-dns-recovery.exe");
+        // U09-REV B: real rollback. Back up the previous executable before
+        // replacement so a start/Hello failure restores both the binary and
+        // the registration (the previous claim of a backup with no code is
+        // removed).
+        let had_previous_binary = std::path::Path::new(&dest).exists();
+        let backup = format!("{dest}.prev-{}", std::process::id());
+        if had_previous_binary {
+            if let Err(e) = std::fs::copy(&dest, &backup) {
+                fail("install-service", 13, format!("cannot back up previous binary: {e}"));
+            }
+        }
+        // Rollback helper: restore the previous binary when one existed,
+        // otherwise leave no copied exe behind; restart the previous
+        // service when one existed, otherwise remove the fresh registration.
+        let rollback = |had_previous: bool, backup: &str, dest: &str| {
+            let _ = service_os::stop_service();
+            if had_previous {
+                let _ = std::fs::copy(backup, dest);
+                let _ = std::fs::remove_file(backup);
+                let _ = service_os::start_service();
+            } else {
+                let _ = service_os::remove_service();
+                let _ = std::fs::remove_file(dest);
+            }
+        };
         if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            if had_previous_binary {
+                let _ = std::fs::remove_file(&backup);
+            }
             fail("install-service", 13, format!("cannot create {dest_dir}: {e}"));
+        }
+        // Protected ACL on the binary directory, not only ProgramData
+        // (exact DIR_SDDL: SYSTEM + Administrators, protected).
+        if let Err(e) = service_os::apply_protected_binary_dir_acl(&dest_dir) {
+            if had_previous_binary {
+                let _ = std::fs::remove_file(&backup);
+            }
+            fail("install-service", 13, e);
         }
         let current = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => fail("install-service", 13, format!("cannot locate running image: {e}")),
         };
+        // Upgrade replace: the running service locks the protected binary,
+        // so stop and prove STOPPED before overwriting it (mirrors the
+        // installer's PrepareToInstall `sc stop` + STOPPED poll; the offline
+        // guard refuses anything but proven STOPPED).
+        if had_previous_binary {
+            let _ = service_os::stop_service();
+            if let Err(e) = wait_for_state(ScmServiceState::Stopped, 30) {
+                let _ = std::fs::remove_file(&backup);
+                fail("install-service", 13, format!("cannot stop service for replacement: {e}"));
+            }
+        }
         if let Err(e) = std::fs::copy(&current, &dest) {
+            if had_previous_binary {
+                let _ = std::fs::remove_file(&backup);
+            } else {
+                let _ = std::fs::remove_file(&dest);
+            }
             fail("install-service", 13, format!("cannot stage protected binary: {e}"));
         }
         if let Err(e) = service_os::install_service(&dest) {
+            // Registration failed: restore the previous binary when one
+            // existed, otherwise remove any copied exe.
+            if had_previous_binary {
+                let _ = std::fs::copy(&backup, &dest);
+                let _ = std::fs::remove_file(&backup);
+            } else {
+                let _ = std::fs::remove_file(&dest);
+            }
             fail("install-service", 13, e);
         }
         if let Err(e) = service_os::start_service() {
-            let _ = service_os::stop_service();
-            let _ = service_os::remove_service();
+            rollback(had_previous_binary, &backup, &dest);
             fail("install-service", 13, e);
         }
         if let Err(e) = wait_for_state(ScmServiceState::Running, 30) {
-            let _ = service_os::stop_service();
-            let _ = service_os::remove_service();
+            rollback(had_previous_binary, &backup, &dest);
             fail("install-service", 13, e);
         }
         // Hello validation over the protected pipe with the SCM PID check.
@@ -275,23 +333,24 @@ mod win {
         })();
         match hello_outcome {
             Ok(outcome) if outcome == "success" => {
+                // Upgrade success: the backup is no longer needed.
+                let _ = std::fs::remove_file(&backup);
                 out(&serde_json::json!({
                     "mode": "install-service",
                     "outcome": "success",
                     "exit": 0,
                     "binary": dest,
                     "hello": outcome,
+                    "replaced": had_previous_binary,
                 }));
                 std::process::exit(0);
             }
             Ok(outcome) => {
-                let _ = service_os::stop_service();
-                let _ = service_os::remove_service();
+                rollback(had_previous_binary, &backup, &dest);
                 fail("install-service", 13, format!("hello validation returned {outcome:?}"));
             }
             Err(e) => {
-                let _ = service_os::stop_service();
-                let _ = service_os::remove_service();
+                rollback(had_previous_binary, &backup, &dest);
                 fail("install-service", 13, format!("hello validation failed: {e}"));
             }
         }

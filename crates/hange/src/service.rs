@@ -21,6 +21,31 @@ use std::time::Duration;
 /// a stuck client can never block the watchdog or the stop path.
 pub const IPC_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Real service binary versions as reported by the service itself over the
+/// pipe (Hello reply: `protocol`, `journal_version`, `service_version`).
+/// The updater gate reads these — never the app's own constants — so a
+/// service binary that predates or postdates the GUI is detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceVersions {
+    pub protocol: u32,
+    pub journal_version: u32,
+    pub service_version: (u32, u32, u32),
+}
+
+fn parse_dotted_version(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.trim().strip_prefix('v').unwrap_or(s.trim());
+    let mut parts = s.split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()
+    };
+    let v = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(v)
+}
+
 /// Authenticated lease credentials for one owner session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseCreds {
@@ -500,6 +525,44 @@ pub struct PipeClient {
 impl PipeClient {
     pub fn new() -> Self {
         Self { _private: () }
+    }
+
+    /// Real service versions from the pipe Hello reply (U09-REV F): the
+    /// service's own protocol/journal/binary versions, not the app's
+    /// constants. `None` when the service is unreachable or the reply
+    /// carries no versions (fails closed — the updater gate refuses).
+    pub fn service_versions(&self) -> Option<ServiceVersions> {
+        let req = Request::new(
+            new_request_id(),
+            Operation::Hello,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        let reply = self.roundtrip(req).ok()?;
+        if crate::service::map_outcome(&reply.outcome) != SvcOutcome::Success {
+            return None;
+        }
+        let protocol = reply
+            .body
+            .get("protocol")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)?;
+        let journal_version = reply
+            .body
+            .get("journal_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)?;
+        let service_version = reply
+            .body
+            .get("service_version")
+            .and_then(|v| v.as_str())
+            .and_then(parse_dotted_version)?;
+        Some(ServiceVersions {
+            protocol,
+            journal_version,
+            service_version,
+        })
     }
 
     fn roundtrip(&self, req: Request) -> Result<Reply, SvcError> {

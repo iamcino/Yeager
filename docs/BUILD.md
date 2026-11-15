@@ -118,25 +118,33 @@ exactly like the standalone helper artifact).
 
 ## DNS service evidence (U09) and service-changing migration
 
-U09 ships the DNS recovery service (`crates/dns-recovery`, installer
-`[Code]` sequence, updater gate). The fake-backed gates
+U09-REV ships the DNS recovery service (`crates/dns-recovery`, installer
+`[Code]` calling the `--install-service`/`--enter-maintenance`/
+`--recover-offline`/`--inspect`/`--leave-maintenance` seams, portable Q2
+bootstrap in `crates/app/src/main.rs`, updater gate with real manifest +
+pipe versions). The fake-backed gates
 (`dns-recovery/src/provision.rs` installer/uninstall/portable planner plus
-schema/compat checks, `crates/app/src/updater.rs` service gate) run in the
-normal `cargo test --workspace` suite — `cargo test` never mutates real NICs.
-The one controlled real cycle of the product's OWN service (install →
-Hello/inspection → maintenance enter/leave → upgrade-replace → clean
-uninstall, with an empty journal and no DNS takeover) is recorded in
+schema/compat checks, `crates/app/src/updater.rs` service gate incl.
+pre-replacement `verify_restore`) run in the normal
+`cargo test --workspace` suite — `cargo test` never mutates real NICs. The
+controlled real cycle through the built installer plus portable first run
+(clean install registers/starts with Hello/inspection of the NEW binary,
+upgrade replaces with a DIFFERENT binary while a real journal payload
+survives, forced start failure rolls back exe + registration, maintenance
+round-trip completes through the seams, clean uninstall leaves the machine
+as found, NIC snapshots identical, no DNS takeover) is recorded in
 `C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`. Real NIC mutation, destructive
 faults and power-loss simulation are U10's disposable-VM gate.
 
 **Service-changing updates:** if the installed Yeager predates the recovery
-service (or the release notes name a service/protocol/schema change), update
-with the signed installer, not the in-app single-exe update. The single-exe
-updater checks service compatibility BEFORE installing a replacement and
-refuses service-changing replacements, directing you to the installer; a
-compatible GUI-only update still restores/verifies before restart, and a
-failed cleanup cancels the restart. See `docs/DNS-RECOVERY.md` for the full
-operator reference.
+service (or the release `manifest.json` names a service/protocol/schema
+change), update with the signed installer, not the in-app single-exe update.
+The single-exe updater fetches the target release's real requirements from
+its `manifest.json` sidecar (fail-closed to the installer), reads the
+service's actual versions from the pipe Hello, restores/verifies BEFORE any
+exe replacement (and again before restart), refuses service-changing
+replacements with directions to the installer, and cancels the restart on a
+failed cleanup. See `docs/DNS-RECOVERY.md` for the full operator reference.
 
 ## Publishing on GitLab
 

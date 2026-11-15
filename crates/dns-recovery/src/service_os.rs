@@ -248,9 +248,89 @@ pub fn scm_service_pid() -> Result<Option<u32>, String> {
     }
 }
 
+/// Apply the protected ACL to the service binary directory
+/// (`%ProgramFiles%\Yeager`): owner/group SYSTEM, protected DACL granting
+/// SYSTEM and Administrators full control (exact `DIR_SDDL`, same contract
+/// as the ProgramData journal directory). The installer and the
+/// `--install-service` seam both enforce this; a caller without
+/// SeRestorePrivilege gets a hard error, never a silently weak directory.
+#[cfg(windows)]
+pub fn apply_protected_binary_dir_acl(dir: &str) -> Result<(), String> {
+    crate::security::win::apply_named_sddl(dir, crate::security::DIR_SDDL)
+        .map_err(|e| format!("protected binary dir ACL failed for {dir:?}: {}", e.0))
+}
+
+/// Configure failure actions + non-crash flag + preshutdown on an open
+/// service handle (§8.1: restart at 1 s / 5 s / 30 s including non-crash
+/// failures, plus the 30 s preshutdown budget). Shared by the create and
+/// replace paths so the installer `[Code]` and this seam agree.
+#[cfg(windows)]
+fn configure_failure_actions(
+    service: Ws::System::Services::SC_HANDLE,
+) -> Result<(), String> {
+    use Ws::System::Services as S;
+    unsafe {
+        let mut actions = FAILURE_ACTION_DELAYS_MS
+            .iter()
+            .map(|d| S::SC_ACTION {
+                Type: S::SC_ACTION_RESTART,
+                Delay: *d,
+            })
+            .collect::<Vec<_>>();
+        let failure = S::SERVICE_FAILURE_ACTIONSW {
+            dwResetPeriod: 86400,
+            lpRebootMsg: std::ptr::null_mut(),
+            lpCommand: std::ptr::null_mut(),
+            cActions: actions.len() as u32,
+            lpsaActions: actions.as_mut_ptr(),
+        };
+        if S::ChangeServiceConfig2W(
+            service,
+            S::SERVICE_CONFIG_FAILURE_ACTIONS,
+            &failure as *const _ as *const std::ffi::c_void,
+        ) == 0
+        {
+            return Err(format!(
+                "failure-action configuration failed: {}",
+                last_error()
+            ));
+        }
+        let flag = S::SERVICE_FAILURE_ACTIONS_FLAG {
+            fFailureActionsOnNonCrashFailures: 1,
+        };
+        if S::ChangeServiceConfig2W(
+            service,
+            S::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            &flag as *const _ as *const std::ffi::c_void,
+        ) == 0
+        {
+            return Err(format!(
+                "non-crash failure-action flag failed: {}",
+                last_error()
+            ));
+        }
+        let preshutdown = S::SERVICE_PRESHUTDOWN_INFO {
+            dwPreshutdownTimeout: PRESHUTDOWN_TIMEOUT_MS,
+        };
+        if S::ChangeServiceConfig2W(
+            service,
+            S::SERVICE_CONFIG_PRESHUTDOWN_INFO,
+            &preshutdown as *const _ as *const std::ffi::c_void,
+        ) == 0
+        {
+            return Err(format!("preshutdown configuration failed: {}", last_error()));
+        }
+        Ok(())
+    }
+}
+
 /// Install the service exactly per §8.1 and arm failure actions +
 /// preshutdown. The binary must already live at the protected path; the
-/// quoted ImagePath carries `--service`.
+/// quoted ImagePath carries `--service`. U09-REV upgrade seam: when the
+/// service is already installed, the registration is REPLACED in place
+/// (quoted binPath re-pointed, failure actions + non-crash flag +
+/// preshutdown re-armed) instead of refusing — this is the seam the
+/// installer upgrade path calls after the CLEAN gate and STOPPED proof.
 pub fn install_service(image_path: &str) -> Result<(), String> {
     use Ws::System::Services as S;
     if !is_elevated() {
@@ -263,9 +343,38 @@ pub fn install_service(image_path: &str) -> Result<(), String> {
         let bin = wide(&format!("\"{image_path}\" --service"));
         let existing = S::OpenServiceW(manager, name.as_ptr(), S::SERVICE_ALL_ACCESS);
         if !existing.is_null() {
+            // Upgrade replace: re-point the SCM entry at the (already
+            // replaced) protected binary, then re-arm the full §8.1
+            // configuration so the installer `[Code]` and this seam agree
+            // (quoted path, 1 s / 5 s / 30 s restarts, non-crash flag,
+            // preshutdown).
+            if S::ChangeServiceConfigW(
+                existing,
+                S::SERVICE_NO_CHANGE,
+                S::SERVICE_NO_CHANGE,
+                S::SERVICE_NO_CHANGE,
+                bin.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                display.as_ptr(),
+            ) == 0
+            {
+                let e = last_error();
+                close(existing);
+                close(manager);
+                return Err(format!("reconfigure service binPath failed: {e}"));
+            }
+            if let Err(e) = configure_failure_actions(existing) {
+                close(existing);
+                close(manager);
+                return Err(e);
+            }
             close(existing);
             close(manager);
-            return Err(format!("service {SERVICE_NAME} is already installed"));
+            return Ok(());
         }
         let service = S::CreateServiceW(
             manager,
@@ -287,63 +396,11 @@ pub fn install_service(image_path: &str) -> Result<(), String> {
             close(manager);
             return Err(format!("CreateServiceW failed: {e}"));
         }
-        // Failure actions: restart at 1 s / 5 s / 30 s, including
-        // non-crash failures.
-        let mut actions = FAILURE_ACTION_DELAYS_MS
-            .iter()
-            .map(|d| S::SC_ACTION {
-                Type: S::SC_ACTION_RESTART,
-                Delay: *d,
-            })
-            .collect::<Vec<_>>();
-        let failure = S::SERVICE_FAILURE_ACTIONSW {
-            dwResetPeriod: 86400,
-            lpRebootMsg: std::ptr::null_mut(),
-            lpCommand: std::ptr::null_mut(),
-            cActions: actions.len() as u32,
-            lpsaActions: actions.as_mut_ptr(),
-        };
-        if S::ChangeServiceConfig2W(
-            service,
-            S::SERVICE_CONFIG_FAILURE_ACTIONS,
-            &failure as *const _ as *const std::ffi::c_void,
-        ) == 0
-        {
-            let e = last_error();
+        if let Err(e) = configure_failure_actions(service) {
             S::DeleteService(service);
             close(service);
             close(manager);
-            return Err(format!("failure-action configuration failed: {e}"));
-        }
-        let flag = S::SERVICE_FAILURE_ACTIONS_FLAG {
-            fFailureActionsOnNonCrashFailures: 1,
-        };
-        if S::ChangeServiceConfig2W(
-            service,
-            S::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-            &flag as *const _ as *const std::ffi::c_void,
-        ) == 0
-        {
-            let e = last_error();
-            S::DeleteService(service);
-            close(service);
-            close(manager);
-            return Err(format!("non-crash failure-action flag failed: {e}"));
-        }
-        let preshutdown = S::SERVICE_PRESHUTDOWN_INFO {
-            dwPreshutdownTimeout: PRESHUTDOWN_TIMEOUT_MS,
-        };
-        if S::ChangeServiceConfig2W(
-            service,
-            S::SERVICE_CONFIG_PRESHUTDOWN_INFO,
-            &preshutdown as *const _ as *const std::ffi::c_void,
-        ) == 0
-        {
-            let e = last_error();
-            S::DeleteService(service);
-            close(service);
-            close(manager);
-            return Err(format!("preshutdown configuration failed: {e}"));
+            return Err(e);
         }
         close(service);
         close(manager);

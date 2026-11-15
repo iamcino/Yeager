@@ -114,18 +114,24 @@ giống từng byte với helper phát hành riêng.
 
 ## Bằng chứng service DNS (U09) và cập nhật đổi service
 
-U09 phát hành service khôi phục DNS. Các gate giả lập chạy trong
-`cargo test --workspace` (không bao giờ đụng NIC thật). Chu trình thật duy
-nhất của chính service (install → Hello/inspection → maintenance
-enter/leave → upgrade-replace → clean uninstall, journal rỗng, không takeover
-DNS) được ghi ở `C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`.
+U09-REV phát hành service khôi phục DNS. Các gate giả lập
+(`provision.rs` + `updater.rs` kể cả `verify_restore` trước khi thay file)
+chạy trong `cargo test --workspace` (không bao giờ đụng NIC thật). Chu trình
+thật qua bộ cài đã build + portable first run (clean install đăng ký/chạy
+với Hello/inspection của binary MỚI, upgrade thay binary KHÁC khi journal
+payload thật còn nguyên, lỗi start cưỡng bức rollback exe + registration,
+maintenance round-trip xong qua seams, clean uninstall trả máy về như cũ,
+NIC snapshots giống hệt, không takeover DNS) được ghi ở
+`C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`.
 
 **Cập nhật đổi service:** nếu Yeager đang cài chưa có recovery service (hoặc
-ghi chú phát hành nêu đổi service/protocol/schema), hãy cập nhật bằng bộ cài
-đã ký, đừng dùng nút cập nhật single-exe trong ứng dụng. Trình cập nhật kiểm
-tra tương thích service TRƯỚC khi thay file và sẽ từ chối bản đổi service,
-chỉ bạn sang bộ cài; bản GUI-only tương thích vẫn phải restore/verify trước
-restart, cleanup lỗi thì hủy restart. Chi tiết ở `docs/DNS-RECOVERY.md`.
+`manifest.json` của bản mới nêu đổi service/protocol/schema), hãy cập nhật
+bằng bộ cài đã ký, đừng dùng nút cập nhật single-exe trong ứng dụng. Trình
+cập nhật đọc yêu cầu thật của bản mới từ `manifest.json` (mất manifest thì
+mặc định về bộ cài), đọc version thật của service từ pipe Hello, restore/
+verify TRƯỚC khi thay exe (và lại trước restart), từ chối bản đổi service và
+chỉ bạn sang bộ cài; cleanup lỗi thì hủy restart. Chi tiết ở
+`docs/DNS-RECOVERY.md`.
 
 ## Đăng trên GitLab
 

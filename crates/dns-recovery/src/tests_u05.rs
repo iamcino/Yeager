@@ -984,14 +984,16 @@ fn maintenance_blocks_takeover_and_leaves_cleanly() {
         &peer,
         &request(Operation::LeaveMaintenance, None, None, json!({})),
     );
-    // No transaction was ever committed (takeover never ran): leaving
-    // maintenance on a bare genesis journal honestly refuses — there is no
-    // legal clean state to return to.
-    assert_eq!(leave.outcome, "unavailable");
+    // No transaction was ever committed (takeover never ran): leaving an
+    // empty maintenance marker clears it back to absent (U09-REV B — the
+    // round-trip completes through the seams with no manual SCM
+    // intervention).
+    assert_eq!(leave.outcome, "success");
+    assert!(w.journal_state().is_none());
 }
 
 #[test]
-fn maintenance_round_trip_with_committed_transaction_leaves_cleanly() {
+fn maintenance_round_trip_with_committed_transaction_leaves_recovery_pending() {
     // U09 installer path (fake-backed, synthetic GUID only): with a
     // committed transaction, enter blocks takeover and leave returns the
     // journal to RecoveryPending — the full round-trip the live cycle

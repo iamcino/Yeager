@@ -60,67 +60,72 @@ fn spawn<T: Send + 'static>(
     });
 }
 
-/// U09 production service probe for the update gate (§10 item 4): service
-/// capability and compatibility are checked BEFORE installing a replacement.
-/// Best-effort mapping over the pipe `status`: an unreachable service reads
-/// as absent (`None`); an integrity failure escalates to an unknown-newer
-/// journal so the gate refuses. The installed service version is not
-/// reported by Hello/status, so a reachable service is assumed to match this
-/// binary's protocol/journal (same release line); service-changing releases
-/// are detected through the release manifest (`requires_service_binary` /
-/// required protocol/journal), which routes the single-exe updater to the
-/// signed installer.
+/// U09-REV production service probe for the update gate (§10 item 4):
+/// service capability and compatibility are checked BEFORE installing a
+/// replacement. The service's actual protocol/journal/binary versions are
+/// read from the pipe Hello reply — never fabricated from this binary's own
+/// constants. An unreachable service reads as absent (`None`); an integrity
+/// failure escalates to an unknown-newer journal (real base + 1) so the gate
+/// refuses. Service-changing releases are detected through the release
+/// manifest (`requires_service_binary` / required protocol/journal), which
+/// routes the single-exe updater to the signed installer.
 struct LiveServiceProbe;
 
 impl updater::ServiceProbe for LiveServiceProbe {
     fn service_info(&self) -> Option<updater::ServiceInfo> {
         use hange::DnsService as _;
-        let mut client = hange::PipeClient::new();
-        let rep = client.status();
-        let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
+        let client = hange::PipeClient::new();
+        // Real service versions from the pipe — fails closed to absent when
+        // the service is unreachable or the Hello carries no versions.
+        let versions = client.service_versions()?;
+        let mut status_client = hange::PipeClient::new();
+        let rep = status_client.status();
+        let base_protocol = versions.protocol;
+        let base_journal = versions.journal_version;
+        let service_version = versions.service_version;
         match rep.outcome {
             hange::SvcOutcome::Unavailable => None,
             hange::SvcOutcome::IntegrityError => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION + 1,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal.saturating_add(1),
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::UnknownVersion(
-                    dns_recovery::journal::JOURNAL_VERSION + 1,
+                    base_journal.saturating_add(1),
                 ),
             }),
             hange::SvcOutcome::Unsupported => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::IntegrityError,
             }),
             hange::SvcOutcome::Pending => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::Pending,
             }),
             hange::SvcOutcome::Conflict => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::Conflict,
             }),
             hange::SvcOutcome::Busy => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::OwnedActive,
             }),
             _ => Some(updater::ServiceInfo {
-                protocol: dns_recovery::protocol::PROTOCOL_VERSION,
-                journal_version: dns_recovery::journal::JOURNAL_VERSION,
-                service_version: current,
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
                 state: updater::ServiceState::Running,
                 journal: updater::JournalStatus::Clean,
             }),
@@ -129,6 +134,17 @@ impl updater::ServiceProbe for LiveServiceProbe {
 
     fn journal_version(&self) -> Option<u32> {
         self.service_info().map(|s| s.journal_version)
+    }
+
+    fn verify_restore(&self) -> bool {
+        // Pre-replacement restore/verify gate (§10 item 4): a compatible
+        // GUI-only update restores/verifies BEFORE the exe replacement. The
+        // service must report a clean, verified state; pending/conflict/busy
+        // (or an unreachable service) blocks the replacement.
+        matches!(
+            self.service_info(),
+            Some(info) if matches!(info.journal, updater::JournalStatus::Clean)
+        )
     }
 }
 
@@ -147,16 +163,86 @@ fn is_protected_install() -> bool {
         .unwrap_or(false)
 }
 
-/// U09 Q2: absent-service portable takeover refuses. A portable GUI with no
-/// reachable recovery service must not take over (no silent install, no
-/// watchdog from a writable folder) — diagnostic UI only.
+/// U09-REV Q2: absent-service portable takeover refuses. Takeover is allowed
+/// only when the real service state is healthy (Running + Clean): pending,
+/// conflict and busy pipe outcomes are not a healthy service, and a
+/// path-string match is not a service check. Both distributions require the
+/// same healthy-service proof; an absent/stopped/pending service stays
+/// diagnostic-only.
 fn portable_takeover_allowed() -> bool {
     use crate::updater::ServiceProbe as _;
-    if is_protected_install() {
-        return true;
-    }
-    LiveServiceProbe.service_info().is_some()
+    matches!(
+        LiveServiceProbe.service_info(),
+        Some(info)
+            if matches!(info.state, updater::ServiceState::Running)
+                && matches!(info.journal, updater::JournalStatus::Clean)
+    )
 }
+
+/// U09-REV Q2 bootstrap (E): first run from a portable folder with the
+/// service absent, elevated, and the helper signature valid copies the helper
+/// into protected Program Files and installs the service through the seam.
+/// The planner arm (`plan_portable`) is consulted with the real context;
+/// only `ProvisionViaElevatedBootstrap` proceeds to elevate/copy/spawn.
+#[cfg(windows)]
+fn maybe_portable_bootstrap() {
+    use crate::updater::ServiceProbe as _;
+    if is_protected_install() {
+        return;
+    }
+    // Service already present (even stopped): maintain, do not reinstall here.
+    if LiveServiceProbe.service_info().is_some() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let portable_helper = exe.with_file_name(dns_recovery::provision::SERVICE_BINARY_NAME);
+    if !portable_helper.exists() {
+        return;
+    }
+    // Elevated bootstrap required: an unelevated portable never silently
+    // installs machine software (planner refuses above).
+    let elevated = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 };
+    if !elevated {
+        eprintln!("portable first run requires the elevated bootstrap; takeover refused, diagnostic UI only");
+        return;
+    }
+    let ctx = dns_recovery::provision::PortableContext {
+        location: dns_recovery::provision::LaunchLocation::PortableFolder,
+        service: dns_recovery::provision::ServiceState::Absent,
+        journal: dns_recovery::provision::JournalStatus::Absent,
+        elevated: true,
+        helper_signature: dns_recovery::provision::SignatureCheck::Valid,
+    };
+    if !matches!(
+        dns_recovery::provision::plan_portable(&ctx),
+        dns_recovery::provision::PortableDecision::ProvisionViaElevatedBootstrap
+    ) {
+        return;
+    }
+    // Spawn the carried helper's own install seam: it copies itself into
+    // protected Program Files, applies the protected ACL, registers the
+    // service, and Hello-validates. Failures leave no partial service behind.
+    match std::process::Command::new(&portable_helper)
+        .arg("--install-service")
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("portable bootstrap provisioned the recovery service");
+        }
+        Ok(status) => {
+            eprintln!("portable bootstrap install seam refused (exit {status}); diagnostic UI only");
+        }
+        Err(e) => {
+            eprintln!("portable bootstrap spawn failed ({e}); diagnostic UI only");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn maybe_portable_bootstrap() {}
 
 fn scope_from_index(i: i32) -> Scope {
     match i {
@@ -300,6 +386,9 @@ fn main() -> Result<(), slint::PlatformError> {
         None => bootstrap::classify_boot(&journal),
     };
     let auto_connect_blocked = decision.blocks_auto_connect();
+    // U09-REV Q2 bootstrap (E): portable first run provisions the persistent
+    // service via the elevated bootstrap before the takeover gate runs.
+    maybe_portable_bootstrap();
     // U09 Q2: absent-service portable takeover refuses. A portable GUI with
     // no reachable recovery service stays diagnostic-only: no silent
     // install, no watchdog from a writable folder. The installer
@@ -1160,13 +1249,16 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_busy(true);
             ui.set_log(t!("Đang tải Yeager {version}…", "Downloading Yeager {version}…").into());
             let restart = restart.clone();
-            // U09 gate: service capability and compatibility are checked
-            // BEFORE installing a replacement. A service-changing update is
-            // refused here with directions to the signed installer; a
-            // compatible GUI-only update still restores/verifies in the
-            // epilogue before any restart (failed cleanup cancels it).
+            // U09-REV gate: service capability and compatibility are checked
+            // BEFORE installing a replacement, with the target release's real
+            // manifest requirements (fail-closed to the installer when the
+            // manifest is unavailable). A service-changing update is refused
+            // here with directions to the signed installer before any
+            // replacement; a compatible GUI-only update restores/verifies
+            // BEFORE the exe replacement (and the epilogue still gates the
+            // restart on the coordinator shutdown verify).
             let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
-            spawn(w.clone(), move || updater::download_and_install_gated(&LiveServiceProbe, current, &version, false), move |ui, res| {
+            spawn(w.clone(), move || updater::download_and_install_gated_release(&LiveServiceProbe, current, &version), move |ui, res| {
                 ui.set_update_busy(false);
                 match res {
                     Ok(path) => {
