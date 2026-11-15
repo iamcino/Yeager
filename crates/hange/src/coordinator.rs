@@ -213,6 +213,21 @@ impl From<CoordError> for SvcReport {
     }
 }
 
+/// Whether a registration failure is a dead owner's unsettled debt (U08-REV2
+/// item 1): the service refuses a fresh `register_owner` with `Unavailable`
+/// until the dead owner's restore completes. Only this arm may trigger the
+/// lease-free `recover_dead_owner` path; live-owner `Busy`, conflicts and
+/// auth failures never do.
+fn is_dead_owner_debt(e: &CoordError) -> bool {
+    if e.outcome != SvcOutcome::Unavailable {
+        return false;
+    }
+    let m = e.message.to_lowercase();
+    m.contains("recovery debt")
+        || m.contains("unsettled")
+        || m.contains("restore before new registration")
+}
+
 /// One supervised configuration.
 struct ActiveEntry {
     listener: Option<Box<dyn ManagedListener>>,
@@ -369,6 +384,13 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
     /// (reattaching when the same live process owns the record) and runs
     /// restore through the service.
     ///
+    /// Dead-owner path (U08-REV2 item 1): when registration is refused over a
+    /// dead owner's unsettled debt, the coordinator settles that debt through
+    /// the service's dead-owner mechanism (`recover_dead_owner`, no lease)
+    /// BEFORE any new registration — never register-first-then-restore for a
+    /// dead owner. A clean dead-owner restore tombstones the transaction so
+    /// the retry registration succeeds and the following restore verifies.
+    ///
     /// The restore runs while the lease is still valid — `engine.restore`
     /// closes admission itself — never as quiesce-then-restore with the same
     /// token, because `op_quiesce` deletes the lease and the following
@@ -387,6 +409,33 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
                 // the journal record) so the restore below is authorized.
                 match self.register(0) {
                     Ok(c) => c,
+                    Err(e) if is_dead_owner_debt(&e) => {
+                        // Dead owner's debt blocks new registration: settle it
+                        // through the dead-owner mechanism first (no lease),
+                        // then retry registration once.
+                        let recovered = self.service.recover_dead_owner();
+                        if recovered.outcome != SvcOutcome::VerifiedRestored {
+                            return Err(CoordError {
+                                outcome: recovered.outcome,
+                                message: format!(
+                                    "disable dead-owner recovery not verified: {}",
+                                    recovered.message
+                                ),
+                            });
+                        }
+                        match self.register(0) {
+                            Ok(c) => c,
+                            Err(e2) => {
+                                return Err(CoordError {
+                                    outcome: e2.outcome,
+                                    message: format!(
+                                        "disable re-registration after dead-owner restore failed: {}",
+                                        e2.message
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     Err(e) => {
                         return Err(CoordError {
                             outcome: e.outcome,

@@ -463,6 +463,7 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             Operation::Health => self.op_health(peer, req),
             Operation::Quiesce => self.op_quiesce(peer, req),
             Operation::Restore => self.op_restore(peer, req),
+            Operation::RecoverDeadOwner => self.op_recover_dead_owner(peer, req),
             Operation::Status => self.op_status(req),
             Operation::EnterMaintenance => self.op_enter_maintenance(peer, req),
             Operation::LeaveMaintenance => self.op_leave_maintenance(peer, req),
@@ -1023,6 +1024,71 @@ impl<F: JournalFs + 'static> ServiceHost<F> {
             self.leases.remove(&owner_id);
         }
         reply
+    }
+
+    /// Dead-owner recovery without a lease (U08-REV2 item 1): settle a dead
+    /// recorded owner's debt through the service's dead-owner mechanism.
+    /// No `register_owner` happens first — registration is refused until this
+    /// restore completes, so the boot path calls this before registering.
+    /// - No transaction: `verified_restored` (clean, nothing to do).
+    /// - Recorded owner live: `busy` (never restore a live owner here).
+    /// - Liveness unknown: `unavailable` (journal retained, no blind write).
+    /// - Recorded owner dead: restore the exact original via the engine and
+    ///   report the outcome; a clean restore tombstones the transaction so a
+    ///   subsequent `register_owner` succeeds.
+    fn op_recover_dead_owner(&mut self, _peer: &PeerAuth, req: &Request) -> Reply {
+        if let Some(stored) = self.dedup_lookup(&req.request_id) {
+            return stored.clone();
+        }
+        let (generation, recorded) = match self.current_transaction() {
+            Err(e) => {
+                return self.reply(
+                    req,
+                    0,
+                    "unavailable",
+                    serde_json::json!({"error": format!("journal unavailable: {e}")}),
+                );
+            }
+            Ok(None) => {
+                let reply = self.reply(
+                    req,
+                    self.journal_generation(),
+                    "verified_restored",
+                    serde_json::json!({"note": "clean journal, nothing to restore"}),
+                );
+                self.dedup_store(req.request_id.clone(), reply.clone());
+                return reply;
+            }
+            Ok(Some((generation, tx))) => (generation, tx.owner.clone()),
+        };
+        match (self.probe_factory)().check(&recorded) {
+            OwnerLiveness::Live => self.reply(
+                req,
+                generation,
+                "busy",
+                serde_json::json!({
+                    "error": "a live owner holds the machine lease; activation must target the existing instance",
+                    "owner_id": recorded.owner_id,
+                }),
+            ),
+            OwnerLiveness::Unknown(detail) => self.reply(
+                req,
+                generation,
+                "unavailable",
+                serde_json::json!({"error": format!("owner liveness unknown ({detail}); journal retained")}),
+            ),
+            OwnerLiveness::Dead => {
+                let report = self.restore_for_owner(&recorded);
+                let reply = self.reply(
+                    req,
+                    report.generation,
+                    outcome_str(report.outcome),
+                    serde_json::json!({"errors": report.errors.len()}),
+                );
+                self.dedup_store(req.request_id.clone(), reply.clone());
+                reply
+            }
+        }
     }
 
     // ---- health ------------------------------------------------------------------

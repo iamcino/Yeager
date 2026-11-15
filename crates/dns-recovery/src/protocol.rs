@@ -53,6 +53,7 @@ pub enum Operation {
     Health,
     Quiesce,
     Restore,
+    RecoverDeadOwner,
     Status,
     EnterMaintenance,
     LeaveMaintenance,
@@ -70,6 +71,7 @@ impl Operation {
             Operation::Health => "health",
             Operation::Quiesce => "quiesce",
             Operation::Restore => "restore",
+            Operation::RecoverDeadOwner => "recover_dead_owner",
             Operation::Status => "status",
             Operation::EnterMaintenance => "enter_maintenance",
             Operation::LeaveMaintenance => "leave_maintenance",
@@ -87,6 +89,7 @@ impl Operation {
             "health" => Operation::Health,
             "quiesce" => Operation::Quiesce,
             "restore" => Operation::Restore,
+            "recover_dead_owner" => Operation::RecoverDeadOwner,
             "status" => Operation::Status,
             "enter_maintenance" => Operation::EnterMaintenance,
             "leave_maintenance" => Operation::LeaveMaintenance,
@@ -103,6 +106,7 @@ impl Operation {
             Operation::Apply
                 | Operation::Reconfigure
                 | Operation::Restore
+                | Operation::RecoverDeadOwner
                 | Operation::EnterMaintenance
                 | Operation::LeaveMaintenance
         )

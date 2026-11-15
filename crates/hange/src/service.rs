@@ -212,6 +212,17 @@ pub trait DnsService {
     ) -> SvcReport;
     fn quiesce(&mut self, creds: &LeaseCreds) -> SvcReport;
     fn restore(&mut self, creds: &LeaseCreds) -> SvcReport;
+    /// Dead-owner recovery without a lease (U08-REV2 item 1): settle a dead
+    /// recorded owner's debt before any new registration. Default returns
+    /// `Unavailable` so scripted fakes keep compiling; real clients override
+    /// to call the service `recover_dead_owner` operation.
+    fn recover_dead_owner(&mut self) -> SvcReport {
+        SvcReport {
+            outcome: SvcOutcome::Unavailable,
+            generation: 0,
+            message: "dead-owner recovery not supported by this service".into(),
+        }
+    }
     fn status(&mut self) -> SvcReport;
     /// Current journal transaction epoch, if the service reports one.
     /// After a successful takeover the journal epoch advances (0 -> 1) while
@@ -425,6 +436,17 @@ impl<F: dns_recovery::fs::JournalFs + 'static> DnsService for HostClient<'_, F> 
         SvcReport::from_reply(&self.roundtrip(req))
     }
 
+    fn recover_dead_owner(&mut self) -> SvcReport {
+        let req = Request::new(
+            new_request_id(),
+            Operation::RecoverDeadOwner,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        SvcReport::from_reply(&self.roundtrip(req))
+    }
+
     fn status(&mut self) -> SvcReport {
         let req = Request::new(
             new_request_id(),
@@ -612,6 +634,17 @@ impl DnsService for PipeClient {
             Some(creds.owner_id.clone()),
             Some(creds.epoch),
             serde_json::json!({ "token": creds.token }),
+        );
+        self.call(req)
+    }
+
+    fn recover_dead_owner(&mut self) -> SvcReport {
+        let req = Request::new(
+            new_request_id(),
+            Operation::RecoverDeadOwner,
+            None,
+            None,
+            serde_json::json!({}),
         );
         self.call(req)
     }

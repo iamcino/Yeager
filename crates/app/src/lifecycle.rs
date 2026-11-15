@@ -269,6 +269,10 @@ struct State {
     engine_running: usize,
     running: usize,
     shutdown: Slot,
+    /// Query-end started a joinable teardown (admission closed, slot Active)
+    /// without running restore yet. The next `shutdown` takes ownership and
+    /// runs the single restore; joiners wait. Cleared on publish.
+    session_started: bool,
 }
 
 /// Intermediate shutdown phases (no state lock held across DNS calls).
@@ -316,6 +320,7 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                 engine_running: 0,
                 running: 0,
                 shutdown: Slot::Idle,
+                session_started: false,
             }),
             settle_cv: Condvar::new(),
             done_cv: Condvar::new(),
@@ -344,30 +349,37 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
         self.dns.status()
     }
 
-    /// Session query-end (WM_QUERYENDSESSION): start quiesce without
-    /// restoring yet. Closes admission (epoch bump, drain queued work) and
-    /// runs the DNS-side quiesce immediately; the bounded end-session cleanup
-    /// or a cancel joins the same in-flight shutdown via `shutdown`, which
-    /// finishes the current restoration without reopening the old epoch.
-    /// Never reopens: a pure quiesce leaves `open == false` until an explicit
-    /// fresh enable or a `DnsOff` verified restore reopens on a new epoch.
+    /// Session query-end (WM_QUERYENDSESSION): close admission and start a
+    /// joinable teardown WITHOUT revoking the service lease. Closes admission
+    /// (epoch bump, drain queued work) and marks the shutdown slot `Active`
+    /// so the end-session decision (`shutdown`) joins that same teardown and
+    /// runs the single restore inside it. No DNS call happens here and no
+    /// restore runs yet — crucially, no `op_quiesce` lease revocation: the
+    /// lease survives until `shutdown`'s restore settles it (U08-REV2 item 3).
+    /// A pure quiesce leaves `open == false` until an explicit fresh enable
+    /// or a `DnsOff` verified restore reopens on a new epoch.
     pub fn quiesce_for_session(&self) {
-        let cancelled = {
-            let mut s = self.lock();
-            // If a shutdown is already in flight or done, joining it covers
-            // the session path; do not bump the epoch twice.
-            if !matches!(s.shutdown, Slot::Idle) {
-                s.queue.drain(..).count()
-            } else {
-                s.open = false;
-                s.epoch += 1;
-                let cancelled = s.queue.drain(..).count();
-                s.engine_queue.clear();
-                cancelled
-            }
+        let mut s = self.lock();
+        // If a shutdown is already in flight or done, joining it covers the
+        // session path; do not bump the epoch twice and do not start another.
+        if !matches!(s.shutdown, Slot::Idle) {
+            s.queue.drain(..);
+            s.engine_queue.clear();
+            return;
+        }
+        s.open = false;
+        s.epoch += 1;
+        s.queue.drain(..);
+        s.engine_queue.clear();
+        // Start the joinable teardown: Active with no quit yet. The next
+        // `shutdown` takes ownership (clearing `session_started`) and runs
+        // the single restore; concurrent joiners wait on `done_cv`.
+        s.shutdown = Slot::Active {
+            quit_involved: false,
         };
-        let _ = cancelled;
-        self.dns.quiesce();
+        s.session_started = true;
+        // Intentionally no `self.dns.quiesce()` here: any service-side
+        // quiesce that revokes the lease would refuse the following restore.
     }
 
     /// Shared admission path for enable and change. A successful request
@@ -570,9 +582,27 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                         s.shutdown = Slot::Active {
                             quit_involved: true,
                         };
+                        s.session_started = false;
                         break ShutdownKind::ProcessQuit;
                     }
                     Slot::Active { quit_involved } => {
+                        // Session query-end started this teardown (admission
+                        // already closed, no restore ran yet): the first
+                        // `shutdown` to arrive takes ownership and runs the
+                        // single restore instead of waiting for an owner that
+                        // will never come. Later joiners wait normally.
+                        if s.session_started {
+                            s.session_started = false;
+                            if kind == ShutdownKind::ProcessQuit {
+                                s.shutdown = Slot::Active {
+                                    quit_involved: true,
+                                };
+                                break ShutdownKind::ProcessQuit;
+                            }
+                            // DnsOff joining a session-started teardown keeps
+                            // the existing Active (quit not involved).
+                            break kind;
+                        }
                         if kind == ShutdownKind::ProcessQuit && !quit_involved {
                             s.shutdown = Slot::Active {
                                 quit_involved: true,
@@ -587,6 +617,7 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                         s.shutdown = Slot::Active {
                             quit_involved: kind == ShutdownKind::ProcessQuit,
                         };
+                        s.session_started = false;
                         break kind;
                     }
                 }
@@ -624,6 +655,7 @@ impl<D: DnsCtl + 'static, E: EngineCtl + 'static, U: UiNotify + 'static, P: Pers
                 persist_error: inter.persist_error,
             };
             s.shutdown = Slot::Done(report.clone());
+            s.session_started = false;
             report
         };
         self.done_cv.notify_all();
@@ -1621,27 +1653,46 @@ mod tests {
         }
     }
 
-    // ---- U08-REV item 5: session quiesce never reopens --------------------
+    // ---- U08-REV2 item 3: query-end never revokes the lease --------------
 
     #[test]
     fn session_quiesce_closes_admission_without_reopen_and_quit_joins() {
-        // WM_QUERYENDSESSION starts quiesce only (no restore, no reopen);
-        // a canceled end (JoinOnly) finishes via the quit-kind path without
-        // reopening the old epoch.
+        // WM_QUERYENDSESSION closes admission and starts a joinable teardown
+        // WITHOUT any service-side lease revocation: no DNS call happens at
+        // query-end, so the lease survives until `shutdown`'s restore.
+        // A canceled end (JoinOnly) joins that same teardown via the
+        // quit-kind path; the single restore succeeds, admission stays
+        // sealed, nothing reopens. Fails on the pre-REV2 tip, where
+        // `quiesce_for_session` called `dns.quiesce()` (revoking the lease).
         let world: WorldLog = Arc::new(StdMutex::new(Vec::new()));
         let lc = fixture(&world, EngineMode::Return);
         assert!(lc.snapshot().admission_open);
         lc.quiesce_for_session();
         assert!(!lc.snapshot().admission_open);
-        assert!(world.lock().unwrap().contains(&WorldEvent::Quiesce));
+        // No DNS side-effect at query-end (U08-REV2: previously this called
+        // `dns.quiesce()`, revoking the lease before any restore).
+        assert!(!world.lock().unwrap().contains(&WorldEvent::Quiesce));
         assert!(!world.lock().unwrap().contains(&WorldEvent::Restore));
         // Queued work is drained at quiesce: a later enable is refused.
         assert!(lc.request_enable(auto().0, auto().1).is_err());
-        // Joining via the quit-kind path finishes the current restoration
-        // without reopening.
+        // Joining via the quit-kind path finishes the same teardown: exactly
+        // one restore, which succeeds, without reopening.
         let report = lc.shutdown(ShutdownKind::ProcessQuit);
+        assert!(report.successful());
         assert!(!report.reopened);
-        assert!(world.lock().unwrap().contains(&WorldEvent::Restore));
+        assert!(!lc.snapshot().admission_open);
+        let restores = world
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == WorldEvent::Restore)
+            .count();
+        assert_eq!(restores, 1, "single teardown, single restore");
+        // Quiesce-before-restore ordering still holds inside the shutdown.
+        assert_ordered(
+            &world,
+            &[WorldEvent::Quiesce, WorldEvent::Restore, WorldEvent::Verify],
+        );
         // A second quiesce after shutdown does not reopen either.
         lc.quiesce_for_session();
         assert!(!lc.snapshot().admission_open);

@@ -23,8 +23,8 @@ mod upstream;
 
 pub use authority::{global as dns_authority, owner_id as gui_owner_id, Applied, Authority, AuthorityStatus};
 pub use coordinator::{
-    ChoiceBinder, CoordError, Coordinator, ListenerBinder, ManagedListener, ManagedStatus, RealBinder,
-    Supervision, STOP_BOUND,
+    BindError, ChoiceBinder, CoordError, Coordinator, ListenerBinder, ManagedListener, ManagedStatus,
+    RealBinder, Supervision, STOP_BOUND,
 };
 pub use plan::{
     bound_endpoints, check_plan_rules, classify_bind, desired_plan, is_planned_loopback,

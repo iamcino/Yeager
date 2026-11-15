@@ -1230,10 +1230,19 @@ fn main() -> Result<(), slint::PlatformError> {
 /// Exact result-bearing cleanup for `--cleanup` (uninstaller path).
 /// Returns the process exit code as the lifecycle outcome it actually is:
 /// 0 verified clean, 10 live-owner/busy, 11 pending/unavailable, 12
-/// conflict, 13 privilege/service/auth. A failed journal is retained and
+/// conflict, 13 privilege/auth. A failed journal is retained and
 /// TCP/logon cleanup still runs, but the nonzero DNS result stands.
 fn cleanup_and_exit() -> i32 {
-    let code = cleanup_code(hange::restore());
+    cleanup_and_exit_with(hange::restore)
+}
+
+/// Testable core of [`cleanup_and_exit`]: the restore call is injected so
+/// tests drive every exit-table row without touching the real service.
+/// Production passes `hange::restore`; TCP/logon cleanup still runs in both.
+fn cleanup_and_exit_with(
+    restore: impl FnOnce() -> Result<hange::AuthorityStatus, common::Error>,
+) -> i32 {
+    let code = cleanup_code(restore());
     if code != 0 {
         // TCP/logon cleanup still runs, but the nonzero DNS result stands.
         let _ = erwin::restore();
@@ -1248,9 +1257,14 @@ fn cleanup_and_exit() -> i32 {
 }
 
 /// Pure mapping for [`cleanup_and_exit`]: the lifecycle restore outcome to
-/// the §8.3 exit code. Tested below; `Busy` (live owner holds the machine
-/// lease) is 10, pending/unavailable is 11, conflict is 12, privilege/auth
-/// is 13.
+/// the §8.3 exit code. `Busy` (live owner holds the machine lease) is 10,
+/// pending/unavailable is 11, conflict is 12, privilege/auth is 13.
+/// Unavailable is 11 (not 13): the service is reachable but debt remains and
+/// the journal is retained — §8.3 and `protocol::exit_code_for_outcome` put
+/// pending/unavailable/deferred at 11, while 13 is privilege/service/auth
+/// (`refused`/`auth_rejected`/`service_unavailable`). No digit-substring
+/// matching: an arbitrary message containing "10" or "13" must never decide
+/// the code.
 fn cleanup_code(result: Result<hange::AuthorityStatus, common::Error>) -> i32 {
     match result {
         Ok(status) if status.pending.is_none() => 0,
@@ -1258,8 +1272,12 @@ fn cleanup_code(result: Result<hange::AuthorityStatus, common::Error>) -> i32 {
             let debt = status.pending.unwrap_or_default();
             eprintln!("cleanup: DNS debt retained, journal kept: {debt}");
             // A retained lease that is still live reports as busy debt;
-            // everything else pending stays 11.
-            if debt.contains("Busy") || debt.contains("busy") || debt.contains("live-owner") {
+            // everything else pending (including unavailable) stays 11.
+            if debt.contains("Busy")
+                || debt.contains("busy")
+                || debt.contains("live-owner")
+                || debt.contains("live_owner")
+            {
                 10
             } else {
                 11
@@ -1273,17 +1291,20 @@ fn cleanup_code(result: Result<hange::AuthorityStatus, common::Error>) -> i32 {
             } else if msg.contains("Busy")
                 || msg.contains("busy")
                 || msg.contains("live-owner")
-                || msg.contains("10")
+                || msg.contains("live_owner")
             {
                 10
-            } else if msg.contains("Unavailable")
-                || msg.contains("unavailable")
-                || msg.contains("privilege")
+            } else if msg.contains("privilege")
+                || msg.contains("Privilege")
                 || msg.contains("auth")
-                || msg.contains("13")
+                || msg.contains("Auth")
+                || msg.contains("refused")
+                || msg.contains("Refused")
+                || msg.contains("service_unavailable")
             {
                 13
             } else {
+                // Includes `Unavailable`/`unavailable`: debt retained, 11.
                 11
             }
         }
@@ -2065,14 +2086,19 @@ mod tests {
 
     #[test]
     fn cleanup_codes_match_the_documented_lifecycle_outcomes() {
-        // Item 4 (--cleanup row): code and comment agree, routed as the
-        // lifecycle outcome it actually is. 0 verified clean, 10
+        // Item 4 (--cleanup row, U08-REV2): code and comment agree, routed as
+        // the lifecycle outcome it actually is. 0 verified clean, 10
         // live-owner/busy, 11 pending/unavailable, 12 conflict, 13
-        // privilege/service/auth. The journal is retained on every nonzero.
+        // privilege/auth. Unavailable is 11 (not 13): §8.3 and
+        // `protocol::exit_code_for_outcome` put pending/unavailable/deferred
+        // at 11; 13 is privilege/auth. No digit-substring matching. The
+        // journal is retained on every nonzero.
         assert_eq!(cleanup_code(ok_clean()), 0);
         assert_eq!(cleanup_code(ok_pending("adapter gone")), 11);
         assert_eq!(cleanup_code(ok_pending("Busy: live owner holds lease")), 10);
         assert_eq!(cleanup_code(ok_pending("live-owner debt")), 10);
+        // Pending carrying an unavailable note stays 11.
+        assert_eq!(cleanup_code(ok_pending("unavailable: debt retained")), 11);
         assert_eq!(
             cleanup_code(Err(common::Error::new("Conflict: foreign edit"))),
             12
@@ -2083,17 +2109,55 @@ mod tests {
             ))),
             10
         );
+        // U08-REV2 fix: Unavailable maps to 11, matching the comment and §8.3.
         assert_eq!(
             cleanup_code(Err(common::Error::new("Unavailable: no service"))),
-            13
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("unavailable: debt retained"))),
+            11
         );
         assert_eq!(
             cleanup_code(Err(common::Error::new("privilege: need admin"))),
             13
         );
+        // Arbitrary digits in the message never decide the code.
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("restore failed 10 times"))),
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("error 13 in module 7"))),
+            11
+        );
         assert_eq!(
             cleanup_code(Err(common::Error::new("restore failed"))),
             11
+        );
+    }
+
+    #[test]
+    fn cleanup_and_exit_routes_every_row_without_touching_the_service() {
+        // `cleanup_and_exit` itself (U08-REV2 item 2): injected restore results
+        // drive the exit code; TCP/logon cleanup still runs behind it.
+        assert_eq!(cleanup_and_exit_with(ok_clean), 0);
+        assert_eq!(cleanup_and_exit_with(|| ok_pending("adapter gone")), 11);
+        assert_eq!(
+            cleanup_and_exit_with(|| ok_pending("Busy: live owner holds lease")),
+            10
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("Conflict: x"))),
+            12
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("Unavailable: down"))),
+            11
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("privilege: need admin"))),
+            13
         );
     }
 }
