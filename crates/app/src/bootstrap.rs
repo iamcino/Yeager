@@ -368,6 +368,11 @@ pub struct TestBootHost {
     pub fs: std::rc::Rc<dns_recovery::fs::FakeFs>,
     pub probe: std::rc::Rc<dns_recovery::replay::FakeOwnerProbe>,
     pub peer: dns_recovery::protocol::PeerAuth,
+    /// Recording seam (U08-REV3 item 1): every `register_owner` attempt and
+    /// every `recover_dead_owner` call through the test service is appended
+    /// here in order, so the dead-owner test asserts ORDER (settle-first),
+    /// not only the end state.
+    pub order: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
 impl<D, E, U, P> RealBootCtl<D, E, U, P>
@@ -448,6 +453,10 @@ where
                 image_file_id: Option<&str>,
             ) -> Result<hange::Registration, hange::SvcError> {
                 let peer = self.cell.borrow().peer.clone();
+                let order = self.cell.borrow().order.clone();
+                order
+                    .borrow_mut()
+                    .push("register_owner".to_string());
                 let mut th = self.cell.borrow_mut();
                 let mut client = hange::HostClient::new(&mut th.host, peer);
                 client.register_owner(
@@ -504,6 +513,10 @@ where
             }
             fn recover_dead_owner(&mut self) -> hange::SvcReport {
                 let peer = self.cell.borrow().peer.clone();
+                let order = self.cell.borrow().order.clone();
+                order
+                    .borrow_mut()
+                    .push("recover_dead_owner".to_string());
                 let mut th = self.cell.borrow_mut();
                 let mut client = hange::HostClient::new(&mut th.host, peer);
                 client.recover_dead_owner()
@@ -2010,6 +2023,7 @@ mod tests {
             fs,
             probe,
             peer: test_peer(),
+            order: Rc::new(std::cell::RefCell::new(Vec::new())),
         }))
     }
 
@@ -2129,7 +2143,7 @@ mod tests {
         // Dead owner: `inspect` reports OwnedDead with liveness derived from
         // the host's probe family, then `recover` settles the dead owner's
         // debt through the service dead-owner mechanism (no fresh-owner
-        // register-first) and completes the restore. Fails on the pre-REV2
+        // register-first) and completes the restore. Fails on the pre-REV3
         // tip, where `recover` registered first and was refused over the
         // unsettled debt before any restore.
         let cell = make_test_cell();
@@ -2146,6 +2160,19 @@ mod tests {
         // End-to-end boot recovery: dead-owner journal actually restored.
         let recovery = boot.recover();
         assert_eq!(recovery, BootRecovery::RestoredVerified);
+        // ORDER (U08-REV3 item 1): settle-first. No `register_owner` call may
+        // reach the service ahead of `recover_dead_owner` in the dead-owner
+        // scenario. The recording seam on the host observes every attempt.
+        let order = cell.borrow().order.borrow().clone();
+        let first_recover = order.iter().position(|e| e == "recover_dead_owner").expect(
+            "dead-owner recover must call recover_dead_owner through the service",
+        );
+        assert!(
+            !order[..first_recover]
+                .iter()
+                .any(|e| e == "register_owner"),
+            "settle-first: no register_owner may precede recover_dead_owner, got {order:?}"
+        );
         // The journal is clean again: a fresh inspect is Clean and a fresh
         // registration succeeds (debt settled, not retained).
         let after = boot.inspect();

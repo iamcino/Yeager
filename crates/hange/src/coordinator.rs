@@ -405,45 +405,93 @@ impl<S: DnsService, B: ListenerBinder> Coordinator<S, B> {
         let creds = match self.lease.clone() {
             Some(c) => c,
             None => {
-                // No lease: register (reattach when this live process owns
-                // the journal record) so the restore below is authorized.
-                match self.register(0) {
-                    Ok(c) => c,
-                    Err(e) if is_dead_owner_debt(&e) => {
-                        // Dead owner's debt blocks new registration: settle it
-                        // through the dead-owner mechanism first (no lease),
-                        // then retry registration once.
-                        let recovered = self.service.recover_dead_owner();
-                        if recovered.outcome != SvcOutcome::VerifiedRestored {
+                // Settle-first (U08-REV3 item 1): determine the dead-owner
+                // case from STATE before any registration. An owned
+                // transaction whose recorded owner is not this live process
+                // carries unsettled recovery debt; the service refuses fresh
+                // registration until `recover_dead_owner` settles it, so no
+                // `register_owner` call may reach the service ahead of
+                // `recover_dead_owner` here. Register only after the debt is
+                // settled; a same-owner record reattaches via register below.
+                let snapshot = self.service.inspect_snapshot();
+                let owned_by_other = match (&snapshot.journal_state, &snapshot.owner) {
+                    (Some(state), Some(owner)) if owner.owner_id != self.owner_id => {
+                        matches!(
+                            state.as_str(),
+                            "owned" | "restoring" | "recovery_pending" | "maintenance"
+                        )
+                    }
+                    _ => false,
+                };
+                if owned_by_other {
+                    let recovered = self.service.recover_dead_owner();
+                    if recovered.outcome != SvcOutcome::VerifiedRestored {
+                        return Err(CoordError {
+                            outcome: recovered.outcome,
+                            message: format!(
+                                "disable dead-owner recovery not verified: {}",
+                                recovered.message
+                            ),
+                        });
+                    }
+                    match self.register(0) {
+                        Ok(c) => c,
+                        Err(e2) => {
                             return Err(CoordError {
-                                outcome: recovered.outcome,
+                                outcome: e2.outcome,
                                 message: format!(
-                                    "disable dead-owner recovery not verified: {}",
-                                    recovered.message
+                                    "disable re-registration after dead-owner restore failed: {}",
+                                    e2.message
                                 ),
                             });
                         }
-                        match self.register(0) {
-                            Ok(c) => c,
-                            Err(e2) => {
+                    }
+                } else {
+                    // No lease and no foreign-owned debt: register (reattach
+                    // when this live process owns the journal record) so the
+                    // restore below is authorized.
+                    match self.register(0) {
+                        Ok(c) => c,
+                        Err(e) if is_dead_owner_debt(&e) => {
+                            // Fallback for services whose snapshot carries no
+                            // journal detail (scripted fakes): the refused
+                            // registration revealed dead-owner debt, so settle
+                            // it through the dead-owner mechanism (no lease),
+                            // then retry registration once. Real services with
+                            // a journal snapshot never reach this arm because
+                            // the owned-by-other check above recovered first.
+                            let recovered = self.service.recover_dead_owner();
+                            if recovered.outcome != SvcOutcome::VerifiedRestored {
                                 return Err(CoordError {
-                                    outcome: e2.outcome,
+                                    outcome: recovered.outcome,
                                     message: format!(
-                                        "disable re-registration after dead-owner restore failed: {}",
-                                        e2.message
+                                        "disable dead-owner recovery not verified: {}",
+                                        recovered.message
                                     ),
                                 });
                             }
+                            match self.register(0) {
+                                Ok(c) => c,
+                                Err(e2) => {
+                                    return Err(CoordError {
+                                        outcome: e2.outcome,
+                                        message: format!(
+                                            "disable re-registration after dead-owner restore failed: {}",
+                                            e2.message
+                                        ),
+                                    });
+                                }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        return Err(CoordError {
-                            outcome: e.outcome,
-                            message: format!(
-                                "disable consulted the journal but holds no lease: {}",
-                                e.message
-                            ),
-                        });
+                        Err(e) => {
+                            return Err(CoordError {
+                                outcome: e.outcome,
+                                message: format!(
+                                    "disable consulted the journal but holds no lease: {}",
+                                    e.message
+                                ),
+                            });
+                        }
                     }
                 }
             }
