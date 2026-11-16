@@ -7,6 +7,8 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Semantic Versioning](https://semver.org/lang/vi/).
 
 ## [Unreleased]
+### Thay đổi
+- **Engine Levi được tinh chỉnh:** nghệ thuật kết nối của Levi được mài giũa thêm một lớp bóng — mỗi cái bắt tay mở đầu giờ trôi đi với một nhịp điệu mượt mà và duyên dáng hơn, dìu cả những kết nối cứng đầu nhất về một nhịp êm đềm, ổn định.
 
 ### Sửa lỗi
 - **Bộ lọc capture chỉ giữ ClientHello:** chiều đi của WinDivert giờ đòi tiền tố handshake TLS + ClientHello (`tcp.Payload[0] == 0x16`, `tcp.Payload[1] == 0x03`, `tcp.Payload[5] == 0x01`) sau điều kiện độ dài `tcp.PayloadLength >= 40` đã có, nên dữ liệu upload không còn đi qua userspace. Mệnh đề RST chiều về giữ nguyên. Tài liệu nay ghi rõ chiều đi chỉ xem xét gói mang ClientHello, `Auto` chọn `Fast` tuyệt đối, và đường không cấp phát bộ nhớ là đường inline Auto/Fast.

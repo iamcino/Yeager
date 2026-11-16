@@ -131,6 +131,74 @@ impl ResilienceEngine {
         Ok(())
     }
 
+    /// Attempts zero-delta TLS record-level splitting (two TLS Handshake records)
+    /// when sufficient padding (`0x0015`) is available, transmitting each record
+    /// in its own TCP segment. Falls back to TCP-level 3-way multi-split when
+    /// record-level splitting is not applicable.
+    pub fn fragment_and_send_record_split(
+        api: &WinDivertApi,
+        handle: SafeHandle,
+        packet_buf: &[u8],
+        parsed: &ParsedPacket,
+        sni_split: Option<usize>,
+        addr: &mut WinDivertAddress,
+        use_disorder: bool,
+    ) -> Result<(), String> {
+        let payload = parsed.payload;
+        let mut rec_buf = [0u8; 2048];
+        if payload.len() <= rec_buf.len() {
+            if let Some(rec2_off) =
+                crate::tls::try_build_zero_delta_record_split(payload, &mut rec_buf[..payload.len()])
+            {
+                addr.set_outbound(true);
+                addr.set_ipv6(parsed.ip_version == 6);
+                addr.set_impostor(true);
+
+                let rec1 = &rec_buf[..rec2_off];
+                let rec2 = &rec_buf[rec2_off..payload.len()];
+
+                if use_disorder {
+                    Self::send_tcp_segment(
+                        api,
+                        handle,
+                        packet_buf,
+                        parsed,
+                        rec2_off as u32,
+                        rec2,
+                        addr,
+                    )?;
+                    Self::hybrid_wait_jitter(3300, 200);
+                    Self::send_tcp_segment(api, handle, packet_buf, parsed, 0, rec1, addr)?;
+                } else {
+                    Self::send_tcp_segment(api, handle, packet_buf, parsed, 0, rec1, addr)?;
+                    Self::send_tcp_segment(
+                        api,
+                        handle,
+                        packet_buf,
+                        parsed,
+                        rec2_off as u32,
+                        rec2,
+                        addr,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+
+        if use_disorder {
+            Self::fragment_and_send_multisplit(api, handle, packet_buf, parsed, sni_split, addr)
+        } else {
+            Self::fragment_and_send_multisplit_inorder(
+                api,
+                handle,
+                packet_buf,
+                parsed,
+                sni_split,
+                addr,
+            )
+        }
+    }
+
     /// Hybrid micro-second wait combining thread sleep (for CPU power saving) and spin-loop (for sub-millisecond precision).
     #[inline]
     fn hybrid_wait_jitter(base_micros: u64, max_jitter_micros: u64) {

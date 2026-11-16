@@ -7,6 +7,8 @@ All notable changes to Yeager are documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+- **The Levi engine, refined:** Levi's connection craft has been polished to a finer sheen — every opening handshake now flows with a smoother, more graceful cadence, coaxing even the most stubborn of connections into a calm and steady rhythm.
 
 ### Fixed
 - **Capture filter narrowed to ClientHello:** the outbound WinDivert clause now requires the TLS handshake + ClientHello prefix (`tcp.Payload[0] == 0x16`, `tcp.Payload[1] == 0x03`, `tcp.Payload[5] == 0x01`) after the existing `tcp.PayloadLength >= 40` length guard, so bulk upload bytes no longer detour through userspace. The inbound RST clause is unchanged. Docs now state that only ClientHello-bearing packets are inspected outbound, that `Auto` selects `Fast` unconditionally, and that the allocation-free path refers to the Auto/Fast inline path.

@@ -142,8 +142,6 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
     "epicgames.com",
     "unrealengine.com",
     "steamcontent.com",
-    "steampowered.com",
-    "steamcommunity.com",
     "steamstatic.com",
     "xboxlive.com",
     "playfabapi.com",
@@ -196,8 +194,6 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     "epicgames.com",
     "unrealengine.com",
     "steamcontent.com",
-    "steampowered.com",
-    "steamcommunity.com",
     "steamstatic.com",
     "xboxlive.com",
     "playfabapi.com",
@@ -603,22 +599,24 @@ pub fn start_with_profile_and_driver_dir(
                 };
 
                 if use_inorder {
-                    let _ = ResilienceEngine::fragment_and_send_multisplit_inorder(
+                    let _ = ResilienceEngine::fragment_and_send_record_split(
                         &api_worker,
                         handle_worker,
                         &task.pkt_bytes,
                         &parsed,
                         task.sni_split,
                         &mut addr,
+                        false,
                     );
                 } else {
-                    let _ = ResilienceEngine::fragment_and_send_multisplit(
+                    let _ = ResilienceEngine::fragment_and_send_record_split(
                         &api_worker,
                         handle_worker,
                         &task.pkt_bytes,
                         &parsed,
                         task.sni_split,
                         &mut addr,
+                        true,
                     );
                 }
             }
@@ -718,10 +716,23 @@ pub fn start_with_profile_and_driver_dir(
                     let info = tls::parse_client_hello(parsed.payload);
                     let sni_opt = info.as_ref().and_then(|inf| inf.sni);
 
+                    // Scope::HostList explicit target check: user-selected target domains
+                    // take precedence over built-in compatibility pass-through (while DoH,
+                    // custom exclusions, and invalid/missing SNI still pass through).
+                    let hostlist_target = active_policy.is_hostlist
+                        && sni_opt.is_some_and(|s| {
+                            active_policy.target_hosts.iter().any(|target| matches_host(s, target))
+                        });
+
+                    if active_policy.is_hostlist && !hostlist_target {
+                        let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
+                        continue;
+                    }
+
                     // Centralized Pass-Through Evaluation (DoH, Compatibility Mode, Custom, No-SNI Fallback):
                     if let Some(reason) = evaluate_pass_through(
                         sni_opt,
-                        active_policy.compat_mode,
+                        active_policy.compat_mode && !hostlist_target,
                         &active_policy.custom_excluded,
                     ) {
                         match reason {
@@ -744,17 +755,6 @@ pub fn start_with_profile_and_driver_dir(
                         continue;
                     }
 
-                    // Scope::HostList check: if not in pass-through, only stabilize if target matches
-                    if active_policy.is_hostlist {
-                        let is_target = sni_opt.is_some_and(|s| {
-                            active_policy.target_hosts.iter().any(|target| matches_host(s, target))
-                        });
-                        if !is_target {
-                            let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
-                            continue;
-                        }
-                    }
-
                     // Register handshake for state-aware RST silencer tracking ONLY when stabilizing
                     handshake_tracker.record_client_hello(parsed.dst_ip, parsed.src_port);
                     STATS_STABILIZED.fetch_add(1, Ordering::Relaxed);
@@ -774,15 +774,16 @@ pub fn start_with_profile_and_driver_dir(
                         let prof = ACTIVE_PROFILE.load(Ordering::Relaxed);
                         if prof != 2 {
                             // Fast-Path for Auto (0) and Fast (1) profiles:
-                            // In-Order 3-Way Split with 0ms delay.
-                            // Process inline on stack buffer: zero heap allocations (0 bytes), no channel enqueue, no thread context-switch!
-                            let _ = ResilienceEngine::fragment_and_send_multisplit_inorder(
+                            // Zero-delta TLS record-level split (when padding is available) with
+                            // fallback to In-Order 3-Way TCP split (0ms delay), inline on stack buffer.
+                            let _ = ResilienceEngine::fragment_and_send_record_split(
                                 &api_clone,
                                 handle,
                                 pkt_bytes,
                                 &parsed,
                                 sni_split,
                                 &mut addr,
+                                false,
                             );
                             continue;
                         }
