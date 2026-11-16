@@ -43,7 +43,7 @@ recovery helper.
 
 | Distribution | How the service is provisioned (shipped behavior) |
 |---|---|
-| Installer (`Yeager-Setup-<version>.exe`) | Provisions through the `--install-service` seam after the copy: verifies the NEW helper under the full `verify.ps1` rule (pinned thumbprint derived at build time from `docs/signing/Yeager-codesign.cer` via `Get-PinnedThumbprint` + RFC 3161 timestamp validity + SHA-256 where supplied — never a thumbprint string compare alone), handles clean install AND upgrade replace. The clean-install seam distinguishes ABSENT (1060, proceed to create; when the running image already IS the target file it adopts in place with no copy) from STOPPED (wait applies only when a record exists). Quoted SCM path, protected binary-dir ACL, 1 s / 5 s / 30 s + non-crash flag + preshutdown, start, Hello, `--inspect` of the NEW binary; on start/Hello failure restores exe AND registration (full ImagePath + failure actions + preshutdown) and restarts the previous service. Pre-copy: backup (full ImagePath + failure/preshutdown capture), `--inspect` CLEAN gate (helper-exists-even-without-service included), `--enter-maintenance "installer-upgrade"` with THAT reason (or `--recover-offline` when STOPPED with proven STOPPED; any other SCM state aborts), graceful GUI exit, `sc stop` + STOPPED poll. The restore wait polls `--inspect` to EXIT_CLEAN or the real 30 s timeout — no early break. |
+| Installer (`Yeager-Setup-<version>.exe`) | Provisions through the `--install-service` seam after the copy: verifies the NEW helper under the full `verify.ps1` rule (pinned thumbprint derived at build time from `docs/signing/Yeager-codesign.cer` via `Get-PinnedThumbprint` + RFC 3161 timestamp validity + SHA-256 where supplied — never a thumbprint string compare alone), handles clean install AND upgrade replace. The clean-install seam distinguishes ABSENT (1060, proceed to create; when the running image already IS the target file it adopts in place with no copy) from STOPPED (wait applies only when a record exists). Quoted SCM path, protected binary-dir ACL, 1 s / 5 s / 30 s + non-crash flag + preshutdown, start, Hello, `--inspect` of the NEW binary; on start/Hello failure restores the exe AND the CAPTURED registration (ImagePath, start type, failure actions/flag, preshutdown — written back through the seam's Win32 snapshot, never the canonical values; the service is restarted only when the captured state was running). Pre-copy: backup (seam `--query-service-config` JSON snapshot plus ImagePath/failure sc.exe text as log evidence), `--inspect` CLEAN gate (helper-exists-even-without-service included), `--enter-maintenance "installer-upgrade"` with THAT reason (or `--recover-offline` when STOPPED with proven STOPPED; any other SCM state aborts), graceful GUI exit, `sc stop` + STOPPED poll. The restore wait polls `--inspect` to EXIT_CLEAN or the real 30 s timeout — an unfinished restore holds the installer. |
 | Portable (`Yeager-<version>-portable-x64.zip`) | Carries the signed helper inside the zip. `main` runs the Q2 bootstrap on portable first run: service absent + elevated + helper present → computes the helper signature verdict for real (pinned thumbprint + timestamp, the release verify rule — never a hardcoded `Valid`) → `plan_portable` allows `ProvisionViaElevatedBootstrap` → spawns the carried helper's `--install-service` (copies into protected Program Files, ACLs, registers, Hello-validates). Unelevated or bad-signature refuses; no silent install, no watchdog from a writable folder. Stale portable files are removed only through the guarded path (`portable_delete_guarded` refuses protected targets). |
 
 Rules that always hold (enforced by the shipped code, not only the planner):
@@ -62,10 +62,10 @@ Rules that always hold (enforced by the shipped code, not only the planner):
   real before the planner sees it.
 - The installer never force-kills the GUI blindly: already-gone GUI returns
   immediately (tasklist output, not exit 0), graceful first, up to 30 s
-  wait, monitored force kill only with proven RUNNING service (not `sc
-  query` exit 0), force-kill exit checked, restore polled via `--inspect`
-  to EXIT_CLEAN or the real timeout (an unfinished restore holds the
-  installer).
+   wait, monitored force kill only with proven RUNNING service (not `sc
+   query` exit 0), force-kill exit checked, restore polled via `--inspect`
+   to EXIT_CLEAN or the real 30 s timeout — an unfinished restore holds the
+   installer (the wait returns failure and the install/uninstall aborts).
 
 ## Conflicts and recovery debt
 
@@ -107,12 +107,15 @@ Install/upgrade (`installer/setup.iss` `[Code]` calls the helper seams;
 the planner `dns_recovery::provision::plan_install` is the fake-backed
 policy the `[Code]` mirrors step-for-step):
 
-1. Before any copy: back up the previous helper executable + COMPLETE SCM
-   registration (full ImagePath value, failure actions, preshutdown flag);
-   run `--inspect` whenever the helper file exists (including the
-   helper-exists-but-service-absent path) and abort on any non-clean exit —
-   Maintenance (live exit 11 pending) blocks like any other debt, preserving
-   the old helper and the journal.
+1. Before any copy: back up the previous helper executable + the COMPLETE
+   CAPTURED SCM registration via the seam's Win32 snapshot
+   (`--query-service-config` JSON: ImagePath, start type, failure
+   reset/actions, non-crash flag, preshutdown; the sc.exe text is log
+   evidence only); run `--inspect` whenever the helper file exists
+   (including the helper-exists-but-service-absent path) and abort on any
+   non-clean exit — Maintenance (live exit 11 pending) blocks like any other
+   debt, preserving the old helper and the journal. A failed capture fails
+   closed before any change.
 2. On upgrade paths: `--enter-maintenance "installer-upgrade"` when RUNNING
    (the seam records THAT reason; rejecting new takeover) or
    `--recover-offline` when STOPPED (proven STOPPED only — Absent maps to
@@ -134,14 +137,16 @@ policy the `[Code]` mirrors step-for-step):
    holds by design right after replacement, so requiring clean first would
    fail every upgrade that entered maintenance. Then validate `--inspect`
    of the NEW binary in place (must prove clean); on start/Hello/leave/
-   inspect failure restore both the executable and the COMPLETE registration
-   (`sc config` binPath + failure actions + preshutdown) and restart the
-   previous service. The journal survives every branch.
+   inspect failure restore both the executable and the CAPTURED registration
+   through the seam (`--restore-service-registration`: ImagePath, start type,
+   failure actions/flag, preshutdown — never the canonical values) and restart
+   the previous service only when the captured state was running. The journal
+   survives every branch.
 5. The postinstall GUI launches only when `ServiceReadyCheck` proves RUNNING
    + `--inspect` clean. A failed service installation/start fails the
    install — no takeover race. Raise texts name only what was restored
-   (upgrade: previous binary + registration; clean: no previous state, fresh
-   registration removed). No cleanup error is hidden through installer flags.
+   (upgrade: previous binary + captured registration; clean: no previous state,
+   fresh registration removed). No cleanup error is hidden through installer flags.
 
 Uninstall (clean-only; `[Code]` drives result-checked seams):
 

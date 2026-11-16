@@ -117,12 +117,13 @@ Type: filesandordirs; Name: "{localappdata}\Yeager"
   the NEW binary → GUI only after ready (ServiceReadyCheck).
   Rollback restores both the executable and the registration. }
 
-{ U09-REV2 item 1: the pinned thumbprint is derived, never hand-typed.
+{ U09-REV4 item 1: the pinned thumbprint is derived, never hand-typed.
   Build with /DPINNED_THUMBPRINT=<thumbprint> where the value comes from
   docs/signing/Yeager-codesign.cer via tools/signing/common.ps1
   Get-PinnedThumbprint (the same source the signing tooling loads).
-  build.ps1 / tools/release-gitlab.ps1 compute it; no 39/40-hex literal
-  lives in this script. }
+  tools/release-gitlab.ps1 computes it at release-build time (docs/BUILD.md
+  shows the manual ISCC invocation); build.ps1 only builds the exes and never
+  passes ISCC defines. No 39/40-hex literal lives in this script. }
 #ifndef PINNED_THUMBPRINT
   #error "PINNED_THUMBPRINT must be passed via /DPINNED_THUMBPRINT=... (derived from docs/signing/Yeager-codesign.cer via Get-PinnedThumbprint)"
 #endif
@@ -154,6 +155,10 @@ var
   BackupBinPath: String;
   BackupFailureText: String;
   BackupFailureFlagText: String;
+  { U09-REV4 item 2: temp file holding the seam's `--query-service-config`
+    JSON snapshot (the rollback capture). Empty when no record/helper existed
+    at backup time. }
+  BackupRegFile: String;
   EnteredMaintenanceUn: Boolean;
 
 procedure ExitProcessSilent(ExitCode: Cardinal);
@@ -310,6 +315,10 @@ begin
   { U09-REV2 item 5: the restore wait waits. No early break after a force
     kill: the installer waits for the clean inspect (EXIT_CLEAN) or the real
     30 s timeout; an unfinished restore holds the installer. }
+  { U09-REV4 item 3: a timeout without clean returns False so
+    PrepareToInstall (and the uninstaller) aborts instead of proceeding with
+    the stale True set at function entry. No helper file means no restore to
+    wait for — that path still succeeds. }
   Polls := 0;
   while Polls < 60 do
   begin
@@ -321,6 +330,15 @@ begin
     end;
     Sleep(500);
     Polls := Polls + 1;
+  end;
+  if not FileExists(HelperPath()) then
+    exit;
+  InspectOk := RunAndGetCode(HelperPath(), '--inspect', InspectCode);
+  if not (InspectOk and (InspectCode = EXIT_CLEAN)) then
+  begin
+    Log('CloseGuiGracefully: restore did not reach EXIT_CLEAN within 30 s; holding the installer');
+    Result := False;
+    exit;
   end;
 end;
 
@@ -434,12 +452,17 @@ begin
   Result := True;
 end;
 
-{ U09-REV2 item 4: rollback restores the registration, not only the file.
-  Captures the COMPLETE previous ImagePath (full BINARY_PATH_NAME value,
-  not a 512-character slice), plus the failure actions and the preshutdown
-  flag text. On rollback writes them back (sc config / ChangeServiceConfig
-  path) in addition to restoring the exe and starting the service. }
-procedure BackupPreviousState();
+{ U09-REV4 item 2: rollback restores the CAPTURED registration — all of it,
+  distinguishably. The capture is the seam's own Win32 snapshot
+  (`--query-service-config` → JSON file): ImagePath, start type (+ delayed
+  flag), failure reset/actions, non-crash flag, preshutdown. sc.exe can
+  neither query nor set preshutdown, so the sc.exe text below is log
+  evidence only — restore writes back the CAPTURED values through the seam
+  (`--restore-service-registration`), never the canonical §8.1 values, and
+  restarts the service only when the captured state was running. Returns
+  False when a needed capture failed (fail closed: proceed without rollback
+  ability is refused). }
+function BackupPreviousState(): Boolean;
 var
   Code: Integer;
   Tmp: String;
@@ -448,10 +471,12 @@ var
   P, Q: Integer;
   LineStart, LineEnd: Integer;
 begin
+  Result := True;
   BackupExePath := '';
   BackupBinPath := '';
   BackupFailureText := '';
   BackupFailureFlagText := '';
+  BackupRegFile := '';
   if FileExists(HelperPath()) then
   begin
     BackupExePath := ExpandConstant('{tmp}\YeagerHelperPrev.exe');
@@ -460,7 +485,7 @@ begin
   end;
   { U09-REV2 item 4 fix: output redirection (`>`) is cmd.exe syntax — sc.exe
     receives it as a literal argument and fails. Route through cmd /c like
-    ScQueryStateFull does. }
+    ScQueryStateFull does. The sc.exe text is log evidence only. }
   Tmp := ExpandConstant('{tmp}\yeager_scqc.txt');
   if Exec(ExpandConstant('{cmd}'), '/c sc qc {#ServiceName} > "' + Tmp + '" 2>&1',
     '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
@@ -472,7 +497,8 @@ begin
       if P > 0 then
       begin
         { Full value after the ':' on that line, up to the newline — never
-          a 512-character slice. }
+          a 512-character slice. Evidence log; the restore source is the
+          seam snapshot below. }
         Q := P;
         while (Q <= Length(Lines)) and (Lines[Q] <> ':') and (Lines[Q] <> #10) do
           Q := Q + 1;
@@ -484,13 +510,12 @@ begin
           while (LineEnd <= Length(Lines)) and (Lines[LineEnd] <> #10) and (Lines[LineEnd] <> #13) do
             LineEnd := LineEnd + 1;
           BackupBinPath := Trim(Copy(Lines, LineStart, LineEnd - LineStart));
-          Log('BackupPreviousState: previous ImagePath captured: ' + BackupBinPath);
+          Log('BackupPreviousState: previous ImagePath (evidence): ' + BackupBinPath);
         end;
       end;
     end;
     DeleteFile(Tmp);
   end;
-  { Failure actions + preshutdown flag: captured whole for the rollback write-back. }
   Tmp := ExpandConstant('{tmp}\yeager_scqfailure.txt');
   if Exec(ExpandConstant('{cmd}'), '/c sc qfailure {#ServiceName} > "' + Tmp + '" 2>&1',
     '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
@@ -498,9 +523,9 @@ begin
     if LoadStringFromFile(Tmp, Content) then
     begin
       BackupFailureText := Trim(Content);
-      Log('BackupPreviousState: previous failure actions captured');
+      Log('BackupPreviousState: previous failure actions (evidence) captured');
     end;
-    { Kept for evidence; Restore reads the parsed values below. }
+    DeleteFile(Tmp);
   end;
   Tmp := ExpandConstant('{tmp}\yeager_scqfailureflag.txt');
   if Exec(ExpandConstant('{cmd}'), '/c sc qfailureflag {#ServiceName} > "' + Tmp + '" 2>&1',
@@ -509,21 +534,44 @@ begin
     if LoadStringFromFile(Tmp, Content) then
     begin
       BackupFailureFlagText := Trim(Content);
-      Log('BackupPreviousState: previous failure flag captured');
+      Log('BackupPreviousState: previous failure flag (evidence) captured');
+    end;
+    DeleteFile(Tmp);
+  end;
+  { The rollback capture: the seam's Win32 snapshot (QueryServiceConfigW +
+    QueryServiceConfig2W) through the previous helper. This is what restore
+    writes back — sc.exe text above is never parsed for restore. }
+  if IsServiceInstalled() and FileExists(HelperPath()) then
+  begin
+    Tmp := ExpandConstant('{tmp}\yeager_regcapture.json');
+    DeleteFile(Tmp);
+    if Exec(ExpandConstant('{cmd}'), '/c "' + HelperPath() + '" --query-service-config > "' + Tmp + '" 2>&1',
+      '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
+    begin
+      if LoadStringFromFile(Tmp, Content) and (Pos('"registration"', Content) > 0) then
+      begin
+        BackupRegFile := Tmp;
+        Log('BackupPreviousState: registration snapshot captured via the seam (' + IntToStr(Length(Content)) + ' bytes)');
+      end
+      else
+      begin
+        Log('BackupPreviousState: seam query returned no registration (exit ' + IntToStr(Code) + '); failing closed');
+        Result := False;
+      end;
+    end
+    else
+    begin
+      Log('BackupPreviousState: seam query failed to launch (exit ' + IntToStr(Code) + '); failing closed');
+      Result := False;
     end;
   end;
-  { NOTE: sc.exe exposes no preshutdown query or setter (there is no
-    qpreshutdown/preshutdown subcommand). The 30 s preshutdown budget is
-    armed by the shared §8.1 configuration — the seam's
-    configure_failure_actions (ChangeServiceConfig2), which the failed
-    install already ran before the start/Hello failure — so the restore
-    does not need to (and cannot) write it back via sc.exe. The binPath +
-    failure actions + non-crash flag above are the sc.exe-restorable set. }
 end;
 
 procedure RestorePreviousState();
 var
   Code: Integer;
+  RestoreCode: Integer;
+  RestoreOk: Boolean;
   BinPathArg: String;
   BinPathI: Integer;
 begin
@@ -532,17 +580,22 @@ begin
     CopyFile(BackupExePath, HelperPath(), False);
     Log('RestorePreviousState: previous helper restored');
   end;
-  { Write back the COMPLETE previous registration: ImagePath via sc config,
-    failure actions + non-crash flag, preshutdown re-armed to the captured
-    30 s budget (the only value this installer ever sets). Then start. }
-  if BackupBinPath <> '' then
+  { U09-REV4 item 2: write back the CAPTURED registration through the seam
+    (the restored previous binary): ImagePath, start type, failure
+    reset/actions, non-crash flag, preshutdown. Never the canonical §8.1
+    values — a non-canonical captured state restores distinguishably. }
+  if (BackupRegFile <> '') and FileExists(BackupRegFile) and FileExists(HelperPath()) then
   begin
-    { sc.exe takes the value after `binPath= ` as ONE argument: an ImagePath
-      with arguments must be a single quoted string with EVERY inner quote
-      escaped — `binPath= "\"C:\...\exe\" --service"`. The captured value is
-      `"C:\...\exe" --service`, so escape all inner quotes then wrap
-      (a verbatim pass-through, an extra quote pair, or escaping only the
-      first quote all die with exit 1639). }
+    RestoreOk := RunAndGetCode(HelperPath(), '--restore-service-registration --file "' + BackupRegFile + '"', RestoreCode);
+    Log('RestorePreviousState: captured registration written back (exit ' + IntToStr(RestoreCode) + ')');
+    if (not RestoreOk) or (RestoreCode <> 0) then
+      Log('RestorePreviousState: WARNING: seam registration restore reported failure');
+  end
+  else if BackupBinPath <> '' then
+  begin
+    { Degenerate fallback (no seam capture — no record or no helper at
+      backup): write back the ImagePath text at least. Failure actions, flag
+      and preshutdown are NOT stamped canonical here. }
     BinPathArg := '"';
     for BinPathI := 1 to Length(BackupBinPath) do
     begin
@@ -554,20 +607,20 @@ begin
     BinPathArg := BinPathArg + '"';
     Exec(ExpandConstant('{sys}\sc.exe'), 'config {#ServiceName} binPath= ' + BinPathArg,
       '', SW_HIDE, ewWaitUntilTerminated, Code);
-    Log('RestorePreviousState: previous ImagePath written back (sc config exit ' + IntToStr(Code) + ')');
-  end;
-  Exec(ExpandConstant('{sys}\sc.exe'), 'failure {#ServiceName} reset= 86400 actions= restart/1000/restart/5000/restart/30000',
-    '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log('RestorePreviousState: failure actions re-armed (exit ' + IntToStr(Code) + '; was: ' + Copy(BackupFailureText, 1, 160) + ')');
-  Exec(ExpandConstant('{sys}\sc.exe'), 'failureflag {#ServiceName} 1',
-    '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log('RestorePreviousState: non-crash failure flag re-armed (exit ' + IntToStr(Code) + '; was: ' + Copy(BackupFailureFlagText, 1, 120) + ')');
-  Log('RestorePreviousState: preshutdown 30000 armed by the shared §8.1 seam configuration (no sc.exe setter exists)');
-  if (BackupExePath <> '') or (BackupBinPath <> '') then
+    Log('RestorePreviousState: no seam capture; ImagePath written back only (sc config exit ' + IntToStr(Code) + ')');
+  end
+  else
+    Log('RestorePreviousState: no previous registration captured; exe restored only');
+  { U09-REV4 item 2: restart only when the captured state was running — a
+    stopped/disabled record stays stopped. No operator help needed. }
+  if ServiceWasRunning and IsServiceInstalled() then
   begin
     Exec(ExpandConstant('{sys}\sc.exe'), 'start {#ServiceName}', '',
       SW_HIDE, ewWaitUntilTerminated, Code);
-  end;
+    Log('RestorePreviousState: previously-running service restarted (sc start exit ' + IntToStr(Code) + ')');
+  end
+  else
+    Log('RestorePreviousState: captured state was not running; service left stopped');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -587,6 +640,7 @@ begin
   BackupBinPath := '';
   BackupFailureText := '';
   BackupFailureFlagText := '';
+  BackupRegFile := '';
   State := ScQueryStateFull();
   UpgradeInstall := (State <> 'absent') or FileExists(HelperPath());
   ServiceWasRunning := (State = 'running');
@@ -594,8 +648,21 @@ begin
   if UpgradeInstall then
   begin
     { Back up the previous executable and registration BEFORE replacement;
-      a start/Hello failure below restores both. }
-    BackupPreviousState();
+      a start/Hello failure below restores both. A failed capture fails
+      closed here — proceeding without rollback ability is refused. }
+    if not BackupPreviousState() then
+    begin
+      PreflightAborted := True;
+      PreflightExitCode := 13;
+      PreflightAbortReason := 'could not capture the previous service registration; upgrade aborted, old helper and journal preserved.';
+      if IsSilentInstall() then
+      begin
+        Log('Install abort (silent): registration capture failed ExitProcess(13)');
+        ExitProcessSilent(13);
+      end;
+      Result := PreflightAbortReason;
+      exit;
+    end;
     { CLEAN gate before replacing the service binary — runs when the helper
       file exists even when the service does not, before any copy replaces
       the helper. Maintenance (exit 11) blocks like any other debt. }
@@ -710,17 +777,18 @@ begin
     there fails the install before any service registration is replaced. }
 end;
 
-{ U09-REV2 item 4: raise texts claim only what is actually restored. On the
-  upgrade path the previous binary AND registration (full ImagePath +
-  failure actions + preshutdown) are written back; on the clean-install
-  path there is no previous state — the seam removes the fresh
-  registration and the installer reports that.
+{ U09-REV4 item 2: raise texts claim only what is actually restored. On the
+  upgrade path the previous binary AND the CAPTURED registration (ImagePath,
+  start type, failure actions/flag, preshutdown — written back through the
+  seam; the service is restarted only when the captured state was running)
+  are written back; on the clean-install path there is no previous state —
+  the seam removes the fresh registration and the installer reports that.
   Silent aborts never show UI (RaiseException always displays a message box
   that would hang automation): they ExitProcess with the measured code. }
 function AbortTail(): String;
 begin
   if UpgradeInstall then
-    Result := 'install aborted, previous binary and registration restored, journal preserved.'
+    Result := 'install aborted, previous binary and captured registration restored, journal preserved.'
   else
     Result := 'install aborted with no previous state; the fresh registration was removed by the seam, journal preserved.';
 end;

@@ -5,15 +5,101 @@
 
 use std::path::Path;
 
+/// U09-REV4 item 1: SHA-1 of the DER bytes (the .NET
+/// `X509Certificate2.Thumbprint` definition: SHA-1 of the raw cert, uppercase
+/// hex). Pure Rust so the build derives the pinned thumbprint from
+/// `docs/signing/Yeager-codesign.cer` with no hand-typed constant and no extra
+/// dependency.
+fn sha1_hex(data: &[u8]) -> String {
+    let mut h: [u32; 5] = [
+        0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = ((chunk[4 * i] as u32) << 24)
+                | ((chunk[4 * i + 1] as u32) << 16)
+                | ((chunk[4 * i + 2] as u32) << 8)
+                | (chunk[4 * i + 3] as u32);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &scheduled) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(scheduled);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut s = String::with_capacity(40);
+    for v in h {
+        s.push_str(&format!("{v:08X}"));
+    }
+    s
+}
+
+/// U09-REV4 item 1: derive the pinned thumbprint from the cert file at build
+/// time (same source `tools/signing/common.ps1` `Get-PinnedThumbprint`
+/// loads) and emit it as a generated include. The app never hand-types the
+/// value; the mechanical test opens the same `.cer` and asserts equality.
+fn emit_pinned_thumbprint(out_dir: &str, manifest_dir: &str) {
+    let cert = format!("{manifest_dir}/../../docs/signing/Yeager-codesign.cer");
+    println!("cargo:rerun-if-changed={cert}");
+    let bytes =
+        std::fs::read(&cert).unwrap_or_else(|e| panic!("cannot read pinned cert {cert}: {e}"));
+    let thumb = sha1_hex(&bytes);
+    assert!(
+        thumb.len() == 40 && thumb.bytes().all(|b| b.is_ascii_hexdigit()),
+        "derived pinned thumbprint is not 40 hex digits"
+    );
+    let generated = format!(
+        "// @generated from docs/signing/Yeager-codesign.cer by crates/app/build.rs — do not edit by hand.\n\
+         /// Pinned code-signing cert thumbprint, derived at build time from the cert file.\n\
+         pub const PINNED_THUMBPRINT: &str = \"{thumb}\";\n"
+    );
+    std::fs::write(format!("{out_dir}/pinned_thumbprint.rs"), generated).unwrap();
+}
+
 fn main() {
     slint_build::compile("ui/app.slint").expect("Slint UI failed to compile");
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    // U09-REV4 item 1: always derived (all targets) so `include!` resolves
+    // everywhere; only used on Windows.
+    emit_pinned_thumbprint(&out_dir, &manifest_dir);
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let icon = format!("{manifest_dir}/../../assets/icons/yeager.ico").replace('\\', "/");
     let rc_path = format!("{out_dir}/yeager.rc");
     // Version info follows the workspace version in Cargo.toml.

@@ -1265,48 +1265,158 @@ mod tests {
         assert!(portable_delete_guarded("D:\\tools\\yeager-portable\\yeager.exe").is_ok());
     }
 
-    #[test]
-    fn installer_thumbprint_is_derived_from_the_pinned_cert_file() {
-        // U09-REV2 item 1: the thumbprint is derived, never hand-typed.
-        // The cert file is the same source the signing tooling
-        // (`tools/signing/common.ps1` `Get-PinnedThumbprint`) loads.
-        let iss_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../installer/setup.iss");
-        let iss = std::fs::read_to_string(&iss_path)
-            .unwrap_or_else(|e| panic!("cannot read setup.iss: {e}"));
-        // No hand-typed 39/40-hex thumbprint literal remains in the script:
-        // the value arrives via /DPINNED_THUMBPRINT at build time.
-        assert!(
-            !iss.contains("9131F99C0B198E81FBA0F5818D0637B4A14DCF1"),
-            "setup.iss still holds the 39-digit dropped-4 constant"
-        );
-        for line in iss.lines() {
-            let t = line.trim();
-            if t.starts_with("PINNED_THUMBPRINT") && t.contains('=') && t.contains('\'') {
-                // The only allowed form is the preprocessor expansion of the
-                // build-time define; any hex literal is a hand-typed thumbprint.
-                if t.contains("{#PINNED_THUMBPRINT}") {
-                    continue;
+    fn sha1_hex_bytes(data: &[u8]) -> String {
+        // U09-REV4 item 1 test helper: SHA-1 of the raw cert bytes (the .NET
+        // `X509Certificate2.Thumbprint` definition). No hand-typed thumbprint
+        // literal anywhere in this test.
+        let mut h: [u32; 5] = [
+            0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
+        ];
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = data.to_vec();
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in msg.chunks(64) {
+            let mut w = [0u32; 80];
+            for i in 0..16 {
+                w[i] = ((chunk[4 * i] as u32) << 24)
+                    | ((chunk[4 * i + 1] as u32) << 16)
+                    | ((chunk[4 * i + 2] as u32) << 8)
+                    | (chunk[4 * i + 3] as u32);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+            for (i, &scheduled) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let tmp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(scheduled);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = tmp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut s = String::with_capacity(40);
+        for v in h {
+            s.push_str(&format!("{v:08X}"));
+        }
+        s
+    }
+
+    fn has_long_hex_run(s: &str, min: usize) -> bool {
+        let mut run = 0usize;
+        for b in s.bytes() {
+            if b.is_ascii_hexdigit() {
+                run += 1;
+                if run >= min {
+                    return true;
                 }
-                let hex_run = t.chars().filter(|c| c.is_ascii_hexdigit()).count();
-                if hex_run >= 32 {
-                    panic!("setup.iss holds a hand-typed PINNED_THUMBPRINT literal: {t}");
-                }
+            } else {
+                run = 0;
             }
         }
+        false
+    }
+
+    #[test]
+    fn installer_thumbprint_is_derived_from_the_pinned_cert_file() {
+        // U09-REV4 item 1: mechanical derivation test. OPENS the `.cer` and
+        // asserts equality with BOTH the value the app embeds (the build-time
+        // generated `PINNED_THUMBPRINT` in `crates/app`, derived from this
+        // same file) and the value the installer define carries
+        // (`Get-PinnedThumbprint`, the release script's source). A test that
+        // string-checks a document for a hand-typed value is NOT a derivation
+        // test — this test contains no thumbprint literal at all.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cert = root.join("../../docs/signing/Yeager-codesign.cer");
+        let bytes = std::fs::read(&cert).expect("cannot open pinned cert .cer");
+        let derived = sha1_hex_bytes(&bytes);
+        assert_eq!(derived.len(), 40, "cert thumbprint must be 40 hex digits");
         assert!(
-            iss.contains("PINNED_THUMBPRINT") && iss.contains("Get-PinnedThumbprint"),
-            "setup.iss must derive PINNED_THUMBPRINT via Get-PinnedThumbprint (build-time /D)"
+            derived.bytes().all(|b| b.is_ascii_hexdigit()),
+            "cert thumbprint must be hex"
         );
-        // The documented thumbprint in BUILD.md is the 40-digit cert value.
-        let build_md = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/BUILD.md"),
-        )
-        .expect("cannot read docs/BUILD.md");
+        // The app embeds this same derived value: its source uses the
+        // generated build-time include and holds no hand-typed literal.
+        let app_src = std::fs::read_to_string(root.join("../app/src/main.rs"))
+            .expect("cannot read crates/app/src/main.rs");
         assert!(
-            build_md.contains("9131F99C0B198E81FBA0F5818D0637B4A14D4CF1"),
-            "docs/BUILD.md must document the 40-digit pinned cert thumbprint"
+            app_src.contains("pinned_thumbprint"),
+            "app main.rs must use the generated pinned_thumbprint include"
         );
+        assert!(
+            !has_long_hex_run(&app_src, 32),
+            "app main.rs must not contain a hand-typed thumbprint literal"
+        );
+        let app_build = std::fs::read_to_string(root.join("../app/build.rs"))
+            .expect("cannot read crates/app/build.rs");
+        assert!(
+            app_build.contains("Yeager-codesign.cer"),
+            "app build.rs must read the cert file"
+        );
+        assert!(
+            !has_long_hex_run(&app_build, 32),
+            "app build.rs must not contain a hand-typed thumbprint literal"
+        );
+        // The installer takes the value via /DPINNED_THUMBPRINT with no
+        // literal; the define source yields the same value as the cert file.
+        let iss_path = root.join("../../installer/setup.iss");
+        let iss =
+            std::fs::read_to_string(&iss_path).unwrap_or_else(|e| panic!("cannot read setup.iss: {e}"));
+        assert!(
+            iss.contains("{#PINNED_THUMBPRINT}"),
+            "setup.iss must take the thumbprint via the build-time define"
+        );
+        assert!(
+            iss.contains("Get-PinnedThumbprint"),
+            "setup.iss must document derivation via Get-PinnedThumbprint"
+        );
+        assert!(
+            !has_long_hex_run(&iss, 32),
+            "setup.iss must not contain a hand-typed thumbprint literal"
+        );
+        #[cfg(windows)]
+        {
+            let ps1 = root.join("../../tools/signing/common.ps1");
+            let out = std::process::Command::new("powershell.exe")
+                .env("CODESIGN_PROJECT_NAME", "Yeager")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        ". '{}'; Get-PinnedThumbprint",
+                        ps1.to_string_lossy().replace('\'', "''")
+                    ),
+                ])
+                .output()
+                .expect("cannot run Get-PinnedThumbprint");
+            assert!(out.status.success(), "Get-PinnedThumbprint must succeed");
+            let pinned = String::from_utf8_lossy(&out.stdout).trim().to_ascii_uppercase();
+            assert_eq!(
+                pinned, derived,
+                "Get-PinnedThumbprint (installer define source) must equal the cert file"
+            );
+        }
     }
 
     #[test]

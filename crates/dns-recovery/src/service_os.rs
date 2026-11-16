@@ -246,9 +246,68 @@ pub fn service_exists() -> Result<bool, String> {
     }
 }
 
-/// Current ImagePath value (the `binPath=` the SCM record holds) for
-/// rollback restore. Returns the full quoted `"path" --service` string.
-pub fn query_service_binpath() -> Result<String, String> {
+/// U09-REV4 item 2: complete previous registration snapshot. The rollback
+/// writes back the CAPTURED values — all of them, distinguishably — never
+/// the canonical §8.1 standard configuration. Captured via Win32 reads
+/// (`QueryServiceConfigW` + `QueryServiceConfig2W`), so `sc.exe`'s missing
+/// preshutdown query/setter is no gap.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceFailureActionSnapshot {
+    /// `SC_ACTION_*` type (0 none, 1 restart, 2 reboot, 3 run-command).
+    pub action_type: u32,
+    pub delay_ms: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceRegistration {
+    /// Full ImagePath value (the `binPath=` the SCM record holds), e.g. the
+    /// quoted `"path" --service` string.
+    pub binpath: String,
+    /// `SERVICE_*_START` value (2 auto, 3 demand, 4 disabled, ...).
+    pub start_type: u32,
+    pub delayed_auto_start: bool,
+    pub failure_reset_secs: u32,
+    pub failure_reboot_msg: String,
+    pub failure_command: String,
+    pub failure_actions: Vec<ServiceFailureActionSnapshot>,
+    pub failure_flag_non_crash: bool,
+    pub preshutdown_ms: u32,
+}
+
+/// Read one `QueryServiceConfig2W` info level into an owned byte buffer.
+unsafe fn query_config2_raw(
+    service: Ws::System::Services::SC_HANDLE,
+    level: u32,
+) -> Result<Vec<u8>, String> {
+    use Ws::System::Services as S;
+    let mut needed: u32 = 0;
+    // First call yields the required size (ERROR_INSUFFICIENT_BUFFER = 122).
+    unsafe {
+        S::QueryServiceConfig2W(service, level, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Err(format!(
+            "QueryServiceConfig2W({level}) size query failed: {}",
+            last_error()
+        ));
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let ok = unsafe {
+        S::QueryServiceConfig2W(service, level, buf.as_mut_ptr(), needed, &mut needed)
+    };
+    if ok == 0 {
+        return Err(format!(
+            "QueryServiceConfig2W({level}) failed: {}",
+            last_error()
+        ));
+    }
+    Ok(buf)
+}
+
+/// Capture the complete current registration via Win32 reads. Fails when no
+/// SCM record exists (1060 surfaces here), so callers only invoke it when a
+/// record was proven to exist.
+pub fn query_service_registration() -> Result<ServiceRegistration, String> {
     use Ws::System::Services as S;
     unsafe {
         let manager = open_manager(S::SC_MANAGER_CONNECT)?;
@@ -259,87 +318,238 @@ pub fn query_service_binpath() -> Result<String, String> {
             close(manager);
             return Err(format!("OpenServiceW(QUERY_CONFIG) failed: {e}"));
         }
-        let mut needed: u32 = 0;
-        // First call yields the required size (ERROR_INSUFFICIENT_BUFFER = 122).
-        S::QueryServiceConfigW(h, std::ptr::null_mut(), 0, &mut needed);
-        if needed == 0 {
-            let e = last_error();
-            close(h);
-            close(manager);
-            return Err(format!("QueryServiceConfigW size query failed: {e}"));
-        }
-        let mut buf = vec![0u8; needed as usize];
-        if S::QueryServiceConfigW(
-            h,
-            buf.as_mut_ptr() as *mut S::QUERY_SERVICE_CONFIGW,
-            needed,
-            &mut needed,
-        ) == 0
-        {
-            let e = last_error();
-            close(h);
-            close(manager);
-            return Err(format!("QueryServiceConfigW failed: {e}"));
-        }
-        let cfg = &*(buf.as_ptr() as *const S::QUERY_SERVICE_CONFIGW);
-        let bin = pwstr_to_string(cfg.lpBinaryPathName);
+        let reg = (|| -> Result<ServiceRegistration, String> {
+            let mut needed: u32 = 0;
+            S::QueryServiceConfigW(h, std::ptr::null_mut(), 0, &mut needed);
+            if needed == 0 {
+                return Err(format!("QueryServiceConfigW size query failed: {}", last_error()));
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if S::QueryServiceConfigW(
+                h,
+                buf.as_mut_ptr() as *mut S::QUERY_SERVICE_CONFIGW,
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return Err(format!("QueryServiceConfigW failed: {}", last_error()));
+            }
+            let cfg = &*(buf.as_ptr() as *const S::QUERY_SERVICE_CONFIGW);
+            let bin = pwstr_to_string(cfg.lpBinaryPathName);
+            if bin.is_empty() {
+                return Err("QueryServiceConfigW returned an empty binPath".into());
+            }
+            let start_type = cfg.dwStartType;
+            let delayed = {
+                let b = query_config2_raw(h, S::SERVICE_CONFIG_DELAYED_AUTO_START_INFO)?;
+                (*(b.as_ptr() as *const S::SERVICE_DELAYED_AUTO_START_INFO)).fDelayedAutostart
+                    != 0
+            };
+            let (reset, reboot, command, actions) = {
+                let b = query_config2_raw(h, S::SERVICE_CONFIG_FAILURE_ACTIONS)?;
+                let fa = &*(b.as_ptr() as *const S::SERVICE_FAILURE_ACTIONSW);
+                let mut out = Vec::new();
+                if fa.cActions > 0 {
+                    if fa.lpsaActions.is_null() {
+                        return Err("failure actions list is null with nonzero count".into());
+                    }
+                    let slice =
+                        std::slice::from_raw_parts(fa.lpsaActions, fa.cActions as usize);
+                    for a in slice {
+                        out.push(ServiceFailureActionSnapshot {
+                            action_type: a.Type as u32,
+                            delay_ms: a.Delay,
+                        });
+                    }
+                }
+                (
+                    fa.dwResetPeriod,
+                    pwstr_to_string(fa.lpRebootMsg),
+                    pwstr_to_string(fa.lpCommand),
+                    out,
+                )
+            };
+            let flag = {
+                let b = query_config2_raw(h, S::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG)?;
+                (*(b.as_ptr() as *const S::SERVICE_FAILURE_ACTIONS_FLAG))
+                    .fFailureActionsOnNonCrashFailures
+                    != 0
+            };
+            let preshutdown = {
+                let b = query_config2_raw(h, S::SERVICE_CONFIG_PRESHUTDOWN_INFO)?;
+                (*(b.as_ptr() as *const S::SERVICE_PRESHUTDOWN_INFO)).dwPreshutdownTimeout
+            };
+            Ok(ServiceRegistration {
+                binpath: bin,
+                start_type,
+                delayed_auto_start: delayed,
+                failure_reset_secs: reset,
+                failure_reboot_msg: reboot,
+                failure_command: command,
+                failure_actions: actions,
+                failure_flag_non_crash: flag,
+                preshutdown_ms: preshutdown,
+            })
+        })();
         close(h);
         close(manager);
-        if bin.is_empty() {
-            return Err("QueryServiceConfigW returned an empty binPath".into());
-        }
-        Ok(bin)
+        reg
     }
 }
 
-/// Restore a previous ImagePath and re-arm the full §8.1 configuration
-/// (quoted binPath, 1 s / 5 s / 30 s restarts, non-crash flag, preshutdown).
-/// Used by the `--install-service` rollback when a start/Hello failure
-/// follows an in-place `ChangeServiceConfigW` replacement.
-pub fn restore_service_registration(prev_binpath: &str) -> Result<(), String> {
+/// Current ImagePath value (the `binPath=` the SCM record holds) for
+/// callers that only need the path. The rollback path uses the full
+/// [`query_service_registration`] snapshot instead.
+pub fn query_service_binpath() -> Result<String, String> {
+    Ok(query_service_registration()?.binpath)
+}
+
+/// Write back a CAPTURED registration (all of it: ImagePath, start type +
+/// delayed flag, failure reset/actions/reboot/command, non-crash flag,
+/// preshutdown). Never stamps the canonical §8.1 values.
+pub fn apply_service_registration(reg: &ServiceRegistration) -> Result<(), String> {
     use Ws::System::Services as S;
     if !is_elevated() {
-        return Err("restore_service_registration requires elevation".into());
+        return Err("apply_service_registration requires elevation".into());
     }
     unsafe {
         let manager = open_manager(S::SC_MANAGER_CONNECT)?;
         let name = wide(SERVICE_NAME);
         let display = wide(SERVICE_DISPLAY);
-        let bin = wide(prev_binpath);
+        let bin = wide(&reg.binpath);
         let existing = S::OpenServiceW(manager, name.as_ptr(), S::SERVICE_ALL_ACCESS);
         if existing.is_null() {
             let e = last_error();
             close(manager);
-            return Err(format!("restore open service failed: {e}"));
+            return Err(format!("registration restore: open service failed: {e}"));
         }
-        if S::ChangeServiceConfigW(
-            existing,
-            S::SERVICE_NO_CHANGE,
-            S::SERVICE_NO_CHANGE,
-            S::SERVICE_NO_CHANGE,
-            bin.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            display.as_ptr(),
-        ) == 0
-        {
-            let e = last_error();
-            close(existing);
-            close(manager);
-            return Err(format!("restore binPath failed: {e}"));
-        }
-        if let Err(e) = configure_failure_actions(existing) {
-            close(existing);
-            close(manager);
-            return Err(e);
-        }
+        let result = (|| -> Result<(), String> {
+            if S::ChangeServiceConfigW(
+                existing,
+                S::SERVICE_NO_CHANGE,
+                reg.start_type,
+                S::SERVICE_NO_CHANGE,
+                bin.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                display.as_ptr(),
+            ) == 0
+            {
+                return Err(format!("registration restore: binPath/start-type failed: {}", last_error()));
+            }
+            let delayed = S::SERVICE_DELAYED_AUTO_START_INFO {
+                fDelayedAutostart: if reg.delayed_auto_start { 1 } else { 0 },
+            };
+            if S::ChangeServiceConfig2W(
+                existing,
+                S::SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                &delayed as *const _ as *const std::ffi::c_void,
+            ) == 0
+            {
+                return Err(format!(
+                    "registration restore: delayed-auto-start failed: {}",
+                    last_error()
+                ));
+            }
+            let reboot_w = if reg.failure_reboot_msg.is_empty() {
+                Vec::new()
+            } else {
+                wide(&reg.failure_reboot_msg)
+            };
+            let command_w = if reg.failure_command.is_empty() {
+                Vec::new()
+            } else {
+                wide(&reg.failure_command)
+            };
+            let mut actions: Vec<S::SC_ACTION> = reg
+                .failure_actions
+                .iter()
+                .map(|a| S::SC_ACTION {
+                    Type: a.action_type as i32,
+                    Delay: a.delay_ms,
+                })
+                .collect();
+            let (c_actions, actions_ptr) = if actions.is_empty() {
+                (0u32, std::ptr::null_mut())
+            } else {
+                (actions.len() as u32, actions.as_mut_ptr())
+            };
+            let failure = S::SERVICE_FAILURE_ACTIONSW {
+                dwResetPeriod: reg.failure_reset_secs,
+                lpRebootMsg: if reboot_w.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    reboot_w.as_ptr() as *mut u16
+                },
+                lpCommand: if command_w.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    command_w.as_ptr() as *mut u16
+                },
+                cActions: c_actions,
+                lpsaActions: actions_ptr,
+            };
+            if S::ChangeServiceConfig2W(
+                existing,
+                S::SERVICE_CONFIG_FAILURE_ACTIONS,
+                &failure as *const _ as *const std::ffi::c_void,
+            ) == 0
+            {
+                return Err(format!(
+                    "registration restore: failure actions failed: {}",
+                    last_error()
+                ));
+            }
+            let flag = S::SERVICE_FAILURE_ACTIONS_FLAG {
+                fFailureActionsOnNonCrashFailures: if reg.failure_flag_non_crash {
+                    1
+                } else {
+                    0
+                },
+            };
+            if S::ChangeServiceConfig2W(
+                existing,
+                S::SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                &flag as *const _ as *const std::ffi::c_void,
+            ) == 0
+            {
+                return Err(format!(
+                    "registration restore: non-crash failure-action flag failed: {}",
+                    last_error()
+                ));
+            }
+            let preshutdown = S::SERVICE_PRESHUTDOWN_INFO {
+                dwPreshutdownTimeout: reg.preshutdown_ms,
+            };
+            if S::ChangeServiceConfig2W(
+                existing,
+                S::SERVICE_CONFIG_PRESHUTDOWN_INFO,
+                &preshutdown as *const _ as *const std::ffi::c_void,
+            ) == 0
+            {
+                return Err(format!(
+                    "registration restore: preshutdown failed: {}",
+                    last_error()
+                ));
+            }
+            Ok(())
+        })();
         close(existing);
         close(manager);
-        Ok(())
+        result
     }
+}
+
+/// Restore a CAPTURED previous registration (all of it) after a failed
+/// in-place replacement. Used by the `--install-service` rollback and by the
+/// installer's `--restore-service-registration` path when a start/Hello
+/// failure follows the replacement. The canonical §8.1 stamping stays in
+/// [`configure_failure_actions`] (success path) only.
+pub fn restore_service_registration(reg: &ServiceRegistration) -> Result<(), String> {
+    apply_service_registration(reg)
 }
 
 /// SCM service PID (for the client's server-identity check).
@@ -2360,5 +2570,54 @@ mod tests {
         }
         let _ = stopper.join();
         let _ = client.join();
+    }
+
+    #[test]
+    fn registration_snapshot_round_trips_non_canonical_values() {
+        // U09-REV4 item 2: the rollback capture schema holds the CAPTURED
+        // registration — including a NON-canonical state (demand start,
+        // non-default delays, cleared flag, non-standard preshutdown) — so a
+        // correct restore is distinguishable from stamping the standard
+        // values. Serde round-trip only; no SCM is touched.
+        let reg = ServiceRegistration {
+            binpath: "\"C:\\Program Files\\Yeager\\yeager-dns-recovery.exe\" --service".into(),
+            start_type: 3,
+            delayed_auto_start: false,
+            failure_reset_secs: 3600,
+            failure_reboot_msg: String::new(),
+            failure_command: String::new(),
+            failure_actions: vec![
+                ServiceFailureActionSnapshot { action_type: 1, delay_ms: 2000 },
+                ServiceFailureActionSnapshot { action_type: 1, delay_ms: 10000 },
+                ServiceFailureActionSnapshot { action_type: 0, delay_ms: 60000 },
+            ],
+            failure_flag_non_crash: false,
+            preshutdown_ms: 15000,
+        };
+        let json = serde_json::to_string(&reg).expect("registration serializes");
+        for key in [
+            "binpath",
+            "start_type",
+            "failure_reset_secs",
+            "failure_actions",
+            "failure_flag_non_crash",
+            "preshutdown_ms",
+        ] {
+            assert!(json.contains(key), "snapshot JSON must carry {key}");
+        }
+        let back: ServiceRegistration =
+            serde_json::from_str(&json).expect("registration deserializes");
+        assert_eq!(back, reg, "snapshot must round-trip exactly");
+        // The wrapper form the installer capture file uses also parses.
+        let wrapped = serde_json::json!({
+            "mode": "query-service-config",
+            "outcome": "success",
+            "exit": 0,
+            "registration": reg,
+        });
+        let reg_value = wrapped.get("registration").unwrap();
+        let unwrapped: ServiceRegistration =
+            serde_json::from_value(reg_value.clone()).expect("wrapper registration parses");
+        assert_eq!(unwrapped, reg);
     }
 }

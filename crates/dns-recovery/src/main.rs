@@ -1,5 +1,5 @@
-﻿//! yeager-dns-recovery: the privileged DNS recovery service binary (U05,
-//! SPEC-DNS-FIX.md Â§8.3). U09-REV2 upgrade-cycle build marker.
+//! yeager-dns-recovery: the privileged DNS recovery service binary (U05,
+//! SPEC-DNS-FIX.md §8.3). U09-REV2 upgrade-cycle build marker.
 //!
 //! Modes (all elevated modes refuse without elevation; every mode prints a
 //! structured JSON report to stdout and a readable error to stderr):
@@ -14,8 +14,14 @@
 //! - `--remove-service`: refuse on recovery debt; otherwise stop and delete.
 //! - `--enter-maintenance` / `--leave-maintenance` (U09 installer seams):
 //!   enter/leave service maintenance over the protected pipe (admin only).
+//! - `--query-service-config` (U09-REV4 item 2): read-only dump of the
+//!   complete registration (ImagePath, start type, failure actions/flag,
+//!   preshutdown) via Win32 reads — the rollback capture source.
+//! - `--restore-service-registration --file <capture.json>` (U09-REV4 item 2):
+//!   installer rollback path; writes back the CAPTURED values, never the
+//!   canonical §8.1 configuration.
 //!
-//! Exit codes (Â§8.3): 0 verified clean/success; 10 live-owner/busy;
+//! Exit codes (§8.3): 0 verified clean/success; 10 live-owner/busy;
 //! 11 pending/unavailable; 12 conflict; 13 privilege/service/auth;
 //! 14 integrity/unknown version; 15 unsupported capture/API.
 
@@ -223,23 +229,31 @@ mod win {
         let dest_dir = format!("{program_files}\\Yeager");
         let dest = format!("{dest_dir}\\yeager-dns-recovery.exe");
         // U09-REV2 item 2: ABSENT vs STOPPED. `OpenServiceW` failing with
-        // 1060 means ABSENT â€” proceed to create. The STOPPED wait applies
+        // 1060 means ABSENT — proceed to create. The STOPPED wait applies
         // only when a record exists; any other query failure refuses.
         let had_service = match service_os::service_exists() {
             Ok(v) => v,
             Err(e) => fail("install-service", 13, format!("cannot query service record: {e}")),
         };
-        // Previous registration for rollback restore (item 4): the full
-        // ImagePath, so a start/Hello failure after the in-place
-        // `ChangeServiceConfigW` replacement writes it back.
-        let prev_binpath: Option<String> = if had_service {
-            match service_os::query_service_binpath() {
-                Ok(b) => Some(b),
+        // U09-REV4 item 2: capture the COMPLETE previous registration
+        // (ImagePath, start type + delayed flag, failure reset/actions,
+        // non-crash flag, preshutdown) via Win32 reads, so a start/Hello
+        // failure after the in-place replacement writes back THOSE values �
+        // never the canonical �8.1 standard configuration.
+        let prev_reg: Option<service_os::ServiceRegistration> = if had_service {
+            match service_os::query_service_registration() {
+                Ok(r) => Some(r),
                 Err(e) => fail("install-service", 13, format!("cannot capture previous registration: {e}")),
             }
         } else {
             None
         };
+        // Whether the service was running at capture: only then does the
+        // rollback restart it (a stopped/disabled record stays stopped).
+        let was_running_at_capture: bool = matches!(
+            service_os::scm_query_state(),
+            Ok(dns_recovery::service::ScmServiceState::Running)
+        );
         // The running image, resolved before the staged check below.
         let current_early = match std::env::current_exe() {
             Ok(p) => p,
@@ -274,7 +288,7 @@ mod win {
         // Rollback helper. `staged_in_place` marks the installer flow where
         // the running image already IS the target file (Inno copied + signature-
         // verified it before invoking the seam): the seam skips backup and copy,
-        // and on failure only ensures the service is stopped â€” the installer's
+        // and on failure only ensures the service is stopped — the installer's
         // own RestorePreviousState owns the exe + registration write-back and
         // the restart. Otherwise (seam invoked from elsewhere): restore the
         // previous binary AND registration when a record existed, else remove
@@ -282,7 +296,8 @@ mod win {
         let rollback = |had_previous: bool,
                         backup: &str,
                         dest: &str,
-                        prev_bin: &Option<String>,
+                        prev_reg: &Option<service_os::ServiceRegistration>,
+                        was_running: bool,
                         staged_in_place: bool| {
             let _ = service_os::stop_service();
             if staged_in_place {
@@ -291,10 +306,14 @@ mod win {
             if had_previous {
                 let _ = std::fs::copy(backup, dest);
                 let _ = std::fs::remove_file(backup);
-                if let Some(prev) = prev_bin {
+                if let Some(prev) = prev_reg {
                     let _ = service_os::restore_service_registration(prev);
                 }
-                let _ = service_os::start_service();
+                // U09-REV4 item 2: restart only when the captured state was
+                // running � a stopped/disabled record stays stopped.
+                if was_running {
+                    let _ = service_os::start_service();
+                }
             } else {
                 let _ = service_os::remove_service();
                 let _ = std::fs::remove_file(dest);
@@ -318,7 +337,7 @@ mod win {
         // Adopt path (item 2): the installer flow runs the helper from the
         // target path itself after Inno's copy + signature verification. When
         // the running image already IS the protected file, skip backup and
-        // copy and register/configure/start/Hello in place â€” whether or not
+        // copy and register/configure/start/Hello in place — whether or not
         // a service record exists (clean install AND upgrade take this path
         // through the installer; copying a file onto itself fails).
         let staged_in_place = staged_early;
@@ -352,7 +371,7 @@ mod win {
         if let Err(e) = service_os::install_service(&dest) {
             // Registration failed: restore the previous binary when one
             // existed, otherwise remove the copied exe. In the staged flow
-            // the installer owns the files â€” leave them for its restore.
+            // the installer owns the files — leave them for its restore.
             if !staged_in_place {
                 if had_previous_binary {
                     let _ = std::fs::copy(&backup, &dest);
@@ -364,11 +383,11 @@ mod win {
             fail("install-service", 13, e);
         }
         if let Err(e) = service_os::start_service() {
-            rollback(had_previous_binary, &backup, &dest, &prev_binpath, staged_in_place);
+            rollback(had_previous_binary, &backup, &dest, &prev_reg, was_running_at_capture, staged_in_place);
             fail("install-service", 13, e);
         }
         if let Err(e) = wait_for_state(ScmServiceState::Running, 30) {
-            rollback(had_previous_binary, &backup, &dest, &prev_binpath, staged_in_place);
+            rollback(had_previous_binary, &backup, &dest, &prev_reg, was_running_at_capture, staged_in_place);
             fail("install-service", 13, e);
         }
         // Hello validation over the protected pipe with the SCM PID check.
@@ -414,11 +433,11 @@ mod win {
                 std::process::exit(0);
             }
             Ok(outcome) => {
-                rollback(had_previous_binary, &backup, &dest, &prev_binpath, staged_in_place);
+                rollback(had_previous_binary, &backup, &dest, &prev_reg, was_running_at_capture, staged_in_place);
                 fail("install-service", 13, format!("hello validation returned {outcome:?}"));
             }
             Err(e) => {
-                rollback(had_previous_binary, &backup, &dest, &prev_binpath, staged_in_place);
+                rollback(had_previous_binary, &backup, &dest, &prev_reg, was_running_at_capture, staged_in_place);
                 fail("install-service", 13, format!("hello validation failed: {e}"));
             }
         }
@@ -470,7 +489,7 @@ mod win {
     /// protected pipe (admin only). Accepts the installer's reason token
     /// (`--enter-maintenance "installer-upgrade"` /
     /// `"installer-uninstall"`); the single-token form keeps working with
-    /// the service default. The recorded reason is THAT reason â€” no
+    /// the service default. The recorded reason is THAT reason — no
     /// hardcoded string. Mirrors the installer's preflight step: new
     /// takeover is rejected while maintenance holds. Quiesces any live owner
     /// lease first so the upgrade preflight never races an active takeover.
@@ -573,11 +592,66 @@ mod win {
     }
 
     /// U09-REV2 item 7: exact restore through the helper when the GUI exe is
-    /// absent. The uninstaller (`setup.iss` GUI-absent arm) calls this â€” not
-    /// `--inspect` â€” so the restore actually runs. Replays the journal to an
+    /// absent. The uninstaller (`setup.iss` GUI-absent arm) calls this — not
+    /// `--inspect` — so the restore actually runs. Replays the journal to an
     /// exact-original restore via the same driver as `--recover-offline`
     /// (maintenance already holds, so no new takeover can race it). Exit 0
-    /// only on a verified restore; debt exits map to Â§8.3 like the GUI path.
+    /// only on a verified restore; debt exits map to §8.3 like the GUI path.
+    /// U09-REV4 item 2: read-only dump of the complete current registration
+    /// (ImagePath, start type + delayed flag, failure reset/actions, non-crash
+    /// flag, preshutdown) via Win32 reads. Read-only: no elevation required.
+    /// The installer calls this before replacement and stores the stdout JSON
+    /// as the rollback capture; the same JSON is the live-cycle evidence.
+    pub fn cmd_query_service_config() -> ! {
+        match service_os::query_service_registration() {
+            Ok(reg) => {
+                out(&serde_json::json!({
+                    "mode": "query-service-config",
+                    "outcome": "success",
+                    "exit": 0,
+                    "registration": reg,
+                }));
+                std::process::exit(0);
+            }
+            Err(e) => fail("query-service-config", 11, e),
+        }
+    }
+
+    /// U09-REV4 item 2: installer rollback path. Reads a capture file written
+    /// from `--query-service-config` stdout (accepts the wrapper object or
+    /// the bare registration) and writes back the CAPTURED values via Win32 —
+    /// ImagePath, start type, failure actions/flag, preshutdown — never the
+    /// canonical §8.1 values. Requires elevation.
+    pub fn cmd_restore_service_registration(file: &str) -> ! {
+        if !service_os::is_elevated() {
+            fail("restore-service-registration", 13, "restore-service-registration requires elevation".into());
+        }
+        let raw = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => fail("restore-service-registration", 11, format!("cannot read capture file: {e}")),
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => fail("restore-service-registration", 11, format!("capture file is not JSON: {e}")),
+        };
+        let reg_value = value.get("registration").unwrap_or(&value);
+        let reg: service_os::ServiceRegistration = match serde_json::from_value(reg_value.clone()) {
+            Ok(r) => r,
+            Err(e) => fail("restore-service-registration", 11, format!("capture file has no registration: {e}")),
+        };
+        match service_os::apply_service_registration(&reg) {
+            Ok(()) => {
+                out(&serde_json::json!({
+                    "mode": "restore-service-registration",
+                    "outcome": "success",
+                    "exit": 0,
+                }));
+                std::process::exit(0);
+            }
+            Err(e) => fail("restore-service-registration", 13, e),
+        }
+    }
+
     pub fn cmd_cleanup() -> ! {
         if !service_os::is_elevated() {
             fail("cleanup", 13, "cleanup requires elevation".into());
@@ -625,13 +699,13 @@ mod win {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: yeager-dns-recovery --service|--inspect|--recover-offline|--install-service|--remove-service|--enter-maintenance [reason]|--leave-maintenance|--cleanup");
+    eprintln!("usage: yeager-dns-recovery --service|--inspect|--recover-offline|--install-service|--remove-service|--enter-maintenance [reason]|--leave-maintenance|--cleanup|--query-service-config|--restore-service-registration --file <capture.json>");
     std::process::exit(2);
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || args.len() > 3 {
+    if args.len() < 2 || args.len() > 4 {
         usage();
     }
     #[cfg(windows)]
@@ -688,6 +762,19 @@ fn main() -> ExitCode {
                 usage();
             }
             win::cmd_cleanup()
+        }
+        "--query-service-config" => {
+            if args.len() != 2 {
+                usage();
+            }
+            win::cmd_query_service_config()
+        }
+        "--restore-service-registration" => {
+            if args.len() != 4 || args[2] != "--file" {
+                usage();
+            }
+            let file = args[3].clone();
+            win::cmd_restore_service_registration(&file)
         }
         _ => usage(),
     }
