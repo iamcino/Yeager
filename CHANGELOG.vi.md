@@ -8,6 +8,11 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+### Sửa lỗi
+- **Bộ lọc capture chỉ giữ ClientHello:** chiều đi của WinDivert giờ đòi tiền tố handshake TLS + ClientHello (`tcp.Payload[0] == 0x16`, `tcp.Payload[1] == 0x03`, `tcp.Payload[5] == 0x01`) sau điều kiện độ dài `tcp.PayloadLength >= 40` đã có, nên dữ liệu upload không còn đi qua userspace. Mệnh đề RST chiều về giữ nguyên. Tài liệu nay ghi rõ chiều đi chỉ xem xét gói mang ClientHello, `Auto` chọn `Fast` tuyệt đối, và đường không cấp phát bộ nhớ là đường inline Auto/Fast.
+- **Lỗ hổng cài driver WinDivert (P0):** engine không còn nạp driver từ `%TEMP%\Yeager_bin` mà tài khoản thường cũng ghi được. Mỗi lần khởi động, `WinDivert.dll` / `WinDivert64.sys` nhúng trong bản build được kiểm tra SHA-256 và chép lại khi khác, đặt trong `%ProgramData%\Yeager\driver` được bảo vệ (chỉ Administrators + SYSTEM được ghi, Users chỉ đọc/chạy, tắt kế thừa, kiểm tra lại chủ sở hữu và DACL mỗi lần khởi động, sai là dừng chứ không chạy tiếp). File DLL kẻ khác cài sẵn trong thư mục temp cũ không bao giờ được nạp; thư mục cũ được dọn khi có thể (gặp reparse point thì bỏ qua, không đi vào). Muốn dùng bản driver của riêng mình thì truyền cờ `--driver-dir <đường dẫn>` cho `yeager.exe` hoặc `levi.exe` — không đọc từ `config.json` hay biến môi trường.
+- **Bản ghi service driver cũ (kiểm tra lúc khởi động):** trước khi nạp driver, engine đọc bản ghi service `WinDivert` hiện có và đối chiếu với file driver đã kiểm chứng. Bản ghi đang dừng mà trỏ đi nơi khác sẽ bị xóa để driver được đăng ký lại từ kho được bảo vệ; nếu driver cũ vẫn đang chạy từ nơi khác, quá trình khởi động sẽ dừng và báo lỗi kèm đường dẫn đang ghi trong bản ghi thay vì nạp nó. Thư mục được bảo vệ mới tạo luôn thuộc về Administrators, và thông báo lỗi sai chủ sở hữu giờ nêu rõ chủ sở hữu thực tế.
+
 ## [1.1.6] - 2026-11-13
 
 ### Thay đổi
