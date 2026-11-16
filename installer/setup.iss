@@ -545,7 +545,9 @@ begin
   begin
     Tmp := ExpandConstant('{tmp}\yeager_regcapture.json');
     DeleteFile(Tmp);
-    if Exec(ExpandConstant('{cmd}'), '/c "' + HelperPath() + '" --query-service-config > "' + Tmp + '" 2>&1',
+  { U09-REV5 Alt C: cmd /s /c with the whole payload wrapped in one outer
+    quote pair — a bare /c strips the quotes around a spaced helper path. }
+    if Exec(ExpandConstant('{cmd}'), '/s /c ""' + HelperPath() + '" --query-service-config > "' + Tmp + '" 2>&1"',
       '', SW_HIDE, ewWaitUntilTerminated, Code) and FileExists(Tmp) then
     begin
       if LoadStringFromFile(Tmp, Content) and (Pos('"registration"', Content) > 0) then
