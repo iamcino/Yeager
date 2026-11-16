@@ -1008,6 +1008,8 @@ pub fn pid_exe_name(pid: u32) -> Option<String> {
         }
         CloseHandle(snap);
         out
+    }
+}
 
 #[cfg(test)]
 mod tests {
