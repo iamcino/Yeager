@@ -60,8 +60,10 @@ pub struct PoolStatus {
 
 pub struct Pool {
     /// Fixed: the choice, then its backup. Auto: [`AUTO_PROVIDERS`].
-    members: [Arc<Upstream>; 2],
-    auto: bool,
+    /// Behind a lock so a serving stub can retarget its upstream to a new
+    /// `Choice` while its sockets stay bound (U06-REV2 item 1).
+    members: Mutex<[Arc<Upstream>; 2]>,
+    auto: AtomicBool,
     /// The member answering queries.
     active: AtomicUsize,
     checked_at: Mutex<Option<Instant>>,
@@ -83,8 +85,8 @@ impl Pool {
 
     pub(crate) fn from_upstreams(members: [Arc<Upstream>; 2], auto: bool) -> Self {
         Self {
-            members,
-            auto,
+            members: Mutex::new(members),
+            auto: AtomicBool::new(auto),
             active: AtomicUsize::new(0),
             checked_at: Mutex::new(None),
             checking: AtomicBool::new(false),
@@ -93,22 +95,48 @@ impl Pool {
         }
     }
 
+    /// Retarget the forwarder to a new `Choice` without rebinding sockets.
+    /// Replaces both members, resets the active index to the new primary,
+    /// and clears failover/auto measurement state. Old connections close
+    /// when their `Arc`s drop.
+    pub fn retarget(&self, choice: Choice) {
+        let (providers, auto) = match choice {
+            Choice::Fixed(p) => ([p, backup(p)], false),
+            Choice::Auto => (AUTO_PROVIDERS, true),
+        };
+        let fresh = providers.map(|p| Arc::new(Upstream::new(p)));
+        let old = {
+            let mut guard = self.members.lock().unwrap();
+            std::mem::replace(&mut *guard, fresh)
+        };
+        for m in &old {
+            m.close();
+        }
+        self.auto.store(auto, Ordering::Relaxed);
+        self.active.store(0, Ordering::Relaxed);
+        self.streak.store(0, Ordering::Relaxed);
+        *self.checked_at.lock().unwrap() = None;
+        self.checking.store(false, Ordering::Relaxed);
+    }
+
     fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
     }
 
+    fn is_auto(&self) -> bool {
+        self.auto.load(Ordering::Relaxed)
+    }
+
     pub fn status(&self) -> PoolStatus {
         let i = self.active();
-        let member = &self.members[i];
+        let guard = self.members.lock().unwrap();
+        let member = &guard[i];
+        let auto = self.is_auto();
         PoolStatus {
             provider: member.provider(),
             stat: member.stat(),
-            on_backup: !self.auto && i == 1,
+            on_backup: !auto && i == 1,
         }
-    }
-
-    pub fn last_error(&self) -> Option<String> {
-        self.members[self.active()].last_error()
     }
 
     /// Sends `query` to the provider in use, falling over to the other one
@@ -116,7 +144,11 @@ impl Pool {
     pub async fn query(self: &Arc<Self>, query: &Message) -> Result<(Message, Transport), String> {
         *self.used_at.lock().unwrap() = Some(Instant::now());
         let i = self.active();
-        let first = self.members[i].query(query).await;
+        let (first_member, other_member, auto) = {
+            let guard = self.members.lock().unwrap();
+            (guard[i].clone(), guard[1 - i].clone(), self.is_auto())
+        };
+        let first = first_member.query(query).await;
         self.maybe_check();
         let error = match first {
             Ok(answer) => return Ok(answer),
@@ -125,17 +157,17 @@ impl Pool {
         // Auto has no preference, and the backup gives way at once; the
         // chosen provider gets a grace period first.
         let other = 1 - i;
-        let down_long = self.members[i].failing_for().is_some_and(|d| d >= FAILOVER_AFTER);
-        if !(self.auto || i == 1 || down_long) {
+        let down_long = first_member.failing_for().is_some_and(|d| d >= FAILOVER_AFTER);
+        if !(auto || i == 1 || down_long) {
             return Err(error);
         }
-        match self.members[other].query(query).await {
+        match other_member.query(query).await {
             Ok(answer) => {
                 self.active.store(other, Ordering::Relaxed);
                 self.streak.store(0, Ordering::Relaxed);
                 Ok(answer)
             }
-            Err(e) => Err(format!("{error}; {}: {e}", self.members[other].provider().label())),
+            Err(e) => Err(format!("{error}; {}: {e}", other_member.provider().label())),
         }
     }
 
@@ -146,7 +178,11 @@ impl Pool {
             tokio::time::sleep(WARM_EVERY).await;
             let idle = self.used_at.lock().unwrap().map(|at| at.elapsed());
             if idle.is_some_and(|idle| idle >= WARM_IDLE && idle < WARM_FOR) {
-                let _ = self.members[self.active()].query(&probe()).await;
+                let member = {
+                    let i = self.active();
+                    self.members.lock().unwrap()[i].clone()
+                };
+                let _ = member.query(&probe()).await;
             }
         }
     }
@@ -155,11 +191,12 @@ impl Pool {
     /// the chosen provider is back; in Auto mode, whether the other provider
     /// has become faster.
     fn maybe_check(self: &Arc<Self>) {
-        let on_backup = !self.auto && self.active() == 1;
-        if !self.auto && !on_backup {
+        let auto = self.is_auto();
+        let on_backup = !auto && self.active() == 1;
+        if !auto && !on_backup {
             return;
         }
-        let every = if self.auto { AUTO_EVERY } else { RECOVER_EVERY };
+        let every = if auto { AUTO_EVERY } else { RECOVER_EVERY };
         {
             let mut checked_at = self.checked_at.lock().unwrap();
             if checked_at.is_some_and(|at| at.elapsed() < every) || self.checking.swap(true, Ordering::Relaxed) {
@@ -169,11 +206,18 @@ impl Pool {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            if this.auto {
+            let auto_now = this.is_auto();
+            if auto_now {
                 this.compare().await;
-            } else if this.members[0].query(&probe()).await.is_ok() {
-                this.active.store(0, Ordering::Relaxed);
-                this.members[1].close();
+            } else {
+                let (first, second) = {
+                    let guard = this.members.lock().unwrap();
+                    (guard[0].clone(), guard[1].clone())
+                };
+                if first.query(&probe()).await.is_ok() {
+                    this.active.store(0, Ordering::Relaxed);
+                    second.close();
+                }
             }
             this.checking.store(false, Ordering::Relaxed);
         });
@@ -183,7 +227,10 @@ impl Pool {
     /// has been clearly faster. The first measurement switches at once.
     async fn compare(&self) {
         let i = self.active();
-        let (current, other) = (&self.members[i], &self.members[1 - i]);
+        let (current, other) = {
+            let guard = self.members.lock().unwrap();
+            (guard[i].clone(), guard[1 - i].clone())
+        };
         let first = current.stat().is_none();
         if first {
             let _ = current.query(&probe()).await;

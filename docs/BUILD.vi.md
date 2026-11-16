@@ -15,8 +15,11 @@ cho toolchain MSVC, hoặc `windres` từ
 
 ```powershell
 ./build.ps1                      # build và chép ứng dụng ra dist\yeager.exe
+                                 # VÀ service khôi phục DNS ra
+                                 # dist\yeager-dns-recovery.exe (U09: cả hai đều phát hành)
 
 cargo build --release            # target\release\yeager.exe
+cargo build --release -p dns-recovery  # target\release\yeager-dns-recovery.exe
 cargo build --release -p levi    # target\release\levi.exe, engine bản dòng lệnh
 cargo test --workspace --exclude levi
 ```
@@ -96,10 +99,39 @@ tiên của `master` trên GitLab. Nó dùng remote `gl` (GitLab) và `origin`
    hành trên GitHub, đăng cùng bản phát hành đó lên GitHub.
 
 Mỗi bản phát hành có cùng bộ file ở cả hai nơi: `Yeager-Setup-<phiên bản>.exe`,
-`Yeager-<phiên bản>-portable-x64.zip`, file `yeager.exe` riêng mà trình cập nhật
-trong ứng dụng tải về, `SHA256SUMS.txt`, các báo cáo `*-signature.json`,
+`Yeager-<phiên bản>-portable-x64.zip` (bên trong có sẵn
+`yeager-dns-recovery.exe` đã ký — bản portable dựng service thường trực qua
+bootstrap elevated, Q2 đã chốt), file `yeager.exe` riêng mà trình cập nhật
+trong ứng dụng tải về, file service `yeager-dns-recovery.exe` riêng,
+`SHA256SUMS.txt` (hash cho bộ cài, bản portable, GUI và helper),
+các báo cáo `*-signature.json` (mỗi binary đã ký gồm helper và bộ cài),
 `Yeager-codesign.cer`, `LICENSE` và `THIRD-PARTY-NOTICES.md`. Trên GitHub còn
 có thêm báo cáo VirusTotal (`virustotal-v<phiên bản>.json`) được đính kèm sau.
+
+Helper và bộ cài được kiểm tra theo đúng chính sách hash + chữ ký ghim như
+binary của ứng dụng, và bản mirror GitHub kiểm tra helper trong portable phải
+giống từng byte với helper phát hành riêng.
+
+## Bằng chứng service DNS (U09) và cập nhật đổi service
+
+U09-REV phát hành service khôi phục DNS. Các gate giả lập
+(`provision.rs` + `updater.rs` kể cả `verify_restore` trước khi thay file)
+chạy trong `cargo test --workspace` (không bao giờ đụng NIC thật). Chu trình
+thật qua bộ cài đã build + portable first run (clean install đăng ký/chạy
+với Hello/inspection của binary MỚI, upgrade thay binary KHÁC khi journal
+payload thật còn nguyên, lỗi start cưỡng bức rollback exe + registration,
+maintenance round-trip xong qua seams, clean uninstall trả máy về như cũ,
+NIC snapshots giống hệt, không takeover DNS) được ghi ở
+`C:\projects\yeager-dns-pkg\U09-EVIDENCE.md`.
+
+**Cập nhật đổi service:** nếu Yeager đang cài chưa có recovery service (hoặc
+`manifest.json` của bản mới nêu đổi service/protocol/schema), hãy cập nhật
+bằng bộ cài đã ký, đừng dùng nút cập nhật single-exe trong ứng dụng. Trình
+cập nhật đọc yêu cầu thật của bản mới từ `manifest.json` (mất manifest thì
+mặc định về bộ cài), đọc version thật của service từ pipe Hello, restore/
+verify TRƯỚC khi thay exe (và lại trước restart), từ chối bản đổi service và
+chỉ bạn sang bộ cài; cleanup lỗi thì hủy restart. Chi tiết ở
+`docs/DNS-RECOVERY.md`.
 
 ## Đăng trên GitLab
 

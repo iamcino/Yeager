@@ -7,12 +7,16 @@
 slint::include_modules!();
 
 mod engine;
+mod lifecycle;
+mod bootstrap;
+mod legacy;
 #[cfg(windows)]
 mod platform;
 mod updater;
 
 use common::lang::{self, tr};
 use common::{t, Config, Congestion, DohProvider, Language, Scope, TransportProfile};
+use bootstrap::BootCtl;
 use erwin::config;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
 use std::cell::{Cell, RefCell};
@@ -20,6 +24,16 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The production coordinator type: admission + epoch barriers in front of
+/// the single hange authority, the engine, the UI log drain and the config
+/// save seam. Built once in `main`, shared by every entry path.
+type AppLifecycle = lifecycle::Lifecycle<
+    bootstrap::AppDns,
+    bootstrap::AppEngine,
+    bootstrap::SharedLogUi,
+    bootstrap::NoopPersist,
+>;
 
 /// How often a running Yeager looks for a new release.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -87,6 +101,14 @@ pub fn is_work_area_constrained_snapshot(
     live == [cw.round() as u32, ch.round() as u32]
 }
 
+// U09-REV4 item 1: the pinned thumbprint is derived at build time from
+// `docs/signing/Yeager-codesign.cer` by `crates/app/build.rs` (SHA-1 of the
+// DER, the same source `Get-PinnedThumbprint` loads) and emitted as a
+// generated include. No hand-typed thumbprint constant exists anywhere in
+// this crate; the portable verdict below compares against this derived value.
+#[cfg_attr(not(windows), allow(dead_code))]
+include!(concat!(env!("OUT_DIR"), "/pinned_thumbprint.rs"));
+
 /// Runs a blocking operation off the UI thread and reports the result through a
 /// closure back on the UI thread.
 fn spawn<T: Send + 'static>(
@@ -103,6 +125,256 @@ fn spawn<T: Send + 'static>(
         });
     });
 }
+
+/// U09-REV production service probe for the update gate (§10 item 4):
+/// service capability and compatibility are checked BEFORE installing a
+/// replacement. The service's actual protocol/journal/binary versions are
+/// read from the pipe Hello reply — never fabricated from this binary's own
+/// constants. An unreachable service reads as absent (`None`); an integrity
+/// failure escalates to an unknown-newer journal (real base + 1) so the gate
+/// refuses. Service-changing releases are detected through the release
+/// manifest (`requires_service_binary` / required protocol/journal), which
+/// routes the single-exe updater to the signed installer.
+struct LiveServiceProbe;
+
+impl updater::ServiceProbe for LiveServiceProbe {
+    fn service_info(&self) -> Option<updater::ServiceInfo> {
+        use hange::DnsService as _;
+        let client = hange::PipeClient::new();
+        // Real service versions from the pipe — fails closed to absent when
+        // the service is unreachable or the Hello carries no versions.
+        let versions = client.service_versions()?;
+        let mut status_client = hange::PipeClient::new();
+        let rep = status_client.status();
+        let base_protocol = versions.protocol;
+        let base_journal = versions.journal_version;
+        let service_version = versions.service_version;
+        match rep.outcome {
+            hange::SvcOutcome::Unavailable => None,
+            hange::SvcOutcome::IntegrityError => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal.saturating_add(1),
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::UnknownVersion(
+                    base_journal.saturating_add(1),
+                ),
+            }),
+            hange::SvcOutcome::Unsupported => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::IntegrityError,
+            }),
+            hange::SvcOutcome::Pending => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Pending,
+            }),
+            hange::SvcOutcome::Conflict => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Conflict,
+            }),
+            hange::SvcOutcome::Busy => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::OwnedActive,
+            }),
+            _ => Some(updater::ServiceInfo {
+                protocol: base_protocol,
+                journal_version: base_journal,
+                service_version,
+                state: updater::ServiceState::Running,
+                journal: updater::JournalStatus::Clean,
+            }),
+        }
+    }
+
+    fn journal_version(&self) -> Option<u32> {
+        self.service_info().map(|s| s.journal_version)
+    }
+
+    fn verify_restore(&self) -> bool {
+        // Pre-replacement restore/verify gate (§10 item 4): a compatible
+        // GUI-only update restores/verifies BEFORE the exe replacement. The
+        // service must report a clean, verified state; pending/conflict/busy
+        // (or an unreachable service) blocks the replacement.
+        matches!(
+            self.service_info(),
+            Some(info) if matches!(info.journal, updater::JournalStatus::Clean)
+        )
+    }
+}
+
+/// U09: protected-install detection (Q2 ruled). The installer distribution
+/// runs from `%ProgramFiles%\Yeager`; anything else is the portable
+/// distribution. This is a UI-gating heuristic only — the real protection is
+/// the service ACL plus the invariant that portable cleanup never deletes
+/// the protected binary or ProgramData state
+/// (`dns_recovery::provision::portable_removal_scope`).
+fn is_protected_install() -> bool {
+    std::env::current_exe()
+        .map(|p| {
+            let s = p.to_string_lossy().to_lowercase();
+            s.contains("program files") && s.contains("yeager")
+        })
+        .unwrap_or(false)
+}
+
+/// U09-REV Q2: absent-service portable takeover refuses. Takeover is allowed
+/// only when the real service state is healthy (Running + Clean): pending,
+/// conflict and busy pipe outcomes are not a healthy service, and a
+/// path-string match is not a service check. Both distributions require the
+/// same healthy-service proof; an absent/stopped/pending service stays
+/// diagnostic-only.
+fn portable_takeover_allowed() -> bool {
+    use crate::updater::ServiceProbe as _;
+    matches!(
+        LiveServiceProbe.service_info(),
+        Some(info)
+            if matches!(info.state, updater::ServiceState::Running)
+                && matches!(info.journal, updater::JournalStatus::Clean)
+    )
+}
+
+/// U09-REV4 item 1 + item 8: computed portable helper signature verdict
+/// (never a hardcoded `Valid`). Verifies the carried helper for real —
+/// pinned thumbprint from the build-time derived `PINNED_THUMBPRINT`
+/// (generated from `docs/signing/Yeager-codesign.cer`, same source as
+/// `tools/signing/common.ps1` `Get-PinnedThumbprint`) + RFC 3161 timestamp
+/// validity under the release verify rule (`tools/signing/verify.ps1`).
+#[cfg(windows)]
+fn portable_helper_signature(path: &std::path::Path) -> dns_recovery::provision::SignatureCheck {
+    use dns_recovery::provision::SignatureCheck;
+    let ps = format!(
+        "$s=Get-AuthenticodeSignature -FilePath '{p}'; \
+         $t=''; if ($s.SignerCertificate) {{ $t=$s.SignerCertificate.Thumbprint.ToUpperInvariant() }}; \
+         if ($t -ne '{pinned}') {{ exit 10 }}; \
+         if ($s.Status -in @('NotSigned','HashMismatch','NotSupportedFileFormat','Incompatible')) {{ exit 11 }}; \
+         $u=($s.Status -eq 'UnknownError' -and $s.StatusMessage -like '*root certificate which is not trusted*'); \
+         if (($s.Status -ne 'Valid') -and ($s.Status -ne 'NotTrusted') -and (-not $u)) {{ exit 12 }}; \
+         if (-not $s.TimeStamperCertificate) {{ exit 13 }}; exit 0",
+        p = path.to_string_lossy().replace('\'', "''"),
+        pinned = PINNED_THUMBPRINT
+    );
+    match std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &ps])
+        .output()
+    {
+        Ok(o) if o.status.success() => SignatureCheck::Valid,
+        Ok(o) if o.status.code() == Some(10) || o.status.code() == Some(11) => {
+            SignatureCheck::Invalid
+        }
+        Ok(_) => SignatureCheck::Invalid,
+        Err(_) => SignatureCheck::Unavailable,
+    }
+}
+
+/// U09-REV2 item 8: actual portable removal path — calls the removal
+/// predicate (behavior, not constants). Removes only stale portable-folder
+/// files; any protected deletion target is refused without touching the
+/// filesystem.
+#[cfg(windows)]
+fn portable_cleanup_stale() {
+    if is_protected_install() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    for name in ["yeager.old.exe", "yeager.new.exe"] {
+        let p = exe.with_file_name(name);
+        let s = p.to_string_lossy().to_string();
+        // The predicate enforces the invariant on the real path.
+        if dns_recovery::provision::portable_delete_guarded(&s).is_err() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(not(windows))]
+fn portable_cleanup_stale() {}
+
+/// U09-REV Q2 bootstrap (E): first run from a portable folder with the
+/// service absent, elevated, and the helper signature valid copies the helper
+/// into protected Program Files and installs the service through the seam.
+/// The planner arm (`plan_portable`) is consulted with the real context;
+/// only `ProvisionViaElevatedBootstrap` proceeds to elevate/copy/spawn.
+#[cfg(windows)]
+fn maybe_portable_bootstrap() {
+    use crate::updater::ServiceProbe as _;
+    if is_protected_install() {
+        return;
+    }
+    // Service already present (even stopped): maintain, do not reinstall here.
+    if LiveServiceProbe.service_info().is_some() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let portable_helper = exe.with_file_name(dns_recovery::provision::SERVICE_BINARY_NAME);
+    if !portable_helper.exists() {
+        return;
+    }
+    // Elevated bootstrap required: an unelevated portable never silently
+    // installs machine software (planner refuses above).
+    let elevated = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 };
+    if !elevated {
+        eprintln!("portable first run requires the elevated bootstrap; takeover refused, diagnostic UI only");
+        return;
+    }
+    // Computed verdict for real (item 8) — never a hardcoded Valid.
+    let sig = portable_helper_signature(&portable_helper);
+    if sig != dns_recovery::provision::SignatureCheck::Valid {
+        eprintln!("portable helper signature did not verify ({sig:?}); takeover refused, diagnostic UI only");
+        return;
+    }
+    let ctx = dns_recovery::provision::PortableContext {
+        location: dns_recovery::provision::LaunchLocation::PortableFolder,
+        service: dns_recovery::provision::ServiceState::Absent,
+        journal: dns_recovery::provision::JournalStatus::Absent,
+        elevated: true,
+        helper_signature: sig,
+    };
+    if !matches!(
+        dns_recovery::provision::plan_portable(&ctx),
+        dns_recovery::provision::PortableDecision::ProvisionViaElevatedBootstrap
+    ) {
+        return;
+    }
+    // Spawn the carried helper's own install seam: it copies itself into
+    // protected Program Files, applies the protected ACL, registers the
+    // service, and Hello-validates. Failures leave no partial service behind.
+    match std::process::Command::new(&portable_helper)
+        .arg("--install-service")
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("portable bootstrap provisioned the recovery service");
+        }
+        Ok(status) => {
+            eprintln!("portable bootstrap install seam refused (exit {status}); diagnostic UI only");
+        }
+        Err(e) => {
+            eprintln!("portable bootstrap spawn failed ({e}); diagnostic UI only");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn maybe_portable_bootstrap() {}
 
 fn scope_from_index(i: i32) -> Scope {
     match i {
@@ -180,25 +452,118 @@ fn apply_config_to_ui(ui: &MainWindow, cfg: &Config) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    // Run by the uninstaller after it has closed the app: put back what Yeager
-    // changed in Windows (TCP, DNS, the logon task) and exit without a window.
+    // --- U08 early bootstrap (SPEC-DNS-FIX.md §7) ---
+    // The lifecycle coordinator and its seams are built FIRST, before
+    // config load, updater work, the window, the tray, networking and
+    // connect-on-launch. Journal inspection and dead-owner recovery run
+    // before any fallible initialization; the guard below settles this
+    // process's lease on every early return without bypass.
+    let notify_log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let authority = hange::dns_authority();
+    // Engine-start config for the lifecycle's epoch-gated engine starts.
+    // Mirrored from the UI config and synced just before every start, so a
+    // start always uses the current snapshot, never a stale one.
+    let engine_cfg: Arc<Mutex<Config>> = Arc::new(Mutex::new(Config::default()));
+    let engine_cfg_for_start = engine_cfg.clone();
+    let app_engine = bootstrap::AppEngine::new(Arc::new(move || engine_cfg_for_start.lock().unwrap().clone()));
+    let app_engine_handle = app_engine.clone();
+    let shared_ui = bootstrap::SharedLogUi::new(notify_log.clone());
+    let shared_ui_drain = shared_ui.clone();
+    let lifecycle: Arc<AppLifecycle> = Arc::new(lifecycle::Lifecycle::new(
+        bootstrap::AppDns::new(authority.clone()),
+        app_engine,
+        shared_ui,
+        bootstrap::NoopPersist,
+        lifecycle::LifecycleConfig::default(),
+    ));
+    let boot = bootstrap::RealBootCtl::new(lifecycle.clone());
+    let sync_engine_cfg = |cfg: &Config| {
+        *engine_cfg.lock().unwrap() = cfg.clone();
+    };
+
+    // Started by an update: the previous exe is on its way out.
+    let updated = std::env::args().any(|a| a == updater::UPDATED_ARG);
+    let resume = std::env::args().any(|a| a == updater::CONNECT_ARG);
+
+    // Run by the uninstaller after it has closed the app: exact
+    // result-bearing recovery first (spec §6 uninstaller row), then the
+    // separate TCP and logon cleanup. A failed journal is retained and the
+    // exit is nonzero — silent failure chains are forbidden. No guard is
+    // armed on this path: the cleanup itself is the lifecycle outcome.
     if std::env::args().any(|a| a == "--cleanup") {
-        let _ = erwin::restore();
-        let _ = erwin::latency::restore();
-        hange::clean_up_leftovers();
-        let _ = erwin::set_launch_at_login(false, &Default::default());
+        std::process::exit(cleanup_and_exit());
+    }
+
+    // --- U08 bootstrap order (spec §7) ---
+    // Inspection and dead-owner recovery run FIRST, before the guard, the
+    // updater background work and the single-instance check. A live owner
+    // means quit without touching DNS and without arming any guard: this
+    // process owns no lease, so exiting must quiesce nothing. The duplicate
+    // path below likewise returns before any guard exists, so a panic there
+    // can never fire a shutdown from `Drop`.
+    let journal = boot.inspect();
+    if let bootstrap::JournalState::OwnedLive { owner } = &journal {
+        eprintln!("another Yeager owns DNS ({owner}); activating it");
         return Ok(());
     }
+    let recovery = match &journal {
+        bootstrap::JournalState::Clean | bootstrap::JournalState::OwnedDead { .. } => Some(boot.recover()),
+        _ => None,
+    };
+    let decision = match &recovery {
+        Some(bootstrap::BootRecovery::RestoredVerified) => bootstrap::BootDecision::ProceedAutoConnect,
+        Some(other) => bootstrap::BootDecision::ProceedDiagnosticOnly {
+            reason: format!("recovery did not verify ({other:?}); auto-connect blocked"),
+        },
+        None => bootstrap::classify_boot(&journal),
+    };
+    let auto_connect_blocked = decision.blocks_auto_connect();
+    // U09-REV Q2 bootstrap (E): portable first run provisions the persistent
+    // service via the elevated bootstrap before the takeover gate runs.
+    // Stale portable files are cleaned through the guarded removal path.
+    portable_cleanup_stale();
+    maybe_portable_bootstrap();
+    // U09 Q2: absent-service portable takeover refuses. A portable GUI with
+    // no reachable recovery service stays diagnostic-only: no silent
+    // install, no watchdog from a writable folder. The installer
+    // distribution provisions the service; the portable first run provisions
+    // it via the elevated bootstrap into protected Program Files.
+    let portable_blocked = !portable_takeover_allowed();
+    if portable_blocked {
+        eprintln!("portable without an installed recovery service; takeover refused, diagnostic UI only");
+    }
+    let auto_connect_blocked = auto_connect_blocked || portable_blocked;
+    let boot_diagnostic = bootstrap::BootDiagnostics {
+        decision: decision.clone(),
+        recovery: recovery.clone(),
+        authority_pending: None,
+        legacy_summary: None,
+    };
+
+    updater::finish_previous_update(updated);
+
+    #[cfg(windows)]
+    let instance_guard = match platform::ensure_single_instance(updated) {
+        platform::SingleInstanceDecision::Proceed(guard) => guard,
+        // Duplicate instance (spec §6 row): early owner inspection already
+        // ran above and left the live owner alone. No guard is armed on
+        // this path, so exiting quiesces nothing.
+        platform::SingleInstanceDecision::AlreadyRunning => {
+            return Ok(());
+        }
+    };
 
     #[cfg(windows)]
     {
         let build = platform::get_windows_build();
         if build > 0 && build < 20348 {
-            // Safety: if the user upgraded to a version requiring Win11 while having
-            // active configurations or backups from a previous Yeager run, restore them cleanly.
+            // Unsupported OS (spec §6 row): minimal recovery already ran
+            // above; the restore attempt is idempotent, unsupported
+            // capability stays pending debt, and nothing is ever cleared
+            // heuristically. No guard is armed: nothing further to settle.
+            let _ = hange::restore();
             let _ = erwin::restore();
             let _ = erwin::latency::restore();
-            hange::clean_up_leftovers();
             let _ = erwin::set_launch_at_login(false, &Default::default());
 
             platform::show_unsupported_os_dialog(build);
@@ -206,10 +571,11 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
-    // Started by an update: the previous exe is on its way out.
-    let updated = std::env::args().any(|a| a == updater::UPDATED_ARG);
-    let resume = std::env::args().any(|a| a == updater::CONNECT_ARG);
-    updater::finish_previous_update(updated);
+    // The guard is armed only after inspection, recovery, updater work, the
+    // single-instance check and the unsupported-OS early return — every
+    // later fallible initialization below settles this process's lease
+    // through the coordinator, and no early path can fire it by accident.
+    let mut boot_guard = bootstrap::BootGuard::arm(&boot, bootstrap::BootShutdownKind::ProcessQuit);
 
     // LGPL substitution mechanism: the ONLY way to redirect the driver load
     // away from the protected %ProgramData%\Yeager\driver store. Never read
@@ -226,14 +592,20 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
-    #[cfg(windows)]
-    let instance_guard = match platform::ensure_single_instance(updated) {
-        platform::SingleInstanceDecision::Proceed(guard) => guard,
-        platform::SingleInstanceDecision::AlreadyRunning => return Ok(()),
-    };
 
-    let ui = MainWindow::new()?;
+    // MainWindow::new failure (spec §6 row): recovery already ran above;
+    // the guard settles this process's lease without UI, and the original
+    // error is returned — no `?` bypass.
+    let ui = match MainWindow::new() {
+        Ok(ui) => ui,
+        Err(e) => {
+            lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+            boot_guard.complete();
+            return Err(e);
+        }
+    };
     let cfg = Rc::new(RefCell::new(config::load()));
+    sync_engine_cfg(&cfg.borrow());
     // Validate on load, fall back as a pair: missing/invalid/below-minimum /
     // implausibly huge legacy values resolve to the last validated geometry
     // (here: preferred 860x600), never clamped into a minimum-size window.
@@ -276,7 +648,21 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_congestion(provider_label(erwin::current_provider()).into());
 
     #[cfg(windows)]
-    let tray = platform::setup(&ui, shared_lkg.clone());
+    let tray = {
+        // Tray Exit (spec §6 row): quiesce before quit_event_loop. The quit
+        // runs on a worker thread so the UI thread never blocks; the
+        // epilogue below joins the same shutdown (idempotent, one restore).
+        let lc = lifecycle.clone();
+        platform::setup(&ui, move || {
+            let lc = lc.clone();
+            std::thread::spawn(move || {
+                lc.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+                let _ = slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                });
+            });
+        }, shared_lkg.clone())
+    };
     #[cfg(windows)]
     platform::watch_show_requests(&ui, &instance_guard, shared_lkg.clone());
     #[cfg(windows)]
@@ -346,9 +732,15 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     // --- Engine toggle ---
+    // U08: DNS work goes through the lifecycle admission barrier and engine
+    // starts go through the epoch gate (spec §6 step 1); nothing here uses
+    // the old detached DNS spawn path.
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let lc = lifecycle.clone();
+        let mirror = engine_cfg.clone();
+        let engine_handle = app_engine_handle.clone();
         ui.on_toggle_engine(move |active| {
             let Some(ui) = w.upgrade() else { return };
             if active {
@@ -363,16 +755,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_engine_status(tr("Đang bật DoH…", "Starting DoH…").into());
                 let snapshot = cfg.borrow().clone();
                 if hange::is_enabled() {
-                    start_engine(&ui, &snapshot);
+                    start_engine_gated(&ui, &snapshot, &lc, &mirror, &engine_handle);
                 } else {
-                    let (choice, http3) = (dns_choice(&snapshot), snapshot.doh_http3);
-                    enable_doh_then(&ui, w.clone(), choice, http3, move |ui, _, ok| {
+                    let (choice, local) = (dns_choice(&snapshot), snapshot.doh_http3);
+                    let lc = lc.clone();
+                    let for_dns = lc.clone();
+                    let mirror = mirror.clone();
+                    let engine_handle = engine_handle.clone();
+                    enable_doh_then(&ui, w.clone(), &for_dns, false, choice, local, move |ui, _, ok| {
                         // Switched off again while DoH was coming up.
                         if !ui.get_engine_active() {
                             return;
                         }
                         if ok {
-                            start_engine(ui, &snapshot);
+                            start_engine_gated(ui, &snapshot, &lc, &mirror, &engine_handle);
                         } else {
                             ui.set_engine_active(false);
                             ui.set_engine_status(tr("Lỗi", "Error").into());
@@ -381,8 +777,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     });
                 }
             } else {
-                // DoH stays as the user set it: it works on its own.
-                engine::stop();
+                // Engine toggle off (spec §6 row): retain independent DNS
+                // unless DNS enable itself failed. While a coordinator
+                // shutdown is in flight its own engine stop covers this.
+                if lc.snapshot().admission_open {
+                    engine::stop();
+                }
                 ui.set_engine_active(false);
                 ui.set_engine_status(tr("Đang tắt", "Off").into());
                 ui.set_log(tr("Đã tắt engine. DNS mã hóa vẫn giữ nguyên.", "Engine off. Encrypted DNS stays on.").into());
@@ -707,10 +1107,20 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let drain = shared_ui_drain.clone();
+        let boot_diag = boot_diagnostic.clone();
         dns_stats_timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
+            // Listener supervision (spec §6 listener rows): terminal task
+            // loss closes admission and restores via the service; ordinary
+            // receive/accept/connection errors stay recoverable and never
+            // quit. Runs even when the window is hidden so a dead listener
+            // cannot sit unsupervised.
+            let _ = hange::supervise_tick();
             if let Some(ui) = w.upgrade().filter(|ui| ui.window().is_visible()) {
                 refresh_dns_stats(&ui, &cfg.borrow(), &dns_stats);
                 refresh_engine_stats(&ui);
+                // Live coordinator debt + shutdown-thread notes surface here.
+                refresh_recovery_ui(&ui, &boot_diag, &drain);
                 if ui.get_page() == 0 && network_at.get().is_none_or(|at| at.elapsed() >= NETWORK_REFRESH) {
                     network_at.set(Some(Instant::now()));
                     refresh_network(&ui);
@@ -775,29 +1185,37 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     // --- DNS ---
+    // U08: enables go through lifecycle admission (queued, epoch-barred),
+    // provider/local changes through reconfigure (retaining the original),
+    // and DNS-off through the DnsOff shutdown — never the old detached
+    // spawn of `hange::enable` / `hange::disable`.
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let lc = lifecycle.clone();
         ui.on_set_doh(move |on| {
             cfg.borrow_mut().doh_enabled = on;
             config::save(&cfg.borrow());
             let Some(ui) = w.upgrade() else { return };
             if on {
-                enable_doh(&ui, w.clone(), dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
+                enable_doh(&ui, w.clone(), &lc, dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
             } else if ui.get_engine_active() {
                 // The engine cannot run without DoH, so it goes too.
-                engine::stop();
+                if lc.snapshot().admission_open {
+                    engine::stop();
+                }
                 ui.set_engine_active(false);
                 ui.set_engine_status(tr("Đang tắt", "Off").into());
-                restore_doh(&ui, w.clone(), tr("Đã tắt DNS mã hóa và engine (engine cần DoH).", "Encrypted DNS and the engine are off (the engine needs DoH)."));
+                dns_off_then(&ui, w.clone(), &lc, tr("Đã tắt DNS mã hóa và engine (engine cần DoH).", "Encrypted DNS and the engine are off (the engine needs DoH)."));
             } else {
-                restore_doh(&ui, w.clone(), tr("Đã tắt DNS mã hóa.", "Encrypted DNS off."));
+                dns_off_then(&ui, w.clone(), &lc, tr("Đã tắt DNS mã hóa.", "Encrypted DNS off."));
             }
         });
     }
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let lc = lifecycle.clone();
         ui.on_set_doh_provider(move |i| {
             {
                 let mut cfg = cfg.borrow_mut();
@@ -810,7 +1228,10 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(ui) = w.upgrade() {
                 ui.set_doh_provider(provider_index(&cfg.borrow()));
                 if cfg.borrow().doh_enabled {
-                    enable_doh(&ui, w.clone(), dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
+                    // Provider change (spec §6 row): serialized reconfigure
+                    // retaining the pre-takeover original, not a fresh
+                    // enable over the old configuration.
+                    enable_doh_then(&ui, w.clone(), &lc, true, dns_choice(&cfg.borrow()), cfg.borrow().doh_http3, |_, _, _| {});
                 }
             }
         });
@@ -818,13 +1239,14 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let w = ui.as_weak();
         let cfg = cfg.clone();
+        let lc = lifecycle.clone();
         ui.on_set_doh_http3(move |on| {
             cfg.borrow_mut().doh_http3 = on;
             config::save(&cfg.borrow());
             let Some(ui) = w.upgrade() else { return };
             ui.set_doh_http3(on);
             if hange::is_enabled() {
-                enable_doh(&ui, w.clone(), dns_choice(&cfg.borrow()), on);
+                enable_doh_then(&ui, w.clone(), &lc, true, dns_choice(&cfg.borrow()), on, |_, _, _| {});
             }
         });
     }
@@ -842,14 +1264,21 @@ fn main() -> Result<(), slint::PlatformError> {
                 move || {
                     let (ip, transport) = hange::resolve(provider, "discord.com")?;
                     let ifaces = if hange::is_enabled() { hange::verify_system(provider)? } else { Vec::new() };
-                    // Without the stub the test went straight out, but Windows
-                    // resolves through its own DoH: report what Windows uses.
-                    let transport = if hange::is_enabled() && !hange::stub_running() { None } else { transport };
-                    Ok::<_, common::Error>((ip, transport, ifaces))
+                    // Resolve through the stub carries no per-query transport
+                    // (the stub forwards over its own fastest route): report
+                    // the stub itself. Without the stub the query went
+                    // straight out, but Windows resolves through its own
+                    // DoH: report what Windows uses.
+                    let via_stub = hange::stub_running();
+                    Ok::<_, common::Error>((ip, transport, ifaces, via_stub))
                 },
                 move |ui, res| match res {
-                    Ok((ip, transport, ifaces)) => {
-                        let via = transport.map_or("DoH Windows", hange::Transport::label);
+                    Ok((ip, transport, ifaces, via_stub)) => {
+                        let via = if via_stub {
+                            tr("DNS cục bộ", "local DNS").to_string()
+                        } else {
+                            transport.map_or("DoH Windows", hange::Transport::label).to_string()
+                        };
                         let provider = hange::status().map_or(provider, |s| s.provider);
                         ui.set_dns_status(format!("OK · {} · {via} · discord.com → {ip}", provider.label()).into());
                         ui.set_log(if ifaces.is_empty() {
@@ -1005,7 +1434,16 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_busy(true);
             ui.set_log(t!("Đang tải Yeager {version}…", "Downloading Yeager {version}…").into());
             let restart = restart.clone();
-            spawn(w.clone(), move || updater::download_and_install(&version), move |ui, res| {
+            // U09-REV gate: service capability and compatibility are checked
+            // BEFORE installing a replacement, with the target release's real
+            // manifest requirements (fail-closed to the installer when the
+            // manifest is unavailable). A service-changing update is refused
+            // here with directions to the signed installer before any
+            // replacement; a compatible GUI-only update restores/verifies
+            // BEFORE the exe replacement (and the epilogue still gates the
+            // restart on the coordinator shutdown verify).
+            let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
+            spawn(w.clone(), move || updater::download_and_install_gated_release(&LiveServiceProbe, current, &version), move |ui, res| {
                 ui.set_update_busy(false);
                 match res {
                     Ok(path) => {
@@ -1059,17 +1497,61 @@ fn main() -> Result<(), slint::PlatformError> {
     let update_timer = slint::Timer::default();
     update_timer.start(slint::TimerMode::Repeated, UPDATE_CHECK_INTERVAL, quiet_check);
 
+    // Session notifications (spec §6 row) and legacy detection are armed
+    // before auto-enable, so a logoff racing startup still reaches the
+    // coordinator and the DNS page can report leftovers from the start.
+    #[cfg(windows)]
+    {
+        let lc = lifecycle.clone();
+        platform::install_session_hook(Arc::new(move |event| {
+            use bootstrap::{handle_session, SessionAction, SessionEvent};
+            match handle_session(event) {
+                SessionAction::StartQuiesce => {
+                    // Query-end starts quiesce only (spec §6): admission
+                    // closes now on a worker; the end-session decision joins
+                    // the same in-flight work. Never a DnsOff shutdown here:
+                    // DnsOff would set `reopened` when DNS verifies and
+                    // reopen the old epoch.
+                    let lc = lc.clone();
+                    std::thread::spawn(move || {
+                        lc.quiesce_for_session();
+                    });
+                }
+                SessionAction::BoundedQuit => {
+                    // Bounded synchronous cleanup through the quit-kind path;
+                    // never reopens. Anything unfinished stays covered by the
+                    // service and replay.
+                    lc.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+                    if event == SessionEvent::ConsoleCtrl {
+                        std::process::exit(0);
+                    }
+                }
+                SessionAction::JoinOnly => {
+                    // Canceled end-session: finish the current restoration
+                    // without reopening the old epoch. Joining via the
+                    // quit-kind path never reopens; a pure DnsOff join could.
+                    lc.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+                }
+            }
+        }));
+    }
+    run_legacy_detection(&ui);
+    refresh_recovery_ui(&ui, &boot_diagnostic, &shared_ui_drain);
+
     // Auto-connect on launch (which brings DoH up first), or DoH alone if
-    // that is all the user keeps on. Otherwise undo DNS settings a crashed
-    // run may have left pointing at a stub that is no longer there.
+    // that is all the user keeps on. An unknown/deferred journal blocks
+    // auto-connect (spec §7): the diagnostic UI still runs, DNS stays off.
     let (connect, doh) = (cfg.borrow().connect_on_launch, cfg.borrow().doh_enabled);
-    if connect || resume {
+    if auto_connect_blocked {
+        ui.set_log(boot_diagnostic.state_line().into());
+    } else if connect || resume {
         ui.invoke_toggle_engine(true);
     } else if doh {
-        enable_doh(&ui, ui.as_weak(), dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
-    } else {
-        std::thread::spawn(hange::clean_up_leftovers);
+        enable_doh(&ui, ui.as_weak(), &lifecycle, dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
     }
+    // (No heuristic leftover clear: the early recovery above already
+    // replayed the journal through the service. A crashed run's loopback
+    // reference is debt the service owns, never a pattern to clear here.)
     // TCP tuning stands on its own: it follows its own switch, not the engine.
     if cfg.borrow().tcp_enabled {
         apply_congestion(&ui, ui.as_weak(), cfg.borrow().congestion);
@@ -1080,7 +1562,15 @@ fn main() -> Result<(), slint::PlatformError> {
         std::thread::spawn(erwin::latency::restore);
     }
 
-    ui.show()?;
+    ui.show().map_err(|e| {
+        // ui.show failure (spec §6 row): the guard settles our lease —
+        // recovery already ran at bootstrap — then the original error is
+        // returned with the recovery report attached. No `?` bypass.
+        let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+        boot_guard.complete();
+        eprintln!("UI show failed after DNS recovery ({report:?}): {e}");
+        e
+    })?;
     #[cfg(windows)]
     platform::apply_window_chrome(&ui);
     // Commit the validated pair only after native bounds have settled. A
@@ -1191,7 +1681,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // `ui.run()` would end as soon as the window hides to the tray, taking the
     // tray with it. Run until the tray's Thoát (or close without a tray) quits.
-    slint::run_event_loop_until_quit()?;
+    if let Err(e) = slint::run_event_loop_until_quit() {
+        // Event-loop error (spec §6 row): await coordinator cleanup, then
+        // return the original error plus the recovery report.
+        let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+        boot_guard.complete();
+        eprintln!("event loop failed after DNS recovery ({report:?}): {e}");
+        return Err(e);
+    }
     // A domain edit still waiting for its debounced save.
     if domain_save.running() {
         domain_save.stop();
@@ -1209,15 +1706,115 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(windows)]
     drop(tray);
 
-    engine::stop();
+    // --- Epilogue: coordinator process-shutdown (spec §6 ordering) ---
+    // 1. Quiesce → settle → restore → verify → listener-stop, with the
+    //    engine stop running detached and bounded (never before DNS).
+    // 2. Only then the separate TCP/logon cleanup (engine/TCP locks are
+    //    never on the DNS path).
+    // 3. The update gate: a failed cleanup cancels the restart (spec §10);
+    //    an unverified restore never launches the replacement.
+    let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
+    boot_guard.complete();
+    if !report.successful() {
+        eprintln!("shutdown DNS debt retained ({:?}); update restart cancelled", report.dns);
+    }
+    // Separate TCP cleanup, after DNS (engine/TCP locks never gate DNS).
+    // Launch-at-login is a user setting: only the uninstaller clears it.
     let _ = erwin::restore();
-    hange::disable();
     drop(update_timer);
     let restart = restart.lock().unwrap().take();
-    if let Some((path, connect)) = restart {
+    // U09: failed cleanup cancels the restart through the shared gate
+    // (updater::may_restart_after_cleanup); an unverified restore never
+    // launches the replacement.
+    if let Some((path, connect)) = restart
+        && updater::may_restart_after_cleanup(report.successful()) {
         updater::restart(&path, connect);
     }
     Ok(())
+}
+
+/// Exact result-bearing cleanup for `--cleanup` (uninstaller path).
+/// Returns the process exit code as the lifecycle outcome it actually is:
+/// 0 verified clean, 10 live-owner/busy, 11 pending/unavailable, 12
+/// conflict, 13 privilege/auth. A failed journal is retained and
+/// TCP/logon cleanup still runs, but the nonzero DNS result stands.
+fn cleanup_and_exit() -> i32 {
+    cleanup_and_exit_with(hange::restore)
+}
+
+/// Testable core of [`cleanup_and_exit`]: the restore call is injected so
+/// tests drive every exit-table row without touching the real service.
+/// Production passes `hange::restore`; TCP/logon cleanup still runs in both.
+fn cleanup_and_exit_with(
+    restore: impl FnOnce() -> Result<hange::AuthorityStatus, common::Error>,
+) -> i32 {
+    let code = cleanup_code(restore());
+    if code != 0 {
+        // TCP/logon cleanup still runs, but the nonzero DNS result stands.
+        let _ = erwin::restore();
+        let _ = erwin::latency::restore();
+        let _ = erwin::set_launch_at_login(false, &Default::default());
+        return code;
+    }
+    let _ = erwin::restore();
+    let _ = erwin::latency::restore();
+    let _ = erwin::set_launch_at_login(false, &Default::default());
+    0
+}
+
+/// Pure mapping for [`cleanup_and_exit`]: the lifecycle restore outcome to
+/// the §8.3 exit code. `Busy` (live owner holds the machine lease) is 10,
+/// pending/unavailable is 11, conflict is 12, privilege/auth is 13.
+/// Unavailable is 11 (not 13): the service is reachable but debt remains and
+/// the journal is retained — §8.3 and `protocol::exit_code_for_outcome` put
+/// pending/unavailable/deferred at 11, while 13 is privilege/service/auth
+/// (`refused`/`auth_rejected`/`service_unavailable`). No digit-substring
+/// matching: an arbitrary message containing "10" or "13" must never decide
+/// the code.
+fn cleanup_code(result: Result<hange::AuthorityStatus, common::Error>) -> i32 {
+    match result {
+        Ok(status) if status.pending.is_none() => 0,
+        Ok(status) => {
+            let debt = status.pending.unwrap_or_default();
+            eprintln!("cleanup: DNS debt retained, journal kept: {debt}");
+            // A retained lease that is still live reports as busy debt;
+            // everything else pending (including unavailable) stays 11.
+            if debt.contains("Busy")
+                || debt.contains("busy")
+                || debt.contains("live-owner")
+                || debt.contains("live_owner")
+            {
+                10
+            } else {
+                11
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("cleanup: DNS restore failed, journal kept: {msg}");
+            if msg.contains("Conflict") || msg.contains("conflict") {
+                12
+            } else if msg.contains("Busy")
+                || msg.contains("busy")
+                || msg.contains("live-owner")
+                || msg.contains("live_owner")
+            {
+                10
+            } else if msg.contains("privilege")
+                || msg.contains("Privilege")
+                || msg.contains("auth")
+                || msg.contains("Auth")
+                || msg.contains("refused")
+                || msg.contains("Refused")
+                || msg.contains("service_unavailable")
+            {
+                13
+            } else {
+                // Includes `Unavailable`/`unavailable`: debt retained, 11.
+                11
+            }
+        }
+    }
 }
 
 /// Looks up the local and public addresses for the network card off the UI
@@ -1523,77 +2120,157 @@ fn check_for_update(ui: &MainWindow, w: Weak<MainWindow>, quiet: bool) {
     });
 }
 
-fn enable_doh(ui: &MainWindow, w: Weak<MainWindow>, choice: hange::Choice, http3: bool) {
-    enable_doh_then(ui, w, choice, http3, |_, _, _| {});
+fn enable_doh(ui: &MainWindow, w: Weak<MainWindow>, lc: &Arc<AppLifecycle>, choice: hange::Choice, local: bool) {
+    enable_doh_then(ui, w, lc, false, choice, local, |_, _, _| {});
 }
 
-/// Applies DoH off the UI thread, then calls `then` on the UI thread with
-/// whether it worked.
+/// Applies DNS through the lifecycle admission barrier (spec §6 steps 1–2):
+/// the request is queued under the current epoch, then run on a worker
+/// thread — never on the old detached DNS spawn path. `is_change` admits a
+/// provider/local-mode change as a reconfigure retaining the original
+/// (distinct from enable); both are cancelled at the same drain. `then`
+/// runs on the UI thread with whether the new configuration is in effect.
 fn enable_doh_then(
     ui: &MainWindow,
     w: Weak<MainWindow>,
+    lc: &Arc<AppLifecycle>,
+    is_change: bool,
     choice: hange::Choice,
-    http3: bool,
+    local: bool,
     then: impl FnOnce(&MainWindow, Weak<MainWindow>, bool) + Send + 'static,
 ) {
+    use lifecycle::RunOutcome;
     ui.set_log(tr("Đang bật DNS mã hóa…", "Turning encrypted DNS on…").into());
+    let admitted = if is_change {
+        lc.request_change(choice, local)
+    } else {
+        lc.request_enable(choice, local)
+    };
+    let ticket = match admitted {
+        Ok(t) => t,
+        Err(refusal) => {
+            // Admission closed (shutdown in flight or a completed quit):
+            // refuse instead of committing after the restore barrier.
+            show_doh_result(ui, choice, local, false, &refusal.to_string());
+            then(ui, w, false);
+            return;
+        }
+    };
+    let ticket_id = ticket.id;
+    let lc = lc.clone();
     let weak = w.clone();
-    spawn(w, move || hange::enable(choice, http3), move |ui, res| {
-        let ok = res.is_ok();
-        show_doh_result(&ui, choice, http3, res);
+    spawn(w, move || lc.run_queued(), move |ui, run| {
+        let (ok, detail) = match run {
+            lifecycle::RunOutcome::Finished { outcome, .. } => {
+                (outcome.successful(), format!("ticket {ticket_id}: {outcome:?}"))
+            }
+            RunOutcome::StaleDiscarded { .. } => (
+                false,
+                format!("ticket {ticket_id} stale: admission closed before apply; no DNS committed"),
+            ),
+            RunOutcome::Panicked { .. } => (
+                false,
+                format!("ticket {ticket_id}: DNS worker panicked; the barrier was released, nothing committed"),
+            ),
+            RunOutcome::Empty => (
+                false,
+                format!("ticket {ticket_id}: queued work drained at admission close; nothing committed"),
+            ),
+        };
+        show_doh_result(&ui, choice, local, ok, &detail);
         then(&ui, weak, ok);
     });
 }
 
-fn show_doh_result(ui: &MainWindow, choice: hange::Choice, http3: bool, res: common::Result<hange::Applied>) {
-    match res {
-        Ok(applied) => {
-            let mode = if applied.stub { tr("DNS cục bộ", "local DNS") } else { "DoH Windows" };
-            ui.set_dns_status(format!("{} ({mode})", choice_label(choice)).into());
+fn show_doh_result(ui: &MainWindow, choice: hange::Choice, local: bool, ok: bool, detail: &str) {
+    if ok {
+        // The serving state is read back from the authority (single writer),
+        // not assumed from the request: interfaces are the bound addresses.
+        let status = hange::authority_status();
+        let mode = if status.serving_local { tr("DNS cục bộ", "local DNS") } else { "DoH Windows" };
+        let ifaces = status
+            .addrs
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.set_dns_status(format!("{} ({mode})", choice_label(choice)).into());
+        ui.set_log(
+            t!(
+                "Đã bật DNS mã hóa {} ({mode}) trên {}.{}",
+                "Encrypted DNS {} ({mode}) is on for {}.{}",
+                choice_label(choice),
+                if ifaces.is_empty() { "—" } else { &ifaces },
+                if status.serving_local || !local {
+                    ""
+                } else {
+                    tr(" Cổng 53 đang bận nên dùng DoH của Windows.", " Port 53 is busy, so Windows' own DoH is used.")
+                }
+            )
+            .into(),
+        );
+    } else {
+        ui.set_dns_status(tr("Lỗi", "Error").into());
+        ui.set_log(t!("DNS lỗi: {detail}", "DNS error: {detail}").into());
+    }
+}
+
+/// Starts the engine once DNS is in place, through the lifecycle epoch
+/// gate (spec §6 step 1: engine-start callbacks are rejected on a stale
+/// epoch and can never start after the restore barrier). TCP tuning stays
+/// separate (erwin).
+fn start_engine_gated(
+    ui: &MainWindow,
+    snapshot: &Config,
+    lc: &Arc<AppLifecycle>,
+    mirror: &Arc<Mutex<Config>>,
+    engine_handle: &bootstrap::AppEngine,
+) {
+    ui.set_log(tr("Đang bật engine…", "Starting the engine…").into());
+    // The gated start uses this snapshot — never a stale one.
+    *mirror.lock().unwrap() = snapshot.clone();
+    match lc.request_engine_start(lc.snapshot().epoch) {
+        Ok(()) => {
+            let errs = engine_handle.take_start_errors();
+            if errs.is_empty() {
+                ui.set_engine_active(true);
+                ui.set_engine_status(tr("Đang bật", "On").into());
+                ui.set_log(tr("Yeager đang chạy (DoH + engine).", "Yeager is running (DoH + engine).").into());
+            } else {
+                ui.set_engine_active(false);
+                ui.set_engine_status(tr("Lỗi", "Error").into());
+                ui.set_log(t!("Không bật được engine: {}", "Could not start the engine: {}", errs.join("; ")).into());
+            }
+        }
+        Err(refusal) => {
+            ui.set_engine_active(false);
+            ui.set_engine_status(tr("Lỗi", "Error").into());
+            ui.set_log(t!("Không bật được engine: {refusal}", "Could not start the engine: {refusal}").into());
+        }
+    }
+}
+
+/// DNS toggle off (spec §6 row): the DnsOff barrier — restore, verify,
+/// listener-stop — with the engine stop running independently. Pending or
+/// conflict keeps the listener and is shown as debt, never as success.
+fn dns_off_then(ui: &MainWindow, w: Weak<MainWindow>, lc: &Arc<AppLifecycle>, done_log: &'static str) {
+    ui.set_log(tr("Đang khôi phục DNS…", "Restoring DNS…").into());
+    let lc = lc.clone();
+    spawn(w, move || lc.shutdown(lifecycle::ShutdownKind::DnsOff), move |ui, report| {
+        if report.successful() {
+            ui.set_dns_status(tr("Đã tắt", "Off").into());
+            ui.set_log(done_log.into());
+        } else {
+            ui.set_dns_status(tr("Chờ xử lý", "Pending").into());
             ui.set_log(
                 t!(
-                    "Đã bật DNS mã hóa {} ({mode}) trên {}.{}",
-                    "Encrypted DNS {} ({mode}) is on for {}.{}",
-                    choice_label(choice),
-                    applied.interfaces.join(", "),
-                    if applied.stub || !http3 {
-                        ""
-                    } else {
-                        tr(" Cổng 53 đang bận nên dùng DoH của Windows.", " Port 53 is busy, so Windows' own DoH is used.")
-                    }
+                    "DNS chưa khôi phục xong, trình nghe vẫn giữ và nợ được giữ lại: {:?}",
+                    "DNS restore is pending, the listener is retained and the debt is kept: {:?}",
+                    report.dns
                 )
                 .into(),
             );
         }
-        Err(e) => {
-            ui.set_dns_status(tr("Lỗi", "Error").into());
-            ui.set_log(t!("DNS lỗi: {e}", "DNS error: {e}").into());
-        }
-    }
-}
-
-/// Starts the engine once DoH is in place. TCP tuning is separate (erwin).
-fn start_engine(ui: &MainWindow, cfg: &Config) {
-    ui.set_log(tr("Đang bật engine…", "Starting the engine…").into());
-    match engine::start(cfg) {
-        Ok(()) => {
-            ui.set_engine_active(true);
-            ui.set_engine_status(tr("Đang bật", "On").into());
-            ui.set_log(tr("Yeager đang chạy (DoH + engine).", "Yeager is running (DoH + engine).").into());
-        }
-        Err(e) => {
-            ui.set_engine_active(false);
-            ui.set_engine_status(tr("Lỗi", "Error").into());
-            ui.set_log(t!("Không bật được engine: {e}", "Could not start the engine: {e}").into());
-        }
-    }
-}
-
-fn restore_doh(ui: &MainWindow, w: Weak<MainWindow>, done_log: &'static str) {
-    ui.set_log(tr("Đang khôi phục DNS…", "Restoring DNS…").into());
-    spawn(w, hange::disable, move |ui, ()| {
-        ui.set_dns_status(tr("Đã tắt", "Off").into());
-        ui.set_log(done_log.into());
     });
 }
 
@@ -1848,7 +2525,9 @@ fn apply_lists(cfg: &Config) {
 }
 
 /// The engine reads the scope and transport profile when it starts, so
-/// restart it to apply a change made while it is running.
+/// restart it to apply a change made while it is running. Refused while a
+/// coordinator shutdown is in flight: the shutdown's own engine stop owns
+/// the engine then (spec §6 step 1).
 fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
     if !ui.get_engine_active() {
         return;
@@ -1858,6 +2537,493 @@ fn restart_engine_if_active(ui: &MainWindow, cfg: &Config) {
         ui.set_engine_active(false);
         ui.set_engine_status(tr("Lỗi", "Error").into());
         ui.set_log(t!("Không bật lại được: {e}", "Could not restart: {e}").into());
+    }
+}
+
+/// U08 legacy detection (SPEC-DNS-FIX.md §9): conservative, detection-only
+/// in the GUI. Evidence comes from the read-only seams: configured DNS with
+/// full DoH properties per adapter (so an exact shape can classify as
+/// `ExactCandidate` when the facts say so), live-GUI detection across
+/// sessions, and the UDP/TCP loopback owner tables with process identity
+/// (our own stub vs a live legacy GUI vs an unidentified foreign listener).
+/// Repair needs explicit elevated approval (Q3, ruled); until then this
+/// reports only. Approved repairs record their automatic-target intent so a
+/// crash replays it instead of the dead loopback.
+fn run_legacy_detection(ui: &MainWindow) {
+    use legacy::{AdapterSnapshot, DohProp, FamilyConfig, LegacyInput, ListenerEvidence};
+    // Real adapter properties first; effective-only fallback keeps detection
+    // running when the configured getter fails (then exact candidacy is
+    // impossible by design — see `classify_family`).
+    let snapshots: Vec<AdapterSnapshot> = match hange::legacy_adapter_info() {
+        Ok(adapters) => adapters
+            .into_iter()
+            .map(|a| {
+                let conv = |f: Option<hange::FamilyDns>| {
+                    f.map(|fam| FamilyConfig {
+                        servers: fam.servers,
+                        properties: fam
+                            .properties
+                            .into_iter()
+                            .map(|p| DohProp {
+                                version: p.version,
+                                index: p.index,
+                                prop_type: p.prop_type,
+                                template: p.template,
+                                flags: p.flags,
+                            })
+                            .collect(),
+                    })
+                };
+                AdapterSnapshot {
+                    guid: a.guid.clone(),
+                    name_hint: a.name,
+                    v4: conv(a.v4),
+                    v6: conv(a.v6),
+                }
+            })
+            .collect(),
+        Err(_) => hange::adapter_dns()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| {
+                let (mut v4, mut v6) = (Vec::new(), Vec::new());
+                for ip in a.dns {
+                    if ip.contains(':') {
+                        v6.push(ip);
+                    } else {
+                        v4.push(ip);
+                    }
+                }
+                let family = |servers: Vec<String>| {
+                    (!servers.is_empty()).then(|| FamilyConfig {
+                        servers,
+                        properties: Vec::new(),
+                    })
+                };
+                AdapterSnapshot {
+                    guid: a.name.clone(),
+                    name_hint: a.name,
+                    v4: family(v4),
+                    v6: family(v6),
+                }
+            })
+            .collect(),
+    };
+    let serving_local = hange::stub_running();
+    // Owner tables with process identity (spec §9): who actually holds
+    // 127.0.0.1:53 on TCP/UDP, and what exe are they.
+    let (tcp_owner, udp_owner) = hange::loopback_port_owners();
+    let owner_pid = tcp_owner.or(udp_owner);
+    let owner_exe = owner_pid.and_then(platform::pid_exe_name);
+    let owner_is_self = owner_pid.is_some_and(|pid| pid == std::process::id());
+    let owner_is_yeager = owner_exe.as_deref().is_some_and(|exe| exe.contains("yeager"));
+    // Live GUI across sessions (spec §9): another yeager.exe, or the port
+    // owner itself being a foreign yeager process.
+    let yeager_gui_live = platform::other_yeager_gui_live()
+        || (owner_is_yeager && !owner_is_self);
+    // Another listener holds the path when someone other than our stub owns
+    // it. When our stub serves, we own it (no foreign listener). Otherwise
+    // any owner — or the best-effort TCP probe when the tables are silent —
+    // means an unidentified listener.
+    let other_listener = if serving_local || owner_is_self {
+        false
+    } else if owner_pid.is_some() {
+        !owner_is_yeager
+    } else {
+        loopback_port_held()
+    };
+    let loopback_listening = Some(serving_local || owner_pid.is_some() || other_listener);
+    let report = legacy::detect(&LegacyInput {
+        adapters: snapshots,
+        listeners: ListenerEvidence {
+            yeager_gui_live,
+            loopback53_listening: loopback_listening,
+            other_dns_listener: other_listener,
+        },
+    });
+    // Crash replay: a recorded approved intent resumes the automatic target
+    // (never the dead loopback). Surfaced here so a restart after a crash
+    // during approval shows what will resume.
+    let intent_dir = std::path::PathBuf::from(r"C:\ProgramData\Yeager");
+    let replayed = legacy::replay_repair_intent(&intent_dir);
+    let mut summary = Vec::new();
+    let mut detail = Vec::new();
+    for v in &report.verdicts {
+        summary.push(format!("{}: {:?}", v.guid, v.class));
+        detail.push(format!("{} — {}", v.guid, v.detail));
+    }
+    if let Some((guid, families, _)) = &replayed {
+        detail.push(format!(
+            "Recorded repair intent replays after crash: {guid} ({}) → automatic (never the dead loopback)",
+            families.join(", ")
+        ));
+    }
+    if report.verdicts.is_empty() {
+        ui.set_legacy_state(tr("Không phát hiện DNS cũ", "No legacy DNS found").into());
+    } else {
+        ui.set_legacy_state(summary.join(" · ").into());
+    }
+    ui.set_legacy_detail(detail.join("\n").into());
+    // Consent dialog (Q3, ruled): the GUI calls `request_repair` with an
+    // explicit elevated approval attempt. The GUI is not elevated, so an
+    // approval is refused and nothing is mutated — detection-only holds —
+    // but the call proves the approve path is wired. An elevated approval
+    // (service/helper) that reaches `ApprovedClear` records its intent for
+    // crash replay; the resume target is always automatic.
+    {
+        let w = ui.as_weak();
+        let report = report.clone();
+        ui.on_approve_legacy(move || {
+            let first_exact = report.verdicts.iter().find(|v| {
+                matches!(v.class, legacy::LegacyClass::ExactCandidate { .. })
+            });
+            let guid = match first_exact {
+                Some(v) => v.guid.clone(),
+                None => String::new(),
+            };
+            // The dialog warns that original statics are unrecoverable; the
+            // GUI itself runs unelevated, so this approval is incomplete by
+            // design and `request_repair` must refuse it.
+            let approval = legacy::ElevatedApproval {
+                elevated: false,
+                warned_statics_lost: true,
+                approver: "gui-operator".into(),
+            };
+            let verdict = first_exact.cloned().unwrap_or(legacy::AdapterVerdict {
+                guid: guid.clone(),
+                class: legacy::LegacyClass::NotLegacy,
+                detail: "no exact legacy candidate".into(),
+            });
+            let decision = legacy::request_repair(&verdict, Some(&approval));
+            if let Some(ui) = w.upgrade() {
+                ui.set_legacy_dialog(0);
+                match decision {
+                    legacy::RepairDecision::ApprovedClear {
+                        guid, families, warning,
+                    } => {
+                        // Only reachable behind real elevation: record the
+                        // automatic-target intent so a crash replays it.
+                        let _ = legacy::record_repair_intent(&intent_dir, &guid, &families);
+                        let target = legacy::resume_target_after_crash();
+                        debug_assert_eq!(target, legacy::RepairTarget::Automatic);
+                        ui.set_log(
+                            format!(
+                                "{} Intent recorded for crash replay ({:?}).",
+                                warning,
+                                legacy::describe_repair(&guid, &families)
+                            )
+                            .into(),
+                        );
+                    }
+                    legacy::RepairDecision::Refused { reason } => {
+                        let base = tr(
+                            "Đã ghi nhận đồng ý sửa DNS cũ, nhưng Yeager đang chạy không có quyền elevated nên chưa thay đổi gì. Việc sửa chỉ diễn ra sau phê duyệt elevated rõ ràng.",
+                            "Legacy-DNS repair consent recorded, but Yeager is not elevated so nothing was changed. Repair happens only behind explicit elevated approval.",
+                        );
+                        ui.set_log(format!("{base} ({reason})").into());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let w = ui.as_weak();
+        ui.on_dismiss_legacy(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.set_legacy_dialog(0);
+            }
+        });
+    }
+}
+
+/// Best-effort probe: is loopback port 53 held by something other than our
+/// own stub? A short TCP connect that succeeds means some listener is
+/// there; anything else means unknown/free. No state is changed.
+fn loopback_port_held() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr: SocketAddr = ([127, 0, 0, 1], 53).into();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// Surfaces the bootstrap decision and the coordinator debt on the DNS
+/// page, and drains shutdown-thread notifications into the log.
+fn refresh_recovery_ui(ui: &MainWindow, boot: &bootstrap::BootDiagnostics, drain: &bootstrap::SharedLogUi) {
+    let pending = hange::authority_status().pending;
+    let line = if pending.is_some() {
+        bootstrap::BootDiagnostics {
+            decision: boot.decision.clone(),
+            recovery: boot.recovery.clone(),
+            authority_pending: pending,
+            legacy_summary: boot.legacy_summary.clone(),
+        }
+        .state_line()
+    } else {
+        boot.state_line()
+    };
+    ui.set_dns_recovery_state(line.into());
+    let detail = hange::authority_status()
+        .pending
+        .unwrap_or_default();
+    ui.set_dns_recovery_detail(detail.into());
+    for msg in drain.drain() {
+        ui.set_log(format!("{}\n{msg}", ui.get_log()).into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_clean() -> Result<hange::AuthorityStatus, common::Error> {
+        Ok(hange::AuthorityStatus {
+            enabled: false,
+            serving_local: false,
+            addrs: Vec::new(),
+            pending: None,
+            epoch: Some(1),
+        })
+    }
+
+    fn ok_pending(debt: &str) -> Result<hange::AuthorityStatus, common::Error> {
+        Ok(hange::AuthorityStatus {
+            enabled: false,
+            serving_local: false,
+            addrs: Vec::new(),
+            pending: Some(debt.into()),
+            epoch: Some(1),
+        })
+    }
+
+    #[test]
+    fn cleanup_codes_match_the_documented_lifecycle_outcomes() {
+        // Item 4 (--cleanup row, U08-REV2): code and comment agree, routed as
+        // the lifecycle outcome it actually is. 0 verified clean, 10
+        // live-owner/busy, 11 pending/unavailable, 12 conflict, 13
+        // privilege/auth. Unavailable is 11 (not 13): §8.3 and
+        // `protocol::exit_code_for_outcome` put pending/unavailable/deferred
+        // at 11; 13 is privilege/auth. No digit-substring matching. The
+        // journal is retained on every nonzero.
+        assert_eq!(cleanup_code(ok_clean()), 0);
+        assert_eq!(cleanup_code(ok_pending("adapter gone")), 11);
+        assert_eq!(cleanup_code(ok_pending("Busy: live owner holds lease")), 10);
+        assert_eq!(cleanup_code(ok_pending("live-owner debt")), 10);
+        // Pending carrying an unavailable note stays 11.
+        assert_eq!(cleanup_code(ok_pending("unavailable: debt retained")), 11);
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("Conflict: foreign edit"))),
+            12
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new(
+                "Busy: live owner holds the machine lease"
+            ))),
+            10
+        );
+        // U08-REV2 fix: Unavailable maps to 11, matching the comment and §8.3.
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("Unavailable: no service"))),
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("unavailable: debt retained"))),
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("privilege: need admin"))),
+            13
+        );
+        // Arbitrary digits in the message never decide the code.
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("restore failed 10 times"))),
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("error 13 in module 7"))),
+            11
+        );
+        assert_eq!(
+            cleanup_code(Err(common::Error::new("restore failed"))),
+            11
+        );
+    }
+
+    fn sha1_hex_bytes(data: &[u8]) -> String {
+        // U09-REV4 item 1 test helper: SHA-1 of the raw bytes (the .NET
+        // `X509Certificate2.Thumbprint` definition). Duplicates the build
+        // script's derivation so the test independently opens the `.cer` and
+        // asserts equality — no hand-typed thumbprint literal anywhere.
+        let mut h: [u32; 5] = [
+            0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
+        ];
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = data.to_vec();
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in msg.chunks(64) {
+            let mut w = [0u32; 80];
+            for i in 0..16 {
+                w[i] = ((chunk[4 * i] as u32) << 24)
+                    | ((chunk[4 * i + 1] as u32) << 16)
+                    | ((chunk[4 * i + 2] as u32) << 8)
+                    | (chunk[4 * i + 3] as u32);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+            for (i, &scheduled) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let tmp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(scheduled);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = tmp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut s = String::with_capacity(40);
+        for v in h {
+            s.push_str(&format!("{v:08X}"));
+        }
+        s
+    }
+
+    fn has_long_hex_run(s: &str, min: usize) -> bool {
+        let mut run = 0usize;
+        for b in s.bytes() {
+            if b.is_ascii_hexdigit() {
+                run += 1;
+                if run >= min {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn pinned_thumbprint_is_derived_from_the_cert_file() {
+        // U09-REV4 item 1: mechanical derivation test. Opens the cert file
+        // and asserts equality with BOTH the value the app embeds
+        // (build-time generated `PINNED_THUMBPRINT`) and the value the
+        // installer define carries (`Get-PinnedThumbprint`, the release
+        // script's source). No hand-typed thumbprint literal anywhere.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cert = root.join("../../docs/signing/Yeager-codesign.cer");
+        let bytes = std::fs::read(&cert).expect("cannot open pinned cert .cer");
+        let derived = sha1_hex_bytes(&bytes);
+        assert_eq!(derived.len(), 40, "cert thumbprint must be 40 hex digits");
+        assert!(
+            derived.bytes().all(|b| b.is_ascii_hexdigit()),
+            "cert thumbprint must be hex"
+        );
+        // Equality with the value the app embeds.
+        assert_eq!(
+            super::PINNED_THUMBPRINT, derived,
+            "app-embedded PINNED_THUMBPRINT must equal the cert file"
+        );
+        // The app source must not hand-type the value: no long hex run, and
+        // the value arrives via the generated build-time include.
+        let src =
+            std::fs::read_to_string(root.join("src/main.rs")).expect("cannot read app main.rs");
+        assert!(
+            src.contains("pinned_thumbprint"),
+            "app main.rs must use the generated pinned_thumbprint include"
+        );
+        assert!(
+            !has_long_hex_run(&src, 32),
+            "app main.rs must not contain a hand-typed thumbprint literal"
+        );
+        let build =
+            std::fs::read_to_string(root.join("build.rs")).expect("cannot read app build.rs");
+        assert!(
+            build.contains("Yeager-codesign.cer"),
+            "app build.rs must read the cert file"
+        );
+        assert!(
+            !has_long_hex_run(&build, 32),
+            "app build.rs must not contain a hand-typed thumbprint literal"
+        );
+        // Equality with the value the installer define carries: setup.iss
+        // takes it via /DPINNED_THUMBPRINT with no literal, and the release
+        // source `Get-PinnedThumbprint` yields the same value.
+        let iss = std::fs::read_to_string(root.join("../../installer/setup.iss"))
+            .expect("cannot read installer/setup.iss");
+        assert!(
+            iss.contains("{#PINNED_THUMBPRINT}"),
+            "setup.iss must take the thumbprint via the build-time define"
+        );
+        assert!(
+            !has_long_hex_run(&iss, 32),
+            "setup.iss must not contain a hand-typed thumbprint literal"
+        );
+        #[cfg(windows)]
+        {
+            let ps1 = root.join("../../tools/signing/common.ps1");
+            let out = std::process::Command::new("powershell.exe")
+                .env("CODESIGN_PROJECT_NAME", "Yeager")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        ". '{}'; Get-PinnedThumbprint",
+                        ps1.to_string_lossy().replace('\'', "''")
+                    ),
+                ])
+                .output()
+                .expect("cannot run Get-PinnedThumbprint");
+            assert!(out.status.success(), "Get-PinnedThumbprint must succeed");
+            let pinned = String::from_utf8_lossy(&out.stdout).trim().to_ascii_uppercase();
+            assert_eq!(
+                pinned, derived,
+                "Get-PinnedThumbprint (installer define source) must equal the cert file"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_and_exit_routes_every_row_without_touching_the_service() {
+        // `cleanup_and_exit` itself (U08-REV2 item 2): injected restore results
+        // drive the exit code; TCP/logon cleanup still runs behind it.
+        assert_eq!(cleanup_and_exit_with(ok_clean), 0);
+        assert_eq!(cleanup_and_exit_with(|| ok_pending("adapter gone")), 11);
+        assert_eq!(
+            cleanup_and_exit_with(|| ok_pending("Busy: live owner holds lease")),
+            10
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("Conflict: x"))),
+            12
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("Unavailable: down"))),
+            11
+        );
+        assert_eq!(
+            cleanup_and_exit_with(|| Err(common::Error::new("privilege: need admin"))),
+            13
+        );
     }
 }
 

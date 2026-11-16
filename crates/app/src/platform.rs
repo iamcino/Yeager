@@ -55,11 +55,15 @@ struct Shown {
 /// Builds the tray icon and starts a timer that pumps tray + menu events into
 /// the UI. The returned value must be kept alive for the tray to exist.
 ///
+/// `on_quit` runs when the tray's Thoát item is picked: U08 wires it to
+/// quiesce the coordinator before the event loop quits (spec §6 tray-exit
+/// row), instead of quitting with DNS still admitted.
 /// `last_known_good` is the in-memory normal rectangle shared with the
 /// geometry tracker: re-show restores it when live bounds are invalid, and
 /// never overwrites it with the preferred substitute.
 pub fn setup(
     ui: &MainWindow,
+    on_quit: impl Fn() + Send + Sync + 'static,
     last_known_good: Rc<RefCell<Option<[u32; 2]>>>,
 ) -> Option<Rc<TrayState>> {
     // Texts are filled in by `pump`, in the current language. Like EasyKey's:
@@ -99,12 +103,15 @@ pub fn setup(
 
     let state = Rc::new(TrayState { tray, toggle, engine, tcp, dns, open, update, quit, shown: RefCell::new(None), icon: RefCell::new(None), icon_failed: Cell::new(None) });
 
+    // The quit callback is shared with the pump timer below.
+    let on_quit: Rc<dyn Fn() + Send + Sync> = Rc::new(on_quit);
+
     // Poll the tray/menu channels on the UI thread.
     let w = ui.as_weak();
     let st = state.clone();
     let timer = Box::leak(Box::new(slint::Timer::default()));
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), move || {
-        pump(&w, &st, &last_known_good);
+        pump(&w, &st, &on_quit, &last_known_good);
     });
 
     Some(state)
@@ -113,6 +120,7 @@ pub fn setup(
 fn pump(
     w: &Weak<MainWindow>,
     st: &TrayState,
+    on_quit: &Rc<dyn Fn() + Send + Sync>,
     last_known_good: &Rc<RefCell<Option<[u32; 2]>>>,
 ) {
     let Some(ui) = w.upgrade() else { return };
@@ -145,7 +153,7 @@ fn pump(
                 ui.set_update_dialog(1);
             }
         } else if ev.id() == st.quit.id() {
-            let _ = slint::quit_event_loop();
+            on_quit();
         }
     }
     while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -793,6 +801,213 @@ pub fn show_unsupported_os_dialog(build: u32) {
     ));
     unsafe {
         MessageBoxW(std::ptr::null_mut(), msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U08 session notifications (spec §6: OS logoff/shutdown/session-end row)
+// ---------------------------------------------------------------------------
+
+use crate::bootstrap::{SessionEvent, SessionSink};
+
+/// Holds the installed session sink for the console handler (which is a
+/// plain function pointer and cannot capture state).
+static SESSION_SINK: std::sync::OnceLock<SessionSink> = std::sync::OnceLock::new();
+
+/// Installs the native session-end and attached-console hooks, before
+/// auto-enable runs (spec §6). A hidden message-only window receives
+/// `WM_QUERYENDSESSION` / `WM_ENDSESSION`; an attached console (if any)
+/// gets a control handler. Both normalize into [`SessionEvent`] and call
+/// the sink; the sink maps them onto the coordinator
+/// (`bootstrap::handle_session`).
+///
+/// The WM handler lives on its own thread with a `GetMessageW` loop so the
+/// UI thread is never involved. `WM_QUERYENDSESSION` requests work
+/// nonblocking and returns promptly; `WM_ENDSESSION(true)` runs the
+/// bounded coordinator cleanup synchronously (the OS budget applies;
+/// anything unfinished is covered by the service and replay).
+pub fn install_session_hook(sink: SessionSink) {
+    let _ = SESSION_SINK.set(sink);
+    install_console_handler();
+    std::thread::spawn(session_window_loop);
+}
+
+fn install_console_handler() {
+    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn on_console(ctrl: u32) -> BOOL {
+        // Any console control (Ctrl+C, close, logoff, shutdown): bounded
+        // coordinator quit. The handler returns TRUE (handled) so the
+        // default immediate terminate does not race the cleanup; forced
+        // termination remains covered by the service and replay.
+        const CTRL_C_EVENT: u32 = 0;
+        const CTRL_CLOSE_EVENT: u32 = 2;
+        const CTRL_LOGOFF_EVENT: u32 = 5;
+        const CTRL_SHUTDOWN_EVENT: u32 = 6;
+        if matches!(ctrl, CTRL_C_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT)
+            && let Some(sink) = SESSION_SINK.get()
+        {
+            sink(SessionEvent::ConsoleCtrl);
+            return TRUE;
+        }
+        FALSE
+    }
+
+    // SAFETY: the handler is a static function that only reads the
+    // process-wide sink cell; it is installed at most once per process.
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_console), 1);
+    }
+}
+
+// Message-only window loop for WM_QUERYENDSESSION / WM_ENDSESSION.
+// The sink is read from the process-wide cell: the window procedure is a
+// plain function pointer and cannot capture it.
+fn session_window_loop() {
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
+        HWND_MESSAGE, MSG, WNDCLASSW,
+    };
+
+    const CLASS: &str = "YeagerSessionHook";
+    let class_wide = wide(CLASS);
+
+    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW;
+        const WM_QUERYENDSESSION: u32 = 0x0011;
+        const WM_ENDSESSION: u32 = 0x0016;
+        if msg == WM_QUERYENDSESSION {
+            if let Some(sink) = SESSION_SINK.get() {
+                sink(SessionEvent::QueryEndSession);
+            }
+            return 1; // TRUE: consent to end; quiesce already started.
+        }
+        if msg == WM_ENDSESSION {
+            if let Some(sink) = SESSION_SINK.get() {
+                sink(SessionEvent::EndSession {
+                    can_end: wparam != 0,
+                });
+            }
+            return 0;
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    // SAFETY: all strings are NUL-terminated and live for the process
+    // lifetime; the window is message-only and never shown.
+    unsafe {
+        let instance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        let cls = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_wide.as_ptr(),
+        };
+        if RegisterClassW(&cls) == 0 {
+            return;
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            class_wide.as_ptr(),
+            class_wide.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+        let mut msg = std::mem::zeroed::<MSG>();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Whether another live Yeager GUI process exists (any session, spec §9).
+/// Toolhelp snapshot over `yeager.exe` excluding this PID: a live legacy
+/// GUI blocks automatic repair (detection only). Best effort: snapshot
+/// failure reads as unknown (`false`) so detection never blocks on a probe
+/// error — the listener evidence still gates repair.
+pub fn other_yeager_gui_live() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let this_pid = std::process::id();
+    // SAFETY: snapshot handle checked against INVALID_HANDLE_VALUE and
+    // closed; entry size initialized as the API requires.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found_other = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+                let exe = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                if (exe == "yeager.exe") && entry.th32ProcessID != this_pid {
+                    found_other = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found_other
+    }
+}
+
+/// Lowercase exe name for one PID (spec §9 process identity for the
+/// loopback owner tables). `None` when the process cannot be opened or
+/// read — treated as unidentified, never as proof of absence.
+pub fn pid_exe_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = None;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+                    out = Some(String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase());
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        out
     }
 }
 

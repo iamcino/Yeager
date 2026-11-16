@@ -1,0 +1,65 @@
+[package]
+name = "dns-recovery"
+description = "Yeager DNS takeover: exact original capture, durable journal and recovery service (U01: model/capture; U02: protected journal, shared lock, durable replacement)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dns_recovery"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yeager-dns-recovery"
+path = "src/main.rs"
+
+[features]
+default = []
+# Development-only opt-in for the guarded Windows experiment/evidence harnesses
+# (Q1 experiment, U02 filesystem evidence). Never enabled by default; plain
+# `cargo test`/`cargo check` skip the examples.
+dev-experiment = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+] }
+
+[[example]]
+name = "q1_experiment"
+path = "examples/q1_experiment.rs"
+required-features = ["dev-experiment"]
+
+[[example]]
+name = "u02_fs_evidence"
+path = "examples/u02_fs_evidence.rs"
+required-features = ["dev-experiment"]
+
+# Real-Windows multi-process lock/store harness (own main; skips when not
+# elevated). Standard `cargo test` runs it; it performs no NIC operations and
+# confines all filesystem work to a scratch directory.
+[[test]]
+name = "lock_windows"
+path = "tests/lock_windows.rs"
+harness = false

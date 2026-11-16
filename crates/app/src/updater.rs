@@ -1,6 +1,18 @@
 //! Updates `yeager.exe` in place from the project's releases, the way EasyKey
 //! does.
 //!
+//! U09 service gate (SPEC-DNS-FIX.md §10 item 4): service capability and
+//! compatibility are checked BEFORE installing a replacement, not merely
+//! before spawning. A compatible GUI-only update may retain the service but
+//! must restore/verify before replacement/restart; a service-changing update
+//! routes to the signed installer and its maintenance sequence — the
+//! single-exe updater never leaves an incompatible service or schema behind.
+//! Protocol/schema compatibility is checked before updates and downgrades;
+//! an unknown newer journal blocks the older service. Download/install
+//! failure leaves the current active DNS untouched; a failed cleanup cancels
+//! the restart. The helper and the installer are verified under the same
+//! hash + pinned-signature trust policy as the app binaries.
+//!
 //! Every release is published on GitHub and on GitLab. Both are asked at once;
 //! the newest version either of them has wins, and if one site cannot be
 //! reached (blocked, down, or the repository unavailable) the other one is
@@ -342,6 +354,12 @@ fn accept_bytes(
 /// Downloads `version`, checks it and puts it in place of the running exe,
 /// from the site the check found it on, or the other one if that fails.
 /// Returns the path to start. Blocking; run it off the UI thread.
+///
+/// U09 gate: the caller MUST run [`gate_update`] first (service capability
+/// and compatibility BEFORE the replacement is installed, not merely before
+/// spawning). This function itself performs no service mutation: a download
+/// or install failure returns before any replacement step, leaving the
+/// current active DNS untouched.
 pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failure> {
     let mut failure = None;
     let mut exe = None;
@@ -403,6 +421,172 @@ pub fn restart(path: &Path, connect: bool) {
         cmd.current_dir(dir);
     }
     let _ = cmd.spawn();
+}
+
+// ---- U09 update / service compatibility gate ----------------------------------
+//
+// Pure policy over explicit inputs (fake-backed in tests). Production feeds
+// the running service's Hello/inspect via the `ServiceProbe` below; the
+// decision itself never touches the network, the SCM or the journal.
+
+pub use dns_recovery::provision::{
+    check_update_compat, JournalStatus, ServiceInfo, ServiceState, UpdateDecision,
+    UpdateManifest,
+};
+
+/// Failed cleanup cancels the restart (spec §10 item 4): the replacement may
+/// restart only after a verified restore. Delegates to the provision seam so
+/// the updater, the installer and the tests share one gate.
+pub fn may_restart_after_cleanup(cleanup_verified: bool) -> bool {
+    dns_recovery::provision::may_restart_after_cleanup(cleanup_verified)
+}
+
+/// What a release requires, read from the release manifest itself (U09-REV
+/// F): the target release's required protocol/journal versions plus whether
+/// it ships a new service binary. Never the updater binary's own constants —
+/// using this binary's `PROTOCOL_VERSION`/`JOURNAL_VERSION` here would make
+/// `check_update_compat` unable to return `RouteToInstaller`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseRequirements {
+    pub required_protocol: u32,
+    pub required_journal: u32,
+    pub requires_service_binary: bool,
+}
+
+/// What the update release at `version` requires, from the release's own
+/// manifest requirements.
+pub fn manifest_for_release(
+    version: (u32, u32, u32),
+    requirements: &ReleaseRequirements,
+) -> UpdateManifest {
+    UpdateManifest {
+        version,
+        required_protocol: requirements.required_protocol,
+        required_journal: requirements.required_journal,
+        requires_service_binary: requirements.requires_service_binary,
+    }
+}
+
+/// Fetch the target release's requirements from its published
+/// `manifest.json` sidecar (`{download_base}manifest.json`). Fail-closed:
+/// when the manifest cannot be fetched or parsed, the update is treated as
+/// service-changing so the single-exe updater routes to the signed installer
+/// before any replacement.
+pub fn fetch_release_requirements(version: &str) -> ReleaseRequirements {
+    let fallback = ReleaseRequirements {
+        required_protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+        required_journal: dns_recovery::journal::JOURNAL_VERSION,
+        requires_service_binary: true,
+    };
+    for source in sources() {
+        let url = format!("{}manifest.json", source.download_base(version));
+        let body = match http::get(&url, 64 * 1024) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let required_protocol = v
+                .get("required_protocol")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as u32);
+            let required_journal = v
+                .get("required_journal")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as u32);
+            let requires_service_binary = v
+                .get("requires_service_binary")
+                .and_then(|x| x.as_bool());
+            if let (Some(p), Some(j), Some(s)) =
+                (required_protocol, required_journal, requires_service_binary)
+            {
+                return ReleaseRequirements {
+                    required_protocol: p,
+                    required_journal: j,
+                    requires_service_binary: s,
+                };
+            }
+        }
+    }
+    fallback
+}
+
+/// Minimal service probe for the update gate: the production implementation
+/// consults the running service (Hello/inspect) and the journal version; the
+/// tests script it. `None` means no service information could be obtained
+/// (absent service) — the gate refuses the GUI-only path.
+pub trait ServiceProbe {
+    fn service_info(&self) -> Option<ServiceInfo>;
+    fn journal_version(&self) -> Option<u32>;
+    /// Pre-replacement restore/verify gate (§10 item 4): a compatible
+    /// GUI-only update restores/verifies BEFORE the exe replacement. The
+    /// gated installer returns before any replacement when this is false, so
+    /// the current active DNS is untouched.
+    fn verify_restore(&self) -> bool;
+}
+
+/// Check service capability and compatibility BEFORE installing a
+/// replacement. Returns the routing decision; the caller installs a
+/// replacement only on `GuiOnlyProceed`, routes to the signed installer on
+/// `RouteToInstaller`, and refuses (leaving DNS untouched) otherwise.
+pub fn gate_update<P: ServiceProbe>(
+    probe: &P,
+    current_app: (u32, u32, u32),
+    update: &UpdateManifest,
+) -> UpdateDecision {
+    check_update_compat(
+        probe.service_info().as_ref(),
+        probe.journal_version(),
+        current_app,
+        update,
+    )
+}
+
+/// Gated download-and-install: the service gate runs BEFORE any download or
+/// file mutation. A refused or installer-routed update returns a `Failure`
+/// without touching the running exe, the service or the journal — the
+/// current active DNS is untouched. A compatible GUI-only update restores
+/// and verifies BEFORE the exe replacement (via
+/// `ServiceProbe::verify_restore`), not only before the restart; the
+/// epilogue still gates the restart on the coordinator shutdown verify (see
+/// `main.rs`). A service-changing update routes to the installer before any
+/// replacement.
+pub fn download_and_install_gated<P: ServiceProbe>(
+    probe: &P,
+    current_app: (u32, u32, u32),
+    version: &str,
+    requirements: &ReleaseRequirements,
+) -> std::result::Result<PathBuf, Failure> {
+    let target = parse_version(version).ok_or_else(|| Failure::Download(Error::new("invalid update version")))?;
+    let manifest = manifest_for_release(target, requirements);
+    match gate_update(probe, current_app, &manifest) {
+        UpdateDecision::GuiOnlyProceed { .. } => {
+            // Restore/verify BEFORE replacement: a failed pre-replacement
+            // verify aborts without downloading or touching the exe.
+            if !probe.verify_restore() {
+                return Err(Failure::Install(Error::new(
+                    "pre-replacement restore did not verify; update aborted before replacement, DNS untouched",
+                )));
+            }
+            download_and_install(version)
+        }
+        UpdateDecision::RouteToInstaller { reason } => Err(Failure::Install(Error::new(format!(
+            "service-changing update; use the signed installer ({reason})"
+        )))),
+        UpdateDecision::Refused { reason, .. } => Err(Failure::Install(Error::new(format!(
+            "update refused; DNS untouched ({reason})"
+        )))),
+    }
+}
+
+/// Production entry: fetches the target release's real requirements from
+/// its `manifest.json` sidecar (fail-closed to the installer) before gating.
+pub fn download_and_install_gated_release<P: ServiceProbe>(
+    probe: &P,
+    current_app: (u32, u32, u32),
+    version: &str,
+) -> std::result::Result<PathBuf, Failure> {
+    let requirements = fetch_release_requirements(version);
+    download_and_install_gated(probe, current_app, version, &requirements)
 }
 
 /// On start: remove the exe an update left behind. After an update the old
@@ -1069,6 +1253,159 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // ---- U09 service-compatibility gate ---------------------------------------
+
+    struct FakeProbe {
+        service: Option<ServiceInfo>,
+        journal: Option<u32>,
+        restore_verified: bool,
+    }
+
+    impl ServiceProbe for FakeProbe {
+        fn service_info(&self) -> Option<ServiceInfo> {
+            self.service.clone()
+        }
+        fn journal_version(&self) -> Option<u32> {
+            self.journal
+        }
+        fn verify_restore(&self) -> bool {
+            self.restore_verified
+        }
+    }
+
+    fn gui_requirements() -> ReleaseRequirements {
+        ReleaseRequirements {
+            required_protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+            required_journal: dns_recovery::journal::JOURNAL_VERSION,
+            requires_service_binary: false,
+        }
+    }
+
+    fn service_changing_requirements() -> ReleaseRequirements {
+        ReleaseRequirements {
+            required_protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+            required_journal: dns_recovery::journal::JOURNAL_VERSION,
+            requires_service_binary: true,
+        }
+    }
+
+    fn running_service() -> ServiceInfo {
+        ServiceInfo {
+            protocol: dns_recovery::protocol::PROTOCOL_VERSION,
+            journal_version: dns_recovery::journal::JOURNAL_VERSION,
+            service_version: (1, 1, 6),
+            state: ServiceState::Running,
+            journal: JournalStatus::Clean,
+        }
+    }
+
+    #[test]
+    fn gui_only_update_proceeds_with_verify_before_restart() {
+        let probe = FakeProbe {
+            service: Some(running_service()),
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+            restore_verified: true,
+        };
+        let manifest = manifest_for_release((1, 1, 7), &gui_requirements());
+        match gate_update(&probe, (1, 1, 6), &manifest) {
+            UpdateDecision::GuiOnlyProceed {
+                verify_before_restart,
+            } => assert!(verify_before_restart),
+            other => panic!("GUI-only update must proceed with verify: {other:?}"),
+        }
+        assert!(may_restart_after_cleanup(true));
+        assert!(!may_restart_after_cleanup(false));
+        // Pre-replacement verify gate (behavior, not enum identity): a
+        // verified restore allows the gated path; an unverified restore
+        // blocks before any download/replacement, leaving DNS untouched.
+        assert!(probe.verify_restore());
+        let blocked = FakeProbe {
+            service: Some(running_service()),
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+            restore_verified: false,
+        };
+        assert!(!blocked.verify_restore());
+        assert!(download_and_install_gated(&blocked, (1, 1, 6), "1.1.7", &gui_requirements()).is_err());
+    }
+
+    #[test]
+    fn service_changing_update_routes_to_installer_before_any_replacement() {
+        let probe = FakeProbe {
+            service: Some(running_service()),
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+            restore_verified: true,
+        };
+        // The gate refuses the single-exe path BEFORE any download/replacement:
+        // a parseable version plus a service-changing manifest routes to the
+        // installer.
+        let manifest = manifest_for_release((1, 2, 0), &service_changing_requirements());
+        match gate_update(&probe, (1, 1, 6), &manifest) {
+            UpdateDecision::RouteToInstaller { .. } => {}
+            other => panic!("service-changing update must route to installer: {other:?}"),
+        }
+        // The gated installer refuses without touching the exe or DNS: a
+        // service-changing manifest with a parseable version returns before
+        // any download/replacement step.
+        let err = download_and_install_gated(&probe, (1, 1, 6), "1.2.0", &service_changing_requirements())
+            .expect_err("service-changing update must not replace");
+        assert!(
+            err.message().contains("installer"),
+            "service-changing failure directs to installer: {err:?}"
+        );
+        // An invalid version never reaches the download step either.
+        assert!(download_and_install_gated(&probe, (1, 1, 6), "not-a-version", &gui_requirements()).is_err());
+    }
+
+    #[test]
+    fn unknown_schema_downgrade_refuses() {
+        let probe = FakeProbe {
+            service: None,
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION + 1),
+            restore_verified: true,
+        };
+        assert!(matches!(
+            gate_update(
+                &probe,
+                (1, 1, 6),
+                &manifest_for_release((1, 1, 6), &gui_requirements())
+            ),
+            UpdateDecision::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn absent_service_refuses_gui_only_update() {
+        let probe = FakeProbe {
+            service: None,
+            journal: Some(dns_recovery::journal::JOURNAL_VERSION),
+            restore_verified: true,
+        };
+        assert!(matches!(
+            gate_update(
+                &probe,
+                (1, 1, 6),
+                &manifest_for_release((1, 1, 7), &gui_requirements())
+            ),
+            UpdateDecision::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn helper_and_installer_share_app_trust_policy() {
+        // Same hash + pinned-signature policy as the app binaries: the Rust
+        // seam is provision::verify_artifact (the release pipeline enforces
+        // it via verify.ps1 for every artifact — see docs/BUILD.md).
+        use dns_recovery::provision::{verify_artifact, ArtifactCheck};
+        let pass = |sha: bool, sig: bool| {
+            verify_artifact(&ArtifactCheck {
+                sha256_matches: sha,
+                signature_pinned_valid: sig,
+            })
+        };
+        assert!(pass(true, true));
+        assert!(!pass(true, false));
+        assert!(!pass(false, true));
+    }
     /// The pinned value is the SHA-256 of the *full DER SPKI* (91 bytes for
     /// EC P-256), not of the raw public-key bytes. Rebuild the DER SPKI from
     /// the published certificate's raw key and prove the pin matches it.
