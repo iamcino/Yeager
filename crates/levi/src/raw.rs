@@ -1,9 +1,6 @@
 use std::path::Path;
 use windows_sys::Win32::Foundation::HMODULE;
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    LOAD_LIBRARY_SEARCH_SYSTEM32,
-};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 pub const INVALID_HANDLE_VALUE: usize = usize::MAX;
 
@@ -165,17 +162,7 @@ impl WinDivertApi {
             .chain(std::iter::once(0))
             .collect();
 
-        // Safe load: resolve the DLL itself by full path and its dependencies
-        // only from the DLL's own directory plus System32. The application
-        // directory and the current working directory are never searched, so
-        // a planted DLL elsewhere on the search path cannot be picked up.
-        let hmod = unsafe {
-            LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
+        let hmod = unsafe { LoadLibraryW(wide.as_ptr()) };
         if hmod.is_null() {
             return Err(format!(
                 "Failed to load WinDivert.dll at {:?}",

@@ -6,34 +6,10 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và
 [Semantic Versioning](https://semver.org/lang/vi/).
 
-## [Unreleased]
-
-## [1.1.9] - 2026-11-17
-
-### Đã sửa
-- Gỡ bỏ cơ chế kiểm tra quyền của thư mục driver — cơ chế này có thể từ chối khởi động engine tuỳ theo trạng thái của thư mục dữ liệu Yeager. Engine nay khởi động bình thường trở lại, và bản sao lưu DNS dời về thư mục dữ liệu người dùng, ra khỏi thư mục bị kiểm tra quyền.
-
-## [1.1.8] - 2026-11-17
-### Thay đổi
-- **Bảo vệ DNS nay là sao lưu và khôi phục, ngay trong ứng dụng:** khi bật DNS, Yeager lưu trước cấu hình DNS hiện tại của các adapter mạng bị ảnh hưởng vào một file sao lưu cục bộ, rồi mới áp dụng thiết lập của Yeager. Khi tắt DNS, hoặc thoát Yeager bình thường, Yeager ghi lại đúng các thiết lập đã lưu và xóa file sao lưu. Nếu Yeager đóng đột ngột, lần chạy kế tiếp sẽ khôi phục DNS đã lưu từ file sao lưu còn sót rồi xóa nó đi.
-### Đã gỡ bỏ
-- **Dịch vụ đồng hành khôi phục DNS:** dịch vụ nhỏ giới thiệu ở bản 1.1.7, cùng journal và helper của nó, không còn được cài đặt hay cần đến nữa. Yeager khởi động, bật DNS và gỡ cài đặt mà không cần dịch vụ nào, và bộ cài không đăng ký dịch vụ nào cả.
-### Sửa lỗi
-- **Sự cố DNS không bao giờ chặn việc khác:** mọi lỗi khi lưu hay khôi phục DNS chỉ làm giảm tính năng DNS; không bao giờ ngăn Yeager khởi động và không bao giờ chặn gỡ cài đặt. Nếu chính DNS không bật được thì Levi vẫn tắt, vì engine cần DoH. Gỡ cài đặt khi DNS đang bật sẽ khôi phục DNS gốc của bạn trước và vẫn hoàn tất ngay cả khi việc khôi phục đó lỗi.
-
 ## [1.1.7] - 2026-11-17
-### Thêm mới
-- **Dịch vụ khôi phục DNS:** Yeager nay đi kèm một dịch vụ đồng hành nhỏ chuyên canh giữ cấu hình DNS mà Yeager thiết lập. Dịch vụ ghi lại các thiết lập được bảo vệ và khôi phục chúng nếu một chương trình khác hay một thay đổi hệ thống sửa đổi chúng, đồng thời có thể sửa chữa hư hại do các phiên bản cũ để lại khi bạn phê duyệt rõ ràng. Có mặt trong cả bản cài đặt lẫn bản portable.
 ### Thay đổi
 - **Engine Levi được tinh chỉnh:** nghệ thuật kết nối của Levi được mài giũa thêm một lớp bóng — mỗi cái bắt tay mở đầu giờ trôi đi với một nhịp điệu mượt mà và duyên dáng hơn, dìu cả những kết nối cứng đầu nhất về một nhịp êm đềm, ổn định.
 
-### Sửa lỗi
-- **Bộ lọc capture chỉ giữ ClientHello:** chiều đi của WinDivert giờ đòi tiền tố handshake TLS + ClientHello (`tcp.Payload[0] == 0x16`, `tcp.Payload[1] == 0x03`, `tcp.Payload[5] == 0x01`) sau điều kiện độ dài `tcp.PayloadLength >= 40` đã có, nên dữ liệu upload không còn đi qua userspace. Mệnh đề RST chiều về giữ nguyên. Tài liệu nay ghi rõ chiều đi chỉ xem xét gói mang ClientHello, `Auto` chọn `Fast` tuyệt đối, và đường không cấp phát bộ nhớ là đường inline Auto/Fast.
-- **Lỗ hổng cài driver WinDivert (P0):** engine không còn nạp driver từ `%TEMP%\Yeager_bin` mà tài khoản thường cũng ghi được. Mỗi lần khởi động, `WinDivert.dll` / `WinDivert64.sys` nhúng trong bản build được kiểm tra SHA-256 và chép lại khi khác, đặt trong `%ProgramData%\Yeager\driver` được bảo vệ (chỉ Administrators + SYSTEM được ghi, Users chỉ đọc/chạy, tắt kế thừa, kiểm tra lại chủ sở hữu và DACL mỗi lần khởi động, sai là dừng chứ không chạy tiếp). File DLL kẻ khác cài sẵn trong thư mục temp cũ không bao giờ được nạp; thư mục cũ được dọn khi có thể (gặp reparse point thì bỏ qua, không đi vào). Muốn dùng bản driver của riêng mình thì truyền cờ `--driver-dir <đường dẫn>` cho `yeager.exe` hoặc `levi.exe` — không đọc từ `config.json` hay biến môi trường.
-- **Bản ghi service driver cũ (kiểm tra lúc khởi động):** trước khi nạp driver, engine đọc bản ghi service `WinDivert` hiện có và đối chiếu với file driver đã kiểm chứng. Bản ghi đang dừng mà trỏ đi nơi khác sẽ bị xóa để driver được đăng ký lại từ kho được bảo vệ; nếu driver cũ vẫn đang chạy từ nơi khác, quá trình khởi động sẽ dừng và báo lỗi kèm đường dẫn đang ghi trong bản ghi thay vì nạp nó. Thư mục được bảo vệ mới tạo luôn thuộc về Administrators, và thông báo lỗi sai chủ sở hữu giờ nêu rõ chủ sở hữu thực tế.
-
-- **Ghi nhớ vị trí cửa sổ:** kích thước và vị trí của cửa sổ chính nay được kiểm chứng với vùng làm việc nhìn thấy được trước khi khôi phục. Cửa sổ từng được lưu khi đang thu nhỏ, phóng to, hoặc trên một màn hình nay đã ngắt kết nối sẽ không còn mở lại ngoài màn hình hay với kích thước bất khả; thông số đã lưu được sửa ngay trong bộ nhớ.
-- **Kiểm tra chữ ký của trình cập nhật (P0):** trình cập nhật trong ứng dụng nay kiểm chứng chữ ký Authenticode của mọi bản cập nhật tải về đối chiếu với khóa ký đã được ghim của Yeager, bên cạnh các tổng kiểm SHA-256. Một bản cập nhật có binary bị sửa đổi sẽ bị từ chối ngay cả khi tổng kiểm của nó đã bị tính lại cho khớp, và cả hai nguồn tải đều đi qua cùng một đường kiểm chứng.
 ## [1.1.6] - 2026-11-13
 
 ### Thay đổi

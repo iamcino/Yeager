@@ -1,18 +1,13 @@
-# Yeager — build release binaries and assemble dist\
+# Yeager — build release binary and assemble dist\
 # Requires: Rust toolchain plus a resource compiler for the embedded
 # icon/manifest: `windres` (w64devkit/MSYS2) for the GNU toolchain, or the
 # Windows SDK `rc.exe` for MSVC. If Explorer still shows an old icon after a
 # rebuild, refresh its icon cache with `ie4uinit.exe -show`.
-#
-# Builds the GUI (yeager.exe). DNS is backup state and restore inside the app;
-# there is no separate service binary. The release pipeline signs and hashes
-# the exe under the pinned-certificate policy.
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "Building Yeager (release)..." -ForegroundColor Cyan
-cargo build --release -p yeager
-if ($LASTEXITCODE -ne 0) { throw "cargo build -p yeager failed" }
+cargo build --release
 
 $exe = Join-Path $PSScriptRoot "target\release\yeager.exe"
 if (-not (Test-Path $exe)) {
@@ -27,7 +22,7 @@ $leviExe = Join-Path $PSScriptRoot "target\release\levi.exe"
 if (Test-Path $leviExe) {
     Copy-Item $leviExe (Join-Path $dist "levi.exe") -Force
     $leviSize = [math]::Round((Get-Item $leviExe).Length / 1KB, 0)
-    Write-Host "Done. dist\levi.exe ($leviSize KB)" -ForegroundColor Yellow
+    Write-Host "Done. dist\levi.exe ($leviSize KB)" -ForegroundColor Green
 }
 
 $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)

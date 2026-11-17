@@ -90,10 +90,8 @@ yeager/
   trong danh sách và tên miền con).
 - Không chặn: nhóm 4 đến 6 worker threads chuyên trách giao tiếp qua hàng đợi
   `sync_channel(256)`, loại bỏ hoàn toàn chi phí cấp phát luồng của Windows.
-- Chiều đi chỉ bắt các gói mang ClientHello, nên ACK, keepalive và dữ liệu
-  upload không lên tới user space; đường xử lý inline của Auto/Fast không
-  cấp phát bộ nhớ (zero-alloc), còn Hardened xếp hàng qua worker pool giới
-  hạn.
+- Chiều đi chỉ bắt các gói mở đầu kết nối, nên ACK và keepalive không lên tới
+  user space; đường xử lý từng gói hoàn toàn không cấp phát bộ nhớ (zero-alloc).
 - Chống can thiệp: cơ chế Inbound RST Silencer tự động triệt tiêu các gói reset
   giả mạo từ middlebox trên cổng 443 đến trước phản hồi TLS của máy chủ. Chỉ
   bỏ gói reset khớp với kết nối vừa mở trong 3,5 giây, nên reset thật của máy

@@ -54,18 +54,7 @@ struct Shown {
 
 /// Builds the tray icon and starts a timer that pumps tray + menu events into
 /// the UI. The returned value must be kept alive for the tray to exist.
-///
-/// `on_quit` runs when the tray's Thoát item is picked: U08 wires it to
-/// quiesce the coordinator before the event loop quits (spec §6 tray-exit
-/// row), instead of quitting with DNS still admitted.
-/// `last_known_good` is the in-memory normal rectangle shared with the
-/// geometry tracker: re-show restores it when live bounds are invalid, and
-/// never overwrites it with the preferred substitute.
-pub fn setup(
-    ui: &MainWindow,
-    on_quit: impl Fn() + Send + Sync + 'static,
-    last_known_good: Rc<RefCell<Option<[u32; 2]>>>,
-) -> Option<Rc<TrayState>> {
+pub fn setup(ui: &MainWindow) -> Option<Rc<TrayState>> {
     // Texts are filled in by `pump`, in the current language. Like EasyKey's:
     // the switch on top with a check mark, then what is running (each opens
     // its page), then the window, updates and quit.
@@ -103,33 +92,24 @@ pub fn setup(
 
     let state = Rc::new(TrayState { tray, toggle, engine, tcp, dns, open, update, quit, shown: RefCell::new(None), icon: RefCell::new(None), icon_failed: Cell::new(None) });
 
-    // The quit callback is shared with the pump timer below.
-    let on_quit: Rc<dyn Fn() + Send + Sync> = Rc::new(on_quit);
-
     // Poll the tray/menu channels on the UI thread.
     let w = ui.as_weak();
     let st = state.clone();
     let timer = Box::leak(Box::new(slint::Timer::default()));
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), move || {
-        pump(&w, &st, &on_quit, &last_known_good);
+        pump(&w, &st);
     });
 
     Some(state)
 }
 
-fn pump(
-    w: &Weak<MainWindow>,
-    st: &TrayState,
-    on_quit: &Rc<dyn Fn() + Send + Sync>,
-    last_known_good: &Rc<RefCell<Option<[u32; 2]>>>,
-) {
+fn pump(w: &Weak<MainWindow>, st: &TrayState) {
     let Some(ui) = w.upgrade() else { return };
-    let lkg = *last_known_good.borrow();
 
     // Drain everything queued since the last tick, not just one event.
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
         let open_page = |page| {
-            show(&ui, lkg);
+            show(&ui);
             ui.set_page(page);
         };
         if ev.id() == st.toggle.id() {
@@ -142,10 +122,10 @@ fn pump(
         } else if ev.id() == st.dns.id() {
             open_page(4);
         } else if ev.id() == st.open.id() {
-            show(&ui, lkg);
+            show(&ui);
         } else if ev.id() == st.update.id() {
             // Offer the version a check found, or look for one.
-            show(&ui, lkg);
+            show(&ui);
             if ui.get_update_version().is_empty() {
                 ui.set_page(1);
                 ui.invoke_check_update();
@@ -153,13 +133,13 @@ fn pump(
                 ui.set_update_dialog(1);
             }
         } else if ev.id() == st.quit.id() {
-            on_quit();
+            let _ = slint::quit_event_loop();
         }
     }
     while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
         match ev {
             TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-            | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => show(&ui, lkg),
+            | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => show(&ui),
             _ => {}
         }
     }
@@ -270,171 +250,13 @@ fn set_menu_theme(dark: bool) {
     }
 }
 
-/// Whether the current logical bounds are invalid and must be repaired on
-/// re-show (after unminimize). Valid deliberate resizes — including a stable
-/// 700x500 — never trigger a repair.
-pub fn bounds_need_repair(scale: f32, w: f32, h: f32) -> bool {
-    if !scale.is_finite() || scale <= 0.0 {
-        return true;
-    }
-    !common::is_valid_window_size(w, h)
-}
-
-/// Usable logical work area of the primary monitor, if it can be queried.
-/// Falls back to `None` (no clamping) when the query fails. This is the
-/// fallback when no window handle exists; prefer
-/// [`work_area_size_for_window`] so the target monitor is used.
-pub fn work_area_size() -> Option<(f32, f32)> {
-    use windows_sys::Win32::Foundation::{POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint,
-    };
-    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-    unsafe {
-        let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        if hmon.is_null() {
-            return None;
-        }
-        let mut info = std::mem::zeroed::<MONITORINFO>();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(hmon, &mut info as *mut MONITORINFO as *mut _) == 0 {
-            return None;
-        }
-        let RECT { left, top, right, bottom } = info.rcWork;
-        let (ww, wh) = (right - left, bottom - top);
-        if ww <= 0 || wh <= 0 {
-            return None;
-        }
-        let dpi = GetDpiForSystem();
-        if dpi == 0 {
-            return None;
-        }
-        let scale = dpi as f32 / 96.0;
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-        Some((ww as f32 / scale, wh as f32 / scale))
-    }
-}
-
-/// Usable logical work area of the monitor the given native window is on.
-///
-/// Uses `MonitorFromWindow` + `GetMonitorInfo` (`rcWork`) and that window's
-/// DPI, converted to logical pixels. Falls back to [`work_area_size`] and
-/// then `None` when the handle or query is unavailable.
-pub fn work_area_size_for_hwnd(hwnd: HWND) -> Option<(f32, f32)> {
-    use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
-    };
-    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-    if hwnd.is_null() {
-        return work_area_size();
-    }
-    unsafe {
-        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if hmon.is_null() {
-            return work_area_size();
-        }
-        let mut info = std::mem::zeroed::<MONITORINFO>();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(hmon, &mut info as *mut MONITORINFO as *mut _) == 0 {
-            return work_area_size();
-        }
-        let (ww, wh) = (info.rcWork.right - info.rcWork.left, info.rcWork.bottom - info.rcWork.top);
-        if ww <= 0 || wh <= 0 {
-            return None;
-        }
-        let mut dpi = GetDpiForWindow(hwnd);
-        if dpi == 0 {
-            dpi = GetDpiForSystem();
-        }
-        if dpi == 0 {
-            return None;
-        }
-        let scale = dpi as f32 / 96.0;
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-        Some((ww as f32 / scale, wh as f32 / scale))
-    }
-}
-
-/// [`work_area_size_for_hwnd`] for a Slint window, falling back to
-/// [`work_area_size`] when the native handle is not yet available.
-pub fn work_area_size_for_window(ui: &MainWindow) -> Option<(f32, f32)> {
-    match hwnd(ui) {
-        Some(h) => work_area_size_for_hwnd(h).or_else(work_area_size),
-        None => work_area_size(),
-    }
-}
-
-/// Clamps otherwise-valid dimensions to the usable work area. Unknown work
-/// area leaves the size unchanged. When the work area is smaller than the UI
-/// minimum, the UI minimum is honored instead of persisting a temporary
-/// constrained size (see [`common::clamp_window_size_to_work_area`]).
-/// Retained for tests and as the no-window fallback; production re-show and
-/// startup prefer [`clamp_to_work_area_for_window`].
-#[allow(dead_code)]
-pub fn clamp_to_work_area(w: f32, h: f32) -> (f32, f32) {
-    match work_area_size() {
-        Some((ww, wh)) => common::clamp_window_size_to_work_area(w, h, ww, wh),
-        None => (w, h),
-    }
-}
-
-/// Same as [`clamp_to_work_area`] but on the target monitor for `ui`.
-pub fn clamp_to_work_area_for_window(ui: &MainWindow, w: f32, h: f32) -> (f32, f32) {
-    match work_area_size_for_window(ui) {
-        Some((ww, wh)) => common::clamp_window_size_to_work_area(w, h, ww, wh),
-        None => (w, h),
-    }
-}
-
-/// What to apply on re-show when live bounds are invalid.
-///
-/// Returns `None` when live bounds are valid (a deliberate resize, including
-/// stable 700x500, must never be replaced). Otherwise returns the
-/// in-memory last-known-good normal rectangle when it is a valid pair, and
-/// preferred 860x600 only when no last-known-good exists. Callers clamp the
-/// result to the target monitor work area and must not persist a preferred
-/// substitute over a real last-known-good.
-pub fn reshow_replacement(
-    scale: f32,
-    w: f32,
-    h: f32,
-    last_known_good: Option<[u32; 2]>,
-) -> Option<(f32, f32)> {
-    if !bounds_need_repair(scale, w, h) {
-        return None;
-    }
-    match last_known_good {
-        Some([lw, lh]) if common::is_valid_window_size_u32(lw, lh) => Some((lw as f32, lh as f32)),
-        _ => Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H)),
-    }
-}
-
 /// Brings the window back from the tray (or from minimized) to the front.
-///
-/// Reapplies the last-known-good geometry ONLY when the actual bounds are
-/// invalid (e.g. a transient zero/minimized size survived). A valid
-/// deliberate resize is never overridden on tray clicks. Preferred 860x600
-/// is used only when no last-known-good exists, and the caller keeps the
-/// stored last-known-good unchanged so a later poll never persists that
-/// preferred substitute over the real size.
-pub fn show(ui: &MainWindow, last_known_good: Option<[u32; 2]>) {
+pub fn show(ui: &MainWindow) {
     let _ = ui.show();
     ui.window().set_minimized(false);
     apply_window_chrome(ui);
     use slint::winit_030::WinitWindowAccessor;
     ui.window().with_winit_window(|win| win.focus_window());
-    // After unminimize the native bounds settle: repair only if invalid.
-    let scale = ui.window().scale_factor();
-    let size = ui.window().size().to_logical(scale);
-    if let Some((rw, rh)) = reshow_replacement(scale, size.width, size.height, last_known_good) {
-        let (w, h) = clamp_to_work_area_for_window(ui, rw, rh);
-        ui.window().set_size(slint::LogicalSize::new(w, h));
-        eprintln!("Yeager window: repaired invalid bounds on re-show to {w}x{h}");
-    }
 }
 
 /// The tray icon at the small-icon size for the current DPI, with its rim lit
@@ -721,11 +543,7 @@ pub fn ensure_single_instance(updated: bool) -> SingleInstanceDecision {
 }
 
 /// Shows the window whenever a second launch asks for it.
-pub fn watch_show_requests(
-    ui: &MainWindow,
-    guard: &SingleInstanceGuard,
-    last_known_good: Rc<RefCell<Option<[u32; 2]>>>,
-) {
+pub fn watch_show_requests(ui: &MainWindow, guard: &SingleInstanceGuard) {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -740,7 +558,7 @@ pub fn watch_show_requests(
         if unsafe { WaitForSingleObject(event as _, 0) } == WAIT_OBJECT_0
             && let Some(ui) = w.upgrade()
         {
-            show(&ui, *last_known_good.borrow());
+            show(&ui);
         }
     });
 }
@@ -801,286 +619,5 @@ pub fn show_unsupported_os_dialog(build: u32) {
     ));
     unsafe {
         MessageBoxW(std::ptr::null_mut(), msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// U08 session notifications (spec §6: OS logoff/shutdown/session-end row)
-// ---------------------------------------------------------------------------
-
-use crate::bootstrap::{SessionEvent, SessionSink};
-
-/// Holds the installed session sink for the console handler (which is a
-/// plain function pointer and cannot capture state).
-static SESSION_SINK: std::sync::OnceLock<SessionSink> = std::sync::OnceLock::new();
-
-/// Installs the native session-end and attached-console hooks, before
-/// auto-enable runs (spec §6). A hidden message-only window receives
-/// `WM_QUERYENDSESSION` / `WM_ENDSESSION`; an attached console (if any)
-/// gets a control handler. Both normalize into [`SessionEvent`] and call
-/// the sink; the sink maps them onto the coordinator
-/// (`bootstrap::handle_session`).
-///
-/// The WM handler lives on its own thread with a `GetMessageW` loop so the
-/// UI thread is never involved. `WM_QUERYENDSESSION` requests work
-/// nonblocking and returns promptly; `WM_ENDSESSION(true)` runs the
-/// bounded coordinator cleanup synchronously (the OS budget applies;
-/// anything unfinished is covered by the service and replay).
-pub fn install_session_hook(sink: SessionSink) {
-    let _ = SESSION_SINK.set(sink);
-    install_console_handler();
-    std::thread::spawn(session_window_loop);
-}
-
-fn install_console_handler() {
-    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
-    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-
-    unsafe extern "system" fn on_console(ctrl: u32) -> BOOL {
-        // Any console control (Ctrl+C, close, logoff, shutdown): bounded
-        // coordinator quit. The handler returns TRUE (handled) so the
-        // default immediate terminate does not race the cleanup; forced
-        // termination remains covered by the service and replay.
-        const CTRL_C_EVENT: u32 = 0;
-        const CTRL_CLOSE_EVENT: u32 = 2;
-        const CTRL_LOGOFF_EVENT: u32 = 5;
-        const CTRL_SHUTDOWN_EVENT: u32 = 6;
-        if matches!(ctrl, CTRL_C_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT)
-            && let Some(sink) = SESSION_SINK.get()
-        {
-            sink(SessionEvent::ConsoleCtrl);
-            return TRUE;
-        }
-        FALSE
-    }
-
-    // SAFETY: the handler is a static function that only reads the
-    // process-wide sink cell; it is installed at most once per process.
-    unsafe {
-        SetConsoleCtrlHandler(Some(on_console), 1);
-    }
-}
-
-// Message-only window loop for WM_QUERYENDSESSION / WM_ENDSESSION.
-// The sink is read from the process-wide cell: the window procedure is a
-// plain function pointer and cannot capture it.
-fn session_window_loop() {
-    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
-        HWND_MESSAGE, MSG, WNDCLASSW,
-    };
-
-    const CLASS: &str = "YeagerSessionHook";
-    let class_wide = wide(CLASS);
-
-    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        use windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW;
-        const WM_QUERYENDSESSION: u32 = 0x0011;
-        const WM_ENDSESSION: u32 = 0x0016;
-        if msg == WM_QUERYENDSESSION {
-            if let Some(sink) = SESSION_SINK.get() {
-                sink(SessionEvent::QueryEndSession);
-            }
-            return 1; // TRUE: consent to end; quiesce already started.
-        }
-        if msg == WM_ENDSESSION {
-            if let Some(sink) = SESSION_SINK.get() {
-                sink(SessionEvent::EndSession {
-                    can_end: wparam != 0,
-                });
-            }
-            return 0;
-        }
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-    }
-
-    // SAFETY: all strings are NUL-terminated and live for the process
-    // lifetime; the window is message-only and never shown.
-    unsafe {
-        let instance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
-        let cls = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(wnd_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: instance,
-            hIcon: std::ptr::null_mut(),
-            hCursor: std::ptr::null_mut(),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: class_wide.as_ptr(),
-        };
-        if RegisterClassW(&cls) == 0 {
-            return;
-        }
-        let hwnd = CreateWindowExW(
-            0,
-            class_wide.as_ptr(),
-            class_wide.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            std::ptr::null_mut(),
-            instance,
-            std::ptr::null(),
-        );
-        if hwnd.is_null() {
-            return;
-        }
-        let mut msg = std::mem::zeroed::<MSG>();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-/// Whether another live Yeager GUI process exists (any session, spec §9).
-/// Toolhelp snapshot over `yeager.exe` excluding this PID: a live legacy
-/// GUI blocks automatic repair (detection only). Best effort: snapshot
-/// failure reads as unknown (`false`) so detection never blocks on a probe
-/// error — the listener evidence still gates repair.
-pub fn other_yeager_gui_live() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
-    let this_pid = std::process::id();
-    // SAFETY: snapshot handle checked against INVALID_HANDLE_VALUE and
-    // closed; entry size initialized as the API requires.
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return false;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut found_other = false;
-        if Process32FirstW(snap, &mut entry) != 0 {
-            loop {
-                let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
-                let exe = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
-                if (exe == "yeager.exe") && entry.th32ProcessID != this_pid {
-                    found_other = true;
-                    break;
-                }
-                if Process32NextW(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-        found_other
-    }
-}
-
-/// Lowercase exe name for one PID (spec §9 process identity for the
-/// loopback owner tables). `None` when the process cannot be opened or
-/// read — treated as unidentified, never as proof of absence.
-pub fn pid_exe_name(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut out = None;
-        if Process32FirstW(snap, &mut entry) != 0 {
-            loop {
-                if entry.th32ProcessID == pid {
-                    let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
-                    out = Some(String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase());
-                    break;
-                }
-                if Process32NextW(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-        out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn minimized_maximized_transient_bounds_need_repair() {
-        // Invalid scale, zero, below-minimum and huge all need repair.
-        assert!(bounds_need_repair(0.0, 860.0, 600.0));
-        assert!(bounds_need_repair(f32::NAN, 860.0, 600.0));
-        assert!(bounds_need_repair(1.0, 0.0, 0.0));
-        assert!(bounds_need_repair(1.0, 1.0, 1.0));
-        assert!(bounds_need_repair(1.0, 100.0, 600.0));
-        assert!(bounds_need_repair(1.0, 99999.0, 99999.0));
-    }
-
-    #[test]
-    fn valid_and_deliberate_minimum_bounds_do_not_need_repair() {
-        assert!(!bounds_need_repair(1.0, 860.0, 600.0));
-        assert!(!bounds_need_repair(1.25, 900.0, 650.0));
-        // Deliberate stable 700x500 is valid: never repaired.
-        assert!(!bounds_need_repair(1.0, 700.0, 500.0));
-    }
-
-    #[test]
-    fn invalid_reshow_restores_last_known_good() {
-        // Invalid live bounds restore the in-memory last-known-good.
-        assert_eq!(
-            reshow_replacement(1.0, 0.0, 0.0, Some([900, 650])),
-            Some((900.0, 650.0))
-        );
-        assert_eq!(
-            reshow_replacement(1.0, 1.0, 1.0, Some([900, 650])),
-            Some((900.0, 650.0))
-        );
-        assert_eq!(
-            reshow_replacement(0.0, 860.0, 600.0, Some([900, 650])),
-            Some((900.0, 650.0))
-        );
-        // Preferred 860x600 only when no last-known-good exists.
-        assert_eq!(
-            reshow_replacement(1.0, 0.0, 0.0, None),
-            Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H))
-        );
-    }
-
-    #[test]
-    fn valid_deliberate_size_is_not_replaced_on_reshow() {
-        // Valid deliberate sizes, including stable 700x500, need no repair.
-        assert_eq!(reshow_replacement(1.0, 900.0, 650.0, Some([900, 650])), None);
-        assert_eq!(reshow_replacement(1.0, 700.0, 500.0, Some([900, 650])), None);
-        assert_eq!(reshow_replacement(1.0, 700.0, 500.0, Some([700, 500])), None);
-        assert_eq!(reshow_replacement(1.25, 859.0, 671.0, Some([900, 650])), None);
-        // A later poll must not persist the preferred substitute over a real
-        // good: repair picks the real good, never preferred, when it exists.
-        assert_ne!(
-            reshow_replacement(1.0, 0.0, 0.0, Some([900, 650])),
-            Some((common::WINDOW_PREFERRED_W, common::WINDOW_PREFERRED_H))
-        );
-    }
-
-    #[test]
-    fn clamp_uses_common_work_area_rule() {
-        // The platform clamp delegates to the common work-area rule, which
-        // honors the UI minimum instead of persisting a temporary size when
-        // the work area itself is smaller than 700x500.
-        assert_eq!(clamp_to_work_area(1000.0, 800.0), {
-            match work_area_size() {
-                Some((ww, wh)) => common::clamp_window_size_to_work_area(1000.0, 800.0, ww, wh),
-                None => (1000.0, 800.0),
-            }
-        });
     }
 }

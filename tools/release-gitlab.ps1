@@ -226,10 +226,7 @@ try {
             }
             if (-not $iscc) { throw 'Inno Setup not found. Run "winget install JRSoftware.InnoSetup" and try again.' }
             $numeric = ($version -replace '-.*$', '') + '.0'
-            # The installer thumbprint is derived, never hand-typed — same
-            # source the signing tooling loads.
-            $pinnedBuild = Get-PinnedThumbprint
-            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric" "/DPINNED_THUMBPRINT=$pinnedBuild"
+            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric"
             Step 'Signing the installer'
             Sign "$dist\$setup" "Yeager-Setup-$version-signature.json"
         } finally {
@@ -245,8 +242,7 @@ try {
         Compress-Archive -Path "$stage\*" -DestinationPath (Join-Path $out $zip) -Force
         Copy-Item "$dist\yeager.exe", "$dist\$setup" $out
         Copy-Item docs\signing\Yeager-codesign.cer, LICENSE, THIRD-PARTY-NOTICES.md $out
-        # yeager.exe on its own is what the in-app updater downloads; it checks it against this list.
-        # The installer shares the same hash + pinned-signature trust policy.
+        # yeager.exe on its own is what the in-app updater downloads; it checks it against this list
         $lines = foreach ($f in @($setup, $zip, 'yeager.exe')) {
             "$((Get-FileHash (Join-Path $out $f) -Algorithm SHA256).Hash.ToLower())  $f"
         }

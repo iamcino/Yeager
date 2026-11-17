@@ -6,34 +6,10 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-## [1.1.9] - 2026-11-17
-
-### Fixed
-- Removed the driver directory permission check that could refuse to start the engine depending on the state of the Yeager data folder. The engine starts normally again, and the DNS backup moves to the user data folder, out of the permission-checked folder.
-
-## [1.1.8] - 2026-11-17
-### Changed
-- **DNS protection is now backup and restore, inside the app:** turning DNS on first saves the current DNS settings of the affected network adapters to a local backup, then applies Yeager's settings. Turning DNS off, or quitting Yeager normally, writes your saved settings back exactly and removes the backup. If Yeager closes unexpectedly, the next launch restores your saved DNS from the leftover backup and removes it.
-### Removed
-- **The DNS recovery companion service:** the small service introduced in 1.1.7, together with its journal and helper, is no longer installed or required. Yeager launches, enables DNS and uninstalls without any service, and the installer registers none.
-### Fixed
-- **DNS problems never block anything else:** any failure while saving or restoring DNS only limits the DNS feature; it never prevents Yeager from launching and never blocks uninstall. If DNS itself cannot be enabled, Levi stays off, because the engine needs DoH. Uninstalling while DNS is on restores your original DNS first and still completes even if that restore fails.
-
 ## [1.1.7] - 2026-11-17
-### Added
-- **DNS recovery service:** Yeager now ships a small companion service that guards the DNS configuration Yeager sets. It records the protected settings and restores them if another program or a system change alters them, and it can repair damage left behind by older versions when you explicitly approve it. Included in both the installer and the portable edition.
 ### Changed
 - **The Levi engine, refined:** Levi's connection craft has been polished to a finer sheen — every opening handshake now flows with a smoother, more graceful cadence, coaxing even the most stubborn of connections into a calm and steady rhythm.
 
-### Fixed
-- **Capture filter narrowed to ClientHello:** the outbound WinDivert clause now requires the TLS handshake + ClientHello prefix (`tcp.Payload[0] == 0x16`, `tcp.Payload[1] == 0x03`, `tcp.Payload[5] == 0x01`) after the existing `tcp.PayloadLength >= 40` length guard, so bulk upload bytes no longer detour through userspace. The inbound RST clause is unchanged. Docs now state that only ClientHello-bearing packets are inspected outbound, that `Auto` selects `Fast` unconditionally, and that the allocation-free path refers to the Auto/Fast inline path.
-- **WinDivert driver planting hole (P0):** the engine no longer loads its driver from the user-writable `%TEMP%\Yeager_bin`. On every start the embedded `WinDivert.dll` / `WinDivert64.sys` are hash-verified (SHA-256) against the build and refreshed on mismatch inside the protected `%ProgramData%\Yeager\driver` store (Administrators + SYSTEM full control, Users read/execute only, inheritance off, owner and DACL re-verified on every start, fail closed on mismatch). A same-user planted DLL in the old temp directory is never loaded; the legacy directory is swept best-effort (reparse points are never traversed). Personal driver builds can still be substituted via the `--driver-dir <path>` flag on both `yeager.exe` and `levi.exe` — never via `config.json` or the environment.
-- **Stale driver service record (startup check):** before loading the driver, the engine reads the existing `WinDivert` service record and compares it with the verified driver file. A stopped record pointing elsewhere is removed so the driver is re-registered from the protected store; if the old driver is still running from another location, startup stops with an error naming the recorded path instead of loading it. New protected directories are now always owned by Administrators, and the owner-mismatch error names the owner actually found.
-
-- **Window position memory:** the main window's size and position are validated against the visible work area before they are restored. A window that was saved while minimized, maximized, or on a monitor that has since been disconnected no longer reopens off-screen or with impossible bounds; the saved geometry is repaired in memory instead.
-- **Updater signature check (P0):** the in-app updater now verifies the Authenticode signature of every downloaded update against Yeager's pinned signing key, in addition to the SHA-256 checksums. An update whose binary was altered is rejected even if its checksums were recomputed to match, and both download sources go through the identical verification path.
 ## [1.1.6] - 2026-11-13
 
 ### Changed

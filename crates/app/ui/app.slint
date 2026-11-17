@@ -269,17 +269,6 @@ export component MainWindow inherits Window {
     in property <string> update-version;
     // The ISP Cloudflare sees ("" until known), shown above the status.
     in property <string> isp;
-    // --- DNS restore diagnostics ---
-    // Restore state: "" while healthy, otherwise the pending restore reason.
-    // Detail carries the per-adapter debt, if any.
-    in property <string> dns-recovery-state;
-    in property <string> dns-recovery-detail;
-    // --- U08 legacy leftovers (detection only in the GUI) ---
-    // Summary and per-adapter detail from the conservative detector.
-    // legacy-dialog: 0 hidden, 1 consent dialog.
-    in property <string> legacy-state;
-    in property <string> legacy-detail;
-    in-out property <int> legacy-dialog: 0;
     in property <bool> update-busy: false;
     in property <string> update-status;
     in property <bool> check-updates: true;
@@ -321,8 +310,6 @@ export component MainWindow inherits Window {
     callback open-release-notes();
     callback open-download-page();
     callback set-check-updates(bool);
-    callback approve-legacy();
-    callback dismiss-legacy();
 
     in-out property <int> page: 0;
 
@@ -1049,20 +1036,6 @@ export component MainWindow inherits Window {
                                         clicked => { root.test-dns(); }
                                     }
                                 }
-                                RowSeparator { }
-                                Row {
-                                    title: Lang.t("Khôi phục", "Recovery");
-                                    subtitle: root.dns-recovery-state == "" ? Lang.t("Ổn định", "Healthy") : root.dns-recovery-state;
-                                }
-                                if root.legacy-state != "": RowSeparator { }
-                                if root.legacy-state != "": Row {
-                                    title: Lang.t("DNS cũ", "Legacy DNS");
-                                    subtitle: root.legacy-detail;
-                                    PillButton {
-                                        text: Lang.t("Chi tiết", "Details");
-                                        clicked => { root.legacy-dialog = 1; }
-                                    }
-                                }
                             }
                         }
 
@@ -1221,59 +1194,6 @@ export component MainWindow inherits Window {
                                     root.install-update();
                                 }
                             }
-                        }
-                    }
-                }
-            }
-        }
-        // U08 legacy consent dialog (detection only in the GUI): explains
-        // that the old static settings are unrecoverable and that repair
-        // happens only behind explicit elevated approval. Recording consent
-        // changes nothing by itself.
-        if root.legacy-dialog != 0: Rectangle {
-            background: #00000080;
-            TouchArea { }
-            Rectangle {
-                width: 420px;
-                height: dialog-legacy.preferred-height;
-                background: Theme.group;
-                border-radius: Theme.r-group;
-                border-width: 1px;
-                border-color: Theme.separator;
-                dialog-legacy := VerticalLayout {
-                    padding: 20px;
-                    spacing: 10px;
-                    Text {
-                        text: Lang.t("DNS cũ từ trước Yeager", "Pre-Yeager legacy DNS");
-                        font-size: Theme.fs-title;
-                        font-weight: 700;
-                        color: Theme.label;
-                    }
-                    Text {
-                        text: root.legacy-detail;
-                        font-size: Theme.fs-body;
-                        color: Theme.label2;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: Lang.t("Yeager không thể khôi phục các DNS tĩnh từ trước Yeager: chúng không được ghi lại và không thể dựng lại. Việc sửa chỉ diễn ra sau phê duyệt elevated rõ ràng; ở đây chỉ ghi nhận, không thay đổi gì.",
-                            "Yeager cannot recover pre-Yeager static DNS: it was never recorded and cannot be reconstructed. Repair happens only behind explicit elevated approval; here consent is only recorded, nothing is changed.");
-                        font-size: Theme.fs-body;
-                        color: Theme.label2;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        padding-top: 6px;
-                        spacing: 8px;
-                        alignment: end;
-                        PillButton {
-                            text: Lang.t("Để sau", "Later");
-                            clicked => { root.dismiss-legacy(); }
-                        }
-                        PillButton {
-                            primary: true;
-                            text: Lang.t("Ghi nhận đồng ý", "Record consent");
-                            clicked => { root.approve-legacy(); }
                         }
                     }
                 }
