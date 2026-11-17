@@ -7,6 +7,8 @@ All notable changes to Yeager are documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [1.1.8] - 2026-11-17
 ### Changed
 - **DNS protection is now backup and restore, inside the app:** turning DNS on first saves the current DNS settings of the affected network adapters to a local backup, then applies Yeager's settings. Turning DNS off, or quitting Yeager normally, writes your saved settings back exactly and removes the backup. If Yeager closes unexpectedly, the next launch restores your saved DNS from the leftover backup and removes it.
 ### Removed
