@@ -11,7 +11,7 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 ## [1.1.9] - 2026-11-17
 
 ### Đã sửa
-- Gỡ bỏ cơ chế kiểm tra quyền của thư mục driver — cơ chế này có thể từ chối khởi động engine tuỳ theo trạng thái của thư mục dữ liệu Yeager. Engine nay khởi động bình thường trở lại, và bản sao lưu DNS trong cùng thư mục không còn bị ảnh hưởng.
+- Gỡ bỏ cơ chế kiểm tra quyền của thư mục driver — cơ chế này có thể từ chối khởi động engine tuỳ theo trạng thái của thư mục dữ liệu Yeager. Engine nay khởi động bình thường trở lại, và bản sao lưu DNS dời về thư mục dữ liệu người dùng, ra khỏi thư mục bị kiểm tra quyền.
 
 ## [1.1.8] - 2026-11-17
 ### Thay đổi

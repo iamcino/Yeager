@@ -11,7 +11,7 @@ All notable changes to Yeager are documented here. The format follows
 ## [1.1.9] - 2026-11-17
 
 ### Fixed
-- Removed the driver directory permission check that could refuse to start the engine depending on the state of the Yeager data folder. The engine starts normally again, and the DNS backup kept in the same folder is no longer affected.
+- Removed the driver directory permission check that could refuse to start the engine depending on the state of the Yeager data folder. The engine starts normally again, and the DNS backup moves to the user data folder, out of the permission-checked folder.
 
 ## [1.1.8] - 2026-11-17
 ### Changed
