@@ -13,9 +13,9 @@ use common::{Error, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// `%ProgramData%\Yeager\dns-backup.json`. `None` if ProgramData is unset.
+/// `%LOCALAPPDATA%\Yeager\dns-backup.json`. `None` if LocalAppData is unset.
 pub fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("ProgramData")?;
+    let base = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(base).join("Yeager").join("dns-backup.json"))
 }
 
@@ -27,7 +27,7 @@ pub fn exists() -> bool {
 /// Serializes the captured state to the backup file, creating the directory
 /// if needed. The caller saves this BEFORE pointing adapters at the stub.
 pub fn save(backups: &[AdapterBackup]) -> Result<()> {
-    let p = path().ok_or_else(|| Error::new("ProgramData is not set"))?;
+    let p = path().ok_or_else(|| Error::new("LocalAppData is not set"))?;
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).map_err(io_err)?;
     }
@@ -38,7 +38,7 @@ pub fn save(backups: &[AdapterBackup]) -> Result<()> {
 
 /// Reads the backup file back into captured adapter state.
 pub fn load() -> Result<Vec<AdapterBackup>> {
-    let p = path().ok_or_else(|| Error::new("ProgramData is not set"))?;
+    let p = path().ok_or_else(|| Error::new("LocalAppData is not set"))?;
     let text = std::fs::read_to_string(&p).map_err(io_err)?;
     let doc: Value = serde_json::from_str(&text).map_err(|e| Error::new(e.to_string()))?;
     let arr = doc.as_array().ok_or_else(|| Error::new("backup is not a list"))?;

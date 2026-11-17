@@ -1256,7 +1256,9 @@ pub fn ensure_driver_extracted_with_override(
         return Ok(dir.join(WINDIVERT_DLL_NAME));
     }
     let dir = get_driver_dir()?;
-    ensure_admin_only_dir(&dir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!("could not create driver directory {}: {e}", dir.display())
+    })?;
     sync_embedded_file(&dir.join(WINDIVERT_DLL_NAME), dll_bytes)?;
     sync_embedded_file(&dir.join(WINDIVERT_SYS_NAME), sys_bytes)?;
     Ok(dir.join(WINDIVERT_DLL_NAME))

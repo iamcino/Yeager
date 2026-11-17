@@ -81,7 +81,7 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 Type: files; Name: "{app}\yeager.old.exe"
 Type: files; Name: "{app}\yeager.new.exe"
 Type: filesandordirs; Name: "{localappdata}\Yeager"
-; ProgramData\Yeager holds the DNS backup file. `yeager.exe --cleanup` restores
+; %LOCALAPPDATA%\Yeager holds the DNS backup file. `yeager.exe --cleanup` restores
 ; DNS from it and deletes it on uninstall. A leftover backup whose restore
 ; failed is kept so the next launch can restore it; the folder is not
 ; force-deleted here.
