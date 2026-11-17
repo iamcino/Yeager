@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/app", "crates/erwin", "crates/hange", "crates/common", "crates/levi", "crates/dns-recovery"]
 
 [workspace.package]
-version = "1.1.6"
+version = "1.1.7"
 edition = "2024"
 authors = ["Cino"]
 license = "MIT"
