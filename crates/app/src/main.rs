@@ -16,7 +16,6 @@ mod updater;
 
 use common::lang::{self, tr};
 use common::{t, Config, Congestion, DohProvider, Language, Scope, TransportProfile};
-use bootstrap::BootCtl;
 use erwin::config;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
 use std::cell::{Cell, RefCell};
@@ -101,12 +100,11 @@ pub fn is_work_area_constrained_snapshot(
     live == [cw.round() as u32, ch.round() as u32]
 }
 
-// U09-REV4 item 1: the pinned thumbprint is derived at build time from
+// The pinned code-signing thumbprint is derived at build time from
 // `docs/signing/Yeager-codesign.cer` by `crates/app/build.rs` (SHA-1 of the
 // DER, the same source `Get-PinnedThumbprint` loads) and emitted as a
 // generated include. No hand-typed thumbprint constant exists anywhere in
-// this crate; the portable verdict below compares against this derived value.
-#[cfg_attr(not(windows), allow(dead_code))]
+// this crate; the derivation test below checks it against the cert file.
 include!(concat!(env!("OUT_DIR"), "/pinned_thumbprint.rs"));
 
 /// Runs a blocking operation off the UI thread and reports the result through a
@@ -125,256 +123,6 @@ fn spawn<T: Send + 'static>(
         });
     });
 }
-
-/// U09-REV production service probe for the update gate (§10 item 4):
-/// service capability and compatibility are checked BEFORE installing a
-/// replacement. The service's actual protocol/journal/binary versions are
-/// read from the pipe Hello reply — never fabricated from this binary's own
-/// constants. An unreachable service reads as absent (`None`); an integrity
-/// failure escalates to an unknown-newer journal (real base + 1) so the gate
-/// refuses. Service-changing releases are detected through the release
-/// manifest (`requires_service_binary` / required protocol/journal), which
-/// routes the single-exe updater to the signed installer.
-struct LiveServiceProbe;
-
-impl updater::ServiceProbe for LiveServiceProbe {
-    fn service_info(&self) -> Option<updater::ServiceInfo> {
-        use hange::DnsService as _;
-        let client = hange::PipeClient::new();
-        // Real service versions from the pipe — fails closed to absent when
-        // the service is unreachable or the Hello carries no versions.
-        let versions = client.service_versions()?;
-        let mut status_client = hange::PipeClient::new();
-        let rep = status_client.status();
-        let base_protocol = versions.protocol;
-        let base_journal = versions.journal_version;
-        let service_version = versions.service_version;
-        match rep.outcome {
-            hange::SvcOutcome::Unavailable => None,
-            hange::SvcOutcome::IntegrityError => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal.saturating_add(1),
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::UnknownVersion(
-                    base_journal.saturating_add(1),
-                ),
-            }),
-            hange::SvcOutcome::Unsupported => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal,
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::IntegrityError,
-            }),
-            hange::SvcOutcome::Pending => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal,
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::Pending,
-            }),
-            hange::SvcOutcome::Conflict => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal,
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::Conflict,
-            }),
-            hange::SvcOutcome::Busy => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal,
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::OwnedActive,
-            }),
-            _ => Some(updater::ServiceInfo {
-                protocol: base_protocol,
-                journal_version: base_journal,
-                service_version,
-                state: updater::ServiceState::Running,
-                journal: updater::JournalStatus::Clean,
-            }),
-        }
-    }
-
-    fn journal_version(&self) -> Option<u32> {
-        self.service_info().map(|s| s.journal_version)
-    }
-
-    fn verify_restore(&self) -> bool {
-        // Pre-replacement restore/verify gate (§10 item 4): a compatible
-        // GUI-only update restores/verifies BEFORE the exe replacement. The
-        // service must report a clean, verified state; pending/conflict/busy
-        // (or an unreachable service) blocks the replacement.
-        matches!(
-            self.service_info(),
-            Some(info) if matches!(info.journal, updater::JournalStatus::Clean)
-        )
-    }
-}
-
-/// U09: protected-install detection (Q2 ruled). The installer distribution
-/// runs from `%ProgramFiles%\Yeager`; anything else is the portable
-/// distribution. This is a UI-gating heuristic only — the real protection is
-/// the service ACL plus the invariant that portable cleanup never deletes
-/// the protected binary or ProgramData state
-/// (`dns_recovery::provision::portable_removal_scope`).
-fn is_protected_install() -> bool {
-    std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy().to_lowercase();
-            s.contains("program files") && s.contains("yeager")
-        })
-        .unwrap_or(false)
-}
-
-/// U09-REV Q2: absent-service portable takeover refuses. Takeover is allowed
-/// only when the real service state is healthy (Running + Clean): pending,
-/// conflict and busy pipe outcomes are not a healthy service, and a
-/// path-string match is not a service check. Both distributions require the
-/// same healthy-service proof; an absent/stopped/pending service stays
-/// diagnostic-only.
-fn portable_takeover_allowed() -> bool {
-    use crate::updater::ServiceProbe as _;
-    matches!(
-        LiveServiceProbe.service_info(),
-        Some(info)
-            if matches!(info.state, updater::ServiceState::Running)
-                && matches!(info.journal, updater::JournalStatus::Clean)
-    )
-}
-
-/// U09-REV4 item 1 + item 8: computed portable helper signature verdict
-/// (never a hardcoded `Valid`). Verifies the carried helper for real —
-/// pinned thumbprint from the build-time derived `PINNED_THUMBPRINT`
-/// (generated from `docs/signing/Yeager-codesign.cer`, same source as
-/// `tools/signing/common.ps1` `Get-PinnedThumbprint`) + RFC 3161 timestamp
-/// validity under the release verify rule (`tools/signing/verify.ps1`).
-#[cfg(windows)]
-fn portable_helper_signature(path: &std::path::Path) -> dns_recovery::provision::SignatureCheck {
-    use dns_recovery::provision::SignatureCheck;
-    let ps = format!(
-        "$s=Get-AuthenticodeSignature -FilePath '{p}'; \
-         $t=''; if ($s.SignerCertificate) {{ $t=$s.SignerCertificate.Thumbprint.ToUpperInvariant() }}; \
-         if ($t -ne '{pinned}') {{ exit 10 }}; \
-         if ($s.Status -in @('NotSigned','HashMismatch','NotSupportedFileFormat','Incompatible')) {{ exit 11 }}; \
-         $u=($s.Status -eq 'UnknownError' -and $s.StatusMessage -like '*root certificate which is not trusted*'); \
-         if (($s.Status -ne 'Valid') -and ($s.Status -ne 'NotTrusted') -and (-not $u)) {{ exit 12 }}; \
-         if (-not $s.TimeStamperCertificate) {{ exit 13 }}; exit 0",
-        p = path.to_string_lossy().replace('\'', "''"),
-        pinned = PINNED_THUMBPRINT
-    );
-    match std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &ps])
-        .output()
-    {
-        Ok(o) if o.status.success() => SignatureCheck::Valid,
-        Ok(o) if o.status.code() == Some(10) || o.status.code() == Some(11) => {
-            SignatureCheck::Invalid
-        }
-        Ok(_) => SignatureCheck::Invalid,
-        Err(_) => SignatureCheck::Unavailable,
-    }
-}
-
-/// U09-REV2 item 8: actual portable removal path — calls the removal
-/// predicate (behavior, not constants). Removes only stale portable-folder
-/// files; any protected deletion target is refused without touching the
-/// filesystem.
-#[cfg(windows)]
-fn portable_cleanup_stale() {
-    if is_protected_install() {
-        return;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    for name in ["yeager.old.exe", "yeager.new.exe"] {
-        let p = exe.with_file_name(name);
-        let s = p.to_string_lossy().to_string();
-        // The predicate enforces the invariant on the real path.
-        if dns_recovery::provision::portable_delete_guarded(&s).is_err() {
-            continue;
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-}
-
-#[cfg(not(windows))]
-fn portable_cleanup_stale() {}
-
-/// U09-REV Q2 bootstrap (E): first run from a portable folder with the
-/// service absent, elevated, and the helper signature valid copies the helper
-/// into protected Program Files and installs the service through the seam.
-/// The planner arm (`plan_portable`) is consulted with the real context;
-/// only `ProvisionViaElevatedBootstrap` proceeds to elevate/copy/spawn.
-#[cfg(windows)]
-fn maybe_portable_bootstrap() {
-    use crate::updater::ServiceProbe as _;
-    if is_protected_install() {
-        return;
-    }
-    // Service already present (even stopped): maintain, do not reinstall here.
-    if LiveServiceProbe.service_info().is_some() {
-        return;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let portable_helper = exe.with_file_name(dns_recovery::provision::SERVICE_BINARY_NAME);
-    if !portable_helper.exists() {
-        return;
-    }
-    // Elevated bootstrap required: an unelevated portable never silently
-    // installs machine software (planner refuses above).
-    let elevated = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 };
-    if !elevated {
-        eprintln!("portable first run requires the elevated bootstrap; takeover refused, diagnostic UI only");
-        return;
-    }
-    // Computed verdict for real (item 8) — never a hardcoded Valid.
-    let sig = portable_helper_signature(&portable_helper);
-    if sig != dns_recovery::provision::SignatureCheck::Valid {
-        eprintln!("portable helper signature did not verify ({sig:?}); takeover refused, diagnostic UI only");
-        return;
-    }
-    let ctx = dns_recovery::provision::PortableContext {
-        location: dns_recovery::provision::LaunchLocation::PortableFolder,
-        service: dns_recovery::provision::ServiceState::Absent,
-        journal: dns_recovery::provision::JournalStatus::Absent,
-        elevated: true,
-        helper_signature: sig,
-    };
-    if !matches!(
-        dns_recovery::provision::plan_portable(&ctx),
-        dns_recovery::provision::PortableDecision::ProvisionViaElevatedBootstrap
-    ) {
-        return;
-    }
-    // Spawn the carried helper's own install seam: it copies itself into
-    // protected Program Files, applies the protected ACL, registers the
-    // service, and Hello-validates. Failures leave no partial service behind.
-    match std::process::Command::new(&portable_helper)
-        .arg("--install-service")
-        .status()
-    {
-        Ok(status) if status.success() => {
-            eprintln!("portable bootstrap provisioned the recovery service");
-        }
-        Ok(status) => {
-            eprintln!("portable bootstrap install seam refused (exit {status}); diagnostic UI only");
-        }
-        Err(e) => {
-            eprintln!("portable bootstrap spawn failed ({e}); diagnostic UI only");
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn maybe_portable_bootstrap() {}
 
 fn scope_from_index(i: i32) -> Scope {
     match i {
@@ -476,7 +224,6 @@ fn main() -> Result<(), slint::PlatformError> {
         bootstrap::NoopPersist,
         lifecycle::LifecycleConfig::default(),
     ));
-    let boot = bootstrap::RealBootCtl::new(lifecycle.clone());
     let sync_engine_cfg = |cfg: &Config| {
         *engine_cfg.lock().unwrap() = cfg.clone();
     };
@@ -485,69 +232,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let updated = std::env::args().any(|a| a == updater::UPDATED_ARG);
     let resume = std::env::args().any(|a| a == updater::CONNECT_ARG);
 
-    // Run by the uninstaller after it has closed the app: exact
-    // result-bearing recovery first (spec §6 uninstaller row), then the
-    // separate TCP and logon cleanup. A failed journal is retained and the
-    // exit is nonzero — silent failure chains are forbidden. No guard is
-    // armed on this path: the cleanup itself is the lifecycle outcome.
+    // Run by the uninstaller after it has closed the app: restore DNS from
+    // any leftover backup, then the separate TCP and logon cleanup. Fail-open:
+    // a failed restore is logged but never blocks the uninstall. No guard is
+    // armed on this path.
     if std::env::args().any(|a| a == "--cleanup") {
         std::process::exit(cleanup_and_exit());
     }
-
-    // --- U08 bootstrap order (spec §7) ---
-    // Inspection and dead-owner recovery run FIRST, before the guard, the
-    // updater background work and the single-instance check. A live owner
-    // means quit without touching DNS and without arming any guard: this
-    // process owns no lease, so exiting must quiesce nothing. The duplicate
-    // path below likewise returns before any guard exists, so a panic there
-    // can never fire a shutdown from `Drop`.
-    let journal = boot.inspect();
-    if let bootstrap::JournalState::OwnedLive { owner } = &journal {
-        eprintln!("another Yeager owns DNS ({owner}); activating it");
-        return Ok(());
-    }
-    let recovery = match &journal {
-        bootstrap::JournalState::Clean | bootstrap::JournalState::OwnedDead { .. } => Some(boot.recover()),
-        _ => None,
-    };
-    let decision = match &recovery {
-        Some(bootstrap::BootRecovery::RestoredVerified) => bootstrap::BootDecision::ProceedAutoConnect,
-        Some(other) => bootstrap::BootDecision::ProceedDiagnosticOnly {
-            reason: format!("recovery did not verify ({other:?}); auto-connect blocked"),
-        },
-        None => bootstrap::classify_boot(&journal),
-    };
-    let auto_connect_blocked = decision.blocks_auto_connect();
-    // U09-REV Q2 bootstrap (E): portable first run provisions the persistent
-    // service via the elevated bootstrap before the takeover gate runs.
-    // Stale portable files are cleaned through the guarded removal path.
-    portable_cleanup_stale();
-    maybe_portable_bootstrap();
-    // U09 Q2: absent-service portable takeover refuses. A portable GUI with
-    // no reachable recovery service stays diagnostic-only: no silent
-    // install, no watchdog from a writable folder. The installer
-    // distribution provisions the service; the portable first run provisions
-    // it via the elevated bootstrap into protected Program Files.
-    let portable_blocked = !portable_takeover_allowed();
-    if portable_blocked {
-        eprintln!("portable without an installed recovery service; takeover refused, diagnostic UI only");
-    }
-    let auto_connect_blocked = auto_connect_blocked || portable_blocked;
-    let boot_diagnostic = bootstrap::BootDiagnostics {
-        decision: decision.clone(),
-        recovery: recovery.clone(),
-        authority_pending: None,
-        legacy_summary: None,
-    };
 
     updater::finish_previous_update(updated);
 
     #[cfg(windows)]
     let instance_guard = match platform::ensure_single_instance(updated) {
         platform::SingleInstanceDecision::Proceed(guard) => guard,
-        // Duplicate instance (spec §6 row): early owner inspection already
-        // ran above and left the live owner alone. No guard is armed on
-        // this path, so exiting quiesces nothing.
+        // Duplicate instance: the running owner keeps DNS. No guard is armed
+        // on this path, so exiting quiesces nothing.
         platform::SingleInstanceDecision::AlreadyRunning => {
             return Ok(());
         }
@@ -557,10 +256,9 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let build = platform::get_windows_build();
         if build > 0 && build < 20348 {
-            // Unsupported OS (spec §6 row): minimal recovery already ran
-            // above; the restore attempt is idempotent, unsupported
-            // capability stays pending debt, and nothing is ever cleared
-            // heuristically. No guard is armed: nothing further to settle.
+            // Unsupported OS: restore DNS from any leftover backup (the
+            // attempt is idempotent and fail-open), then put TCP/logon back.
+            // No guard is armed: nothing further to settle.
             let _ = hange::restore();
             let _ = erwin::restore();
             let _ = erwin::latency::restore();
@@ -571,11 +269,11 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
-    // The guard is armed only after inspection, recovery, updater work, the
-    // single-instance check and the unsupported-OS early return — every
-    // later fallible initialization below settles this process's lease
-    // through the coordinator, and no early path can fire it by accident.
-    let mut boot_guard = bootstrap::BootGuard::arm(&boot, bootstrap::BootShutdownKind::ProcessQuit);
+    // The guard is armed only after the updater work, the single-instance
+    // check and the unsupported-OS early return — every later fallible
+    // initialization below settles DNS through the lifecycle, and no early
+    // path can fire it by accident.
+    let mut boot_guard = bootstrap::BootGuard::arm(&lifecycle, lifecycle::ShutdownKind::ProcessQuit);
 
     // LGPL substitution mechanism: the ONLY way to redirect the driver load
     // away from the protected %ProgramData%\Yeager\driver store. Never read
@@ -593,9 +291,8 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
 
-    // MainWindow::new failure (spec §6 row): recovery already ran above;
-    // the guard settles this process's lease without UI, and the original
-    // error is returned — no `?` bypass.
+    // MainWindow::new failure: the guard settles DNS without UI, and the
+    // original error is returned.
     let ui = match MainWindow::new() {
         Ok(ui) => ui,
         Err(e) => {
@@ -606,6 +303,15 @@ fn main() -> Result<(), slint::PlatformError> {
     };
     let cfg = Rc::new(RefCell::new(config::load()));
     sync_engine_cfg(&cfg.borrow());
+    // Crash leftover: a backup from a takeover that never disabled. Unless
+    // this launch enters an enabled session (update resume or auto-connect,
+    // which keeps the backup and re-applies the stub), restore the original
+    // DNS and delete the backup. Fail-open: a failed restore degrades DNS
+    // only and never blocks launch.
+    let entering_enabled_session = resume || cfg.borrow().connect_on_launch;
+    if !entering_enabled_session && hange::has_leftover_backup() {
+        let _ = hange::restore();
+    }
     // Validate on load, fall back as a pair: missing/invalid/below-minimum /
     // implausibly huge legacy values resolve to the last validated geometry
     // (here: preferred 860x600), never clamped into a minimum-size window.
@@ -1108,19 +814,17 @@ fn main() -> Result<(), slint::PlatformError> {
         let w = ui.as_weak();
         let cfg = cfg.clone();
         let drain = shared_ui_drain.clone();
-        let boot_diag = boot_diagnostic.clone();
         dns_stats_timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
-            // Listener supervision (spec §6 listener rows): terminal task
-            // loss closes admission and restores via the service; ordinary
-            // receive/accept/connection errors stay recoverable and never
-            // quit. Runs even when the window is hidden so a dead listener
-            // cannot sit unsupervised.
+            // Listener supervision: terminal task loss restores DNS from the
+            // backup; ordinary receive/accept/connection errors stay
+            // recoverable and never quit. Runs even when the window is hidden
+            // so a dead listener cannot sit unsupervised.
             let _ = hange::supervise_tick();
             if let Some(ui) = w.upgrade().filter(|ui| ui.window().is_visible()) {
                 refresh_dns_stats(&ui, &cfg.borrow(), &dns_stats);
                 refresh_engine_stats(&ui);
-                // Live coordinator debt + shutdown-thread notes surface here.
-                refresh_recovery_ui(&ui, &boot_diag, &drain);
+                // Live restore debt + shutdown-thread notes surface here.
+                refresh_recovery_ui(&ui, &drain);
                 if ui.get_page() == 0 && network_at.get().is_none_or(|at| at.elapsed() >= NETWORK_REFRESH) {
                     network_at.set(Some(Instant::now()));
                     refresh_network(&ui);
@@ -1434,16 +1138,9 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_busy(true);
             ui.set_log(t!("Đang tải Yeager {version}…", "Downloading Yeager {version}…").into());
             let restart = restart.clone();
-            // U09-REV gate: service capability and compatibility are checked
-            // BEFORE installing a replacement, with the target release's real
-            // manifest requirements (fail-closed to the installer when the
-            // manifest is unavailable). A service-changing update is refused
-            // here with directions to the signed installer before any
-            // replacement; a compatible GUI-only update restores/verifies
-            // BEFORE the exe replacement (and the epilogue still gates the
-            // restart on the coordinator shutdown verify).
-            let current = updater::parse_version(updater::current()).unwrap_or((1, 1, 6));
-            spawn(w.clone(), move || updater::download_and_install_gated_release(&LiveServiceProbe, current, &version), move |ui, res| {
+            // Restore debt never cancels the restart; the next launch's
+            // fail-open leftover restore handles any debt.
+            spawn(w.clone(), move || updater::download_and_install(&version), move |ui, res| {
                 ui.set_update_busy(false);
                 match res {
                     Ok(path) => {
@@ -1519,8 +1216,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 SessionAction::BoundedQuit => {
                     // Bounded synchronous cleanup through the quit-kind path;
-                    // never reopens. Anything unfinished stays covered by the
-                    // service and replay.
+                    // never reopens. Anything unfinished leaves a backup the
+                    // next launch restores.
                     lc.shutdown(lifecycle::ShutdownKind::ProcessQuit);
                     if event == SessionEvent::ConsoleCtrl {
                         std::process::exit(0);
@@ -1536,22 +1233,17 @@ fn main() -> Result<(), slint::PlatformError> {
         }));
     }
     run_legacy_detection(&ui);
-    refresh_recovery_ui(&ui, &boot_diagnostic, &shared_ui_drain);
+    refresh_recovery_ui(&ui, &shared_ui_drain);
 
     // Auto-connect on launch (which brings DoH up first), or DoH alone if
-    // that is all the user keeps on. An unknown/deferred journal blocks
-    // auto-connect (spec §7): the diagnostic UI still runs, DNS stays off.
+    // that is all the user keeps on. A crash leftover was already restored
+    // above unless this launch enters an enabled session.
     let (connect, doh) = (cfg.borrow().connect_on_launch, cfg.borrow().doh_enabled);
-    if auto_connect_blocked {
-        ui.set_log(boot_diagnostic.state_line().into());
-    } else if connect || resume {
+    if connect || resume {
         ui.invoke_toggle_engine(true);
     } else if doh {
         enable_doh(&ui, ui.as_weak(), &lifecycle, dns_choice(&cfg.borrow()), cfg.borrow().doh_http3);
     }
-    // (No heuristic leftover clear: the early recovery above already
-    // replayed the journal through the service. A crashed run's loopback
-    // reference is debt the service owns, never a pattern to clear here.)
     // TCP tuning stands on its own: it follows its own switch, not the engine.
     if cfg.borrow().tcp_enabled {
         apply_congestion(&ui, ui.as_weak(), cfg.borrow().congestion);
@@ -1563,12 +1255,11 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     ui.show().map_err(|e| {
-        // ui.show failure (spec §6 row): the guard settles our lease —
-        // recovery already ran at bootstrap — then the original error is
-        // returned with the recovery report attached. No `?` bypass.
+        // ui.show failure: the guard settles DNS, then the original error is
+        // returned with the shutdown report attached.
         let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
         boot_guard.complete();
-        eprintln!("UI show failed after DNS recovery ({report:?}): {e}");
+        eprintln!("UI show failed after DNS restore ({report:?}): {e}");
         e
     })?;
     #[cfg(windows)]
@@ -1706,115 +1397,59 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(windows)]
     drop(tray);
 
-    // --- Epilogue: coordinator process-shutdown (spec §6 ordering) ---
-    // 1. Quiesce → settle → restore → verify → listener-stop, with the
-    //    engine stop running detached and bounded (never before DNS).
-    // 2. Only then the separate TCP/logon cleanup (engine/TCP locks are
-    //    never on the DNS path).
-    // 3. The update gate: a failed cleanup cancels the restart (spec §10);
-    //    an unverified restore never launches the replacement.
+    // --- Epilogue: process shutdown ---
+    // 1. Restore DNS from the backup and verify, with the engine stop running
+    //    detached and bounded (never before DNS).
+    // 2. Only then the separate TCP/logon cleanup.
+    // 3. Restore debt never cancels the update restart: the debt is logged
+    //    and carried into the next launch's fail-open leftover restore.
     let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
     boot_guard.complete();
     if !report.successful() {
-        eprintln!("shutdown DNS debt retained ({:?}); update restart cancelled", report.dns);
+        eprintln!("shutdown DNS debt retained ({:?}); the next launch's leftover restore handles it", report.dns);
     }
-    // Separate TCP cleanup, after DNS (engine/TCP locks never gate DNS).
-    // Launch-at-login is a user setting: only the uninstaller clears it.
+    // Separate TCP cleanup, after DNS. Launch-at-login is a user setting:
+    // only the uninstaller clears it.
     let _ = erwin::restore();
     drop(update_timer);
     let restart = restart.lock().unwrap().take();
-    // U09: failed cleanup cancels the restart through the shared gate
-    // (updater::may_restart_after_cleanup); an unverified restore never
-    // launches the replacement.
-    if let Some((path, connect)) = restart
-        && updater::may_restart_after_cleanup(report.successful()) {
+    if let Some((path, connect)) = restart_after_shutdown(restart, &report) {
         updater::restart(&path, connect);
     }
     Ok(())
 }
 
-/// Exact result-bearing cleanup for `--cleanup` (uninstaller path).
-/// Returns the process exit code as the lifecycle outcome it actually is:
-/// 0 verified clean, 10 live-owner/busy, 11 pending/unavailable, 12
-/// conflict, 13 privilege/auth. A failed journal is retained and
-/// TCP/logon cleanup still runs, but the nonzero DNS result stands.
-fn cleanup_and_exit() -> i32 {
-    cleanup_and_exit_with(hange::restore)
+/// The update restart decision given the shutdown report. Restore debt never
+/// cancels the restart: a cancelled restart leaves the machine's adapters
+/// pointing at a stub that no longer runs, with nothing restoring them until
+/// the user happens to relaunch. The debt is logged and carried into the next
+/// launch, whose leftover-restore path is fail-open.
+fn restart_after_shutdown(
+    restart: Option<(PathBuf, bool)>,
+    report: &lifecycle::ShutdownReport,
+) -> Option<(PathBuf, bool)> {
+    if restart.is_some() && !report.successful() {
+        eprintln!("update restart proceeds despite shutdown DNS debt ({:?})", report.dns);
+    }
+    restart
 }
 
-/// Testable core of [`cleanup_and_exit`]: the restore call is injected so
-/// tests drive every exit-table row without touching the real service.
-/// Production passes `hange::restore`; TCP/logon cleanup still runs in both.
-fn cleanup_and_exit_with(
-    restore: impl FnOnce() -> Result<hange::AuthorityStatus, common::Error>,
-) -> i32 {
-    let code = cleanup_code(restore());
-    if code != 0 {
-        // TCP/logon cleanup still runs, but the nonzero DNS result stands.
-        let _ = erwin::restore();
-        let _ = erwin::latency::restore();
-        let _ = erwin::set_launch_at_login(false, &Default::default());
-        return code;
+/// Uninstaller path (`--cleanup`): restore DNS from any leftover backup, then
+/// the separate TCP/logon cleanup. Fail-open by design — a failed restore is
+/// logged but never blocks the uninstall, so this always exits 0.
+fn cleanup_and_exit() -> i32 {
+    match hange::restore() {
+        Ok(status) => {
+            if let Some(debt) = status.pending {
+                eprintln!("cleanup: DNS restore left debt: {debt}");
+            }
+        }
+        Err(e) => eprintln!("cleanup: DNS restore failed: {e}"),
     }
     let _ = erwin::restore();
     let _ = erwin::latency::restore();
     let _ = erwin::set_launch_at_login(false, &Default::default());
     0
-}
-
-/// Pure mapping for [`cleanup_and_exit`]: the lifecycle restore outcome to
-/// the §8.3 exit code. `Busy` (live owner holds the machine lease) is 10,
-/// pending/unavailable is 11, conflict is 12, privilege/auth is 13.
-/// Unavailable is 11 (not 13): the service is reachable but debt remains and
-/// the journal is retained — §8.3 and `protocol::exit_code_for_outcome` put
-/// pending/unavailable/deferred at 11, while 13 is privilege/service/auth
-/// (`refused`/`auth_rejected`/`service_unavailable`). No digit-substring
-/// matching: an arbitrary message containing "10" or "13" must never decide
-/// the code.
-fn cleanup_code(result: Result<hange::AuthorityStatus, common::Error>) -> i32 {
-    match result {
-        Ok(status) if status.pending.is_none() => 0,
-        Ok(status) => {
-            let debt = status.pending.unwrap_or_default();
-            eprintln!("cleanup: DNS debt retained, journal kept: {debt}");
-            // A retained lease that is still live reports as busy debt;
-            // everything else pending (including unavailable) stays 11.
-            if debt.contains("Busy")
-                || debt.contains("busy")
-                || debt.contains("live-owner")
-                || debt.contains("live_owner")
-            {
-                10
-            } else {
-                11
-            }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            eprintln!("cleanup: DNS restore failed, journal kept: {msg}");
-            if msg.contains("Conflict") || msg.contains("conflict") {
-                12
-            } else if msg.contains("Busy")
-                || msg.contains("busy")
-                || msg.contains("live-owner")
-                || msg.contains("live_owner")
-            {
-                10
-            } else if msg.contains("privilege")
-                || msg.contains("Privilege")
-                || msg.contains("auth")
-                || msg.contains("Auth")
-                || msg.contains("refused")
-                || msg.contains("Refused")
-                || msg.contains("service_unavailable")
-            {
-                13
-            } else {
-                // Includes `Unavailable`/`unavailable`: debt retained, 11.
-                11
-            }
-        }
-    }
 }
 
 /// Looks up the local and public addresses for the network card off the UI
@@ -2746,26 +2381,17 @@ fn loopback_port_held() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-/// Surfaces the bootstrap decision and the coordinator debt on the DNS
-/// page, and drains shutdown-thread notifications into the log.
-fn refresh_recovery_ui(ui: &MainWindow, boot: &bootstrap::BootDiagnostics, drain: &bootstrap::SharedLogUi) {
+/// Surfaces the DNS restore state on the DNS page and drains shutdown-thread
+/// notifications into the log. A debt-free authority reads as ready; any
+/// pending restore stays visible, never reported as success.
+fn refresh_recovery_ui(ui: &MainWindow, drain: &bootstrap::SharedLogUi) {
     let pending = hange::authority_status().pending;
-    let line = if pending.is_some() {
-        bootstrap::BootDiagnostics {
-            decision: boot.decision.clone(),
-            recovery: boot.recovery.clone(),
-            authority_pending: pending,
-            legacy_summary: boot.legacy_summary.clone(),
-        }
-        .state_line()
-    } else {
-        boot.state_line()
+    let line = match &pending {
+        Some(debt) => format!("DNS restore pending: {debt}"),
+        None => "DNS ready".into(),
     };
     ui.set_dns_recovery_state(line.into());
-    let detail = hange::authority_status()
-        .pending
-        .unwrap_or_default();
-    ui.set_dns_recovery_detail(detail.into());
+    ui.set_dns_recovery_detail(pending.unwrap_or_default().into());
     for msg in drain.drain() {
         ui.set_log(format!("{}\n{msg}", ui.get_log()).into());
     }
@@ -2773,81 +2399,6 @@ fn refresh_recovery_ui(ui: &MainWindow, boot: &bootstrap::BootDiagnostics, drain
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn ok_clean() -> Result<hange::AuthorityStatus, common::Error> {
-        Ok(hange::AuthorityStatus {
-            enabled: false,
-            serving_local: false,
-            addrs: Vec::new(),
-            pending: None,
-            epoch: Some(1),
-        })
-    }
-
-    fn ok_pending(debt: &str) -> Result<hange::AuthorityStatus, common::Error> {
-        Ok(hange::AuthorityStatus {
-            enabled: false,
-            serving_local: false,
-            addrs: Vec::new(),
-            pending: Some(debt.into()),
-            epoch: Some(1),
-        })
-    }
-
-    #[test]
-    fn cleanup_codes_match_the_documented_lifecycle_outcomes() {
-        // Item 4 (--cleanup row, U08-REV2): code and comment agree, routed as
-        // the lifecycle outcome it actually is. 0 verified clean, 10
-        // live-owner/busy, 11 pending/unavailable, 12 conflict, 13
-        // privilege/auth. Unavailable is 11 (not 13): §8.3 and
-        // `protocol::exit_code_for_outcome` put pending/unavailable/deferred
-        // at 11; 13 is privilege/auth. No digit-substring matching. The
-        // journal is retained on every nonzero.
-        assert_eq!(cleanup_code(ok_clean()), 0);
-        assert_eq!(cleanup_code(ok_pending("adapter gone")), 11);
-        assert_eq!(cleanup_code(ok_pending("Busy: live owner holds lease")), 10);
-        assert_eq!(cleanup_code(ok_pending("live-owner debt")), 10);
-        // Pending carrying an unavailable note stays 11.
-        assert_eq!(cleanup_code(ok_pending("unavailable: debt retained")), 11);
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("Conflict: foreign edit"))),
-            12
-        );
-        assert_eq!(
-            cleanup_code(Err(common::Error::new(
-                "Busy: live owner holds the machine lease"
-            ))),
-            10
-        );
-        // U08-REV2 fix: Unavailable maps to 11, matching the comment and §8.3.
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("Unavailable: no service"))),
-            11
-        );
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("unavailable: debt retained"))),
-            11
-        );
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("privilege: need admin"))),
-            13
-        );
-        // Arbitrary digits in the message never decide the code.
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("restore failed 10 times"))),
-            11
-        );
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("error 13 in module 7"))),
-            11
-        );
-        assert_eq!(
-            cleanup_code(Err(common::Error::new("restore failed"))),
-            11
-        );
-    }
-
     fn sha1_hex_bytes(data: &[u8]) -> String {
         // U09-REV4 item 1 test helper: SHA-1 of the raw bytes (the .NET
         // `X509Certificate2.Thumbprint` definition). Duplicates the build
@@ -3003,26 +2554,42 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_and_exit_routes_every_row_without_touching_the_service() {
-        // `cleanup_and_exit` itself (U08-REV2 item 2): injected restore results
-        // drive the exit code; TCP/logon cleanup still runs behind it.
-        assert_eq!(cleanup_and_exit_with(ok_clean), 0);
-        assert_eq!(cleanup_and_exit_with(|| ok_pending("adapter gone")), 11);
+    fn update_restart_proceeds_when_shutdown_restore_not_verified() {
+        // Deviation 3.2: restore debt must never cancel the update restart.
+        // A cancelled restart leaves the adapters pointing at a stub that no
+        // longer runs; the debt instead carries into the next launch's
+        // fail-open leftover restore.
+        use crate::lifecycle::{DnsOutcome, EngineOutcome, ShutdownKind, ShutdownReport};
+        use std::path::PathBuf;
+        let report = |dns: DnsOutcome| ShutdownReport {
+            kind: ShutdownKind::ProcessQuit,
+            dns,
+            engine: EngineOutcome::Completed,
+            epoch: 1,
+            reopened: false,
+            cancelled_queued: 0,
+            ui_error: None,
+            persist_error: None,
+        };
+        let slot = || Some((PathBuf::from("yeager.new.exe"), true));
+        for dns in [
+            DnsOutcome::Pending("restore failed".to_string()),
+            DnsOutcome::Conflict("foreign owner".to_string()),
+        ] {
+            let r = report(dns);
+            assert!(!r.successful(), "pending/conflict is never success");
+            assert_eq!(
+                super::restart_after_shutdown(slot(), &r),
+                slot(),
+                "a non-Verified shutdown restore must not cancel the update restart"
+            );
+        }
+        let verified = report(DnsOutcome::Verified);
+        assert_eq!(super::restart_after_shutdown(slot(), &verified), slot());
+        assert_eq!(super::restart_after_shutdown(None, &verified), None);
         assert_eq!(
-            cleanup_and_exit_with(|| ok_pending("Busy: live owner holds lease")),
-            10
-        );
-        assert_eq!(
-            cleanup_and_exit_with(|| Err(common::Error::new("Conflict: x"))),
-            12
-        );
-        assert_eq!(
-            cleanup_and_exit_with(|| Err(common::Error::new("Unavailable: down"))),
-            11
-        );
-        assert_eq!(
-            cleanup_and_exit_with(|| Err(common::Error::new("privilege: need admin"))),
-            13
+            super::restart_after_shutdown(None, &report(DnsOutcome::Pending("debt".to_string()))),
+            None
         );
     }
 }

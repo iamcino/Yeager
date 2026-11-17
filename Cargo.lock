@@ -1131,16 +1131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dns-recovery"
-version = "1.1.7"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2069,7 +2059,6 @@ name = "hange"
 version = "1.1.7"
 dependencies = [
  "common",
- "dns-recovery",
  "futures-util",
  "hickory-net",
  "hickory-proto",
@@ -6907,7 +6896,6 @@ name = "yeager"
 version = "1.1.7"
 dependencies = [
  "common",
- "dns-recovery",
  "embed-resource",
  "erwin",
  "hange",

@@ -1,30 +1,58 @@
-//! Windows side: readback of which resolvers each network adapter uses,
-//! and Windows' own DNS over HTTPS settings for them.
+//! Windows side: which resolvers each network adapter uses, and Windows'
+//! own DNS over HTTPS settings for them — read and written through the
+//! documented IP Helper API (`GetAdaptersAddresses`,
+//! `GetInterfaceDnsSettings`, `SetInterfaceDnsSettings`), the same calls the
+//! Settings app makes, rather than scripting PowerShell and the registry:
+//! a hidden encoded PowerShell rewriting DNS is exactly what antivirus
+//! behaviour engines flag as a DNS hijacker.
 //!
-//! U08: this module is read-only. The pre-U08 direct writer (`apply` with
-//! its leading heuristic reset, and `reset` itself) is deleted — every DNS
-//! mutation goes through the privileged service via the single
-//! [`crate::authority`]. What remains is selection (`online_guids`),
-//! configured readback (`verify`, `servers_without_doh`) and identity
-//! parsing: the evidence side, never the mutation side. A hidden encoded
-//! PowerShell rewriting DNS is exactly what antivirus behaviour engines
-//! flag as a DNS hijacker; so is a heuristic clear, which is why it is
-//! gone rather than kept as a fallback.
+//! The mutation side is backup-state-and-restore only: [`capture`] reads the
+//! current configured state, [`apply`] points adapters at the stub, and
+//! [`restore`] writes the captured state back. There is no heuristic clear
+//! and no service: the caller saves a backup first and restores it on
+//! disable, exit, or crash leftover.
 
 use common::{DohProvider, Error, Result};
 use std::net::IpAddr;
 
-/// GUID strings (lowercase, brace-free) of every currently online adapter:
-/// the selection the single DNS authority publishes to the service before
-/// each mutating call. Selection only — recovery considers all recorded
-/// GUIDs even when disconnected, and arrival alone never enrolls a new
-/// adapter (spec §1).
-pub fn online_guids() -> Result<Vec<String>> {
-    Ok(win::adapters()?
-        .into_iter()
-        .filter(|a| a.online)
-        .map(|a| a.guid_string())
-        .collect())
+/// One address family's captured configured state: the getter-raw
+/// `NameServer` string (empty means automatic/DHCP) and its DoH server
+/// properties. Writing these back verbatim is the qualified restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyBackup {
+    pub name_server: String,
+    pub properties: Vec<DohProperty>,
+}
+
+/// One adapter's captured DNS, keyed by GUID so restore targets the same
+/// interface even if it has since gone offline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterBackup {
+    pub guid: String,
+    pub name: String,
+    pub v4: FamilyBackup,
+    pub v6: FamilyBackup,
+}
+
+/// Points every online adapter at `local` (the stub's loopback addresses,
+/// if serving) followed by the provider's resolvers, each set to DoH with no
+/// plaintext fallback. Returns the adapters changed. No heuristic clear:
+/// the caller must [`capture`] a backup before calling this.
+pub fn apply(provider: DohProvider, local: &[&str]) -> Result<Vec<String>> {
+    win::apply(provider, local)
+}
+
+/// Captures the current configured DNS of every online adapter (the ones
+/// [`apply`] touches), for a backup saved before any mutation.
+pub fn capture() -> Result<Vec<AdapterBackup>> {
+    win::capture()
+}
+
+/// Writes captured state back to each adapter: IPv4 must succeed, IPv6 is
+/// best-effort. Flushes the resolver cache. The caller deletes the backup
+/// only once this returns `Ok`.
+pub fn restore(backups: &[AdapterBackup]) -> Result<()> {
+    win::restore(backups)
 }
 
 /// Effective (static or DHCP) DNS per adapter, for diagnostics and legacy
@@ -156,7 +184,7 @@ fn encrypted_servers(provider: DohProvider, local: &[&str]) -> Vec<&'static str>
 
 #[cfg(windows)]
 mod win {
-    use common::{Error, Result};
+    use common::{DohProvider, Error, Result};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::ptr;
     use windows_sys::core::{GUID, PWSTR};
@@ -299,6 +327,171 @@ mod win {
             })
             .map(|s| s.to_string())
             .collect())
+    }
+
+    pub fn apply(provider: DohProvider, local: &[&str]) -> Result<Vec<String>> {
+        let encrypted = super::encrypted_servers(provider, local);
+        let online: Vec<_> = adapters()?.into_iter().filter(|a| a.online).collect();
+        if online.is_empty() {
+            return Err(Error::new(common::lang::tr(
+                "Không tìm thấy card mạng đang có kết nối Internet.",
+                "No network adapter with an Internet connection was found.",
+            )));
+        }
+        for ipv6 in [false, true] {
+            let family = |s: &&str| s.contains(':') == ipv6;
+            let servers: Vec<&str> = local.iter().chain(&encrypted).copied().filter(family).collect();
+            let properties: Vec<super::DohProperty> = servers
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !local.contains(s))
+                .map(|(i, _)| super::DohProperty {
+                    version: DNS_SERVER_PROPERTY_VERSION1,
+                    index: i as u32,
+                    prop_type: DnsServerDohProperty as u32,
+                    template: Some(provider.template().to_string()),
+                    flags: DNS_DOH_SERVER_SETTINGS_ENABLE as u64,
+                })
+                .collect();
+            let name_server = servers.join(",");
+            for adapter in &online {
+                let set = write_family(&adapter.guid, ipv6, &name_server, &properties);
+                // IPv6 may be switched off on the adapter; IPv4 must work.
+                if !ipv6 {
+                    set.map_err(|e| {
+                        Error::new(common::t!("Không đặt được DNS cho {}: {e}", "Could not set DNS on {}: {e}", adapter.name))
+                    })?;
+                }
+            }
+        }
+        flush_cache();
+        Ok(online.into_iter().map(|a| a.name).collect())
+    }
+
+    pub fn capture() -> Result<Vec<super::AdapterBackup>> {
+        let mut out = Vec::new();
+        for a in adapters()?.into_iter().filter(|a| a.online) {
+            let v4 = capture_family(&a.guid, false)?;
+            let v6 = capture_family(&a.guid, true).unwrap_or(super::FamilyBackup {
+                name_server: String::new(),
+                properties: Vec::new(),
+            });
+            out.push(super::AdapterBackup { guid: a.guid_string(), name: a.name, v4, v6 });
+        }
+        Ok(out)
+    }
+
+    pub fn restore(backups: &[super::AdapterBackup]) -> Result<()> {
+        for b in backups {
+            let Some(guid) = parse_guid(&b.guid) else { continue };
+            write_family(&guid, false, &b.v4.name_server, &b.v4.properties).map_err(|e| {
+                Error::new(common::t!("Không khôi phục được DNS cho {}: {e}", "Could not restore DNS on {}: {e}", b.name))
+            })?;
+            let _ = write_family(&guid, true, &b.v6.name_server, &b.v6.properties);
+        }
+        flush_cache();
+        Ok(())
+    }
+
+    /// Getter-raw `NameServer` plus DoH properties for one family. Unlike
+    /// [`family_settings`], an unconfigured family is a valid empty capture
+    /// (writing it back restores automatic/DHCP), not an error.
+    fn capture_family(guid: &GUID, ipv6: bool) -> Result<super::FamilyBackup> {
+        let mut settings: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
+        settings.Version = DNS_INTERFACE_SETTINGS_VERSION3;
+        settings.Flags = if ipv6 { DNS_SETTING_IPV6 as u64 } else { 0 };
+        let status = unsafe {
+            GetInterfaceDnsSettings(*guid, (&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast())
+        };
+        if status != NO_ERROR {
+            unsafe { FreeInterfaceDnsSettings((&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast()) };
+            return Err(Error::new(common::t!("GetInterfaceDnsSettings lỗi {status}.", "GetInterfaceDnsSettings failed ({status}).")));
+        }
+        let name_server = unsafe { wstr(settings.NameServer) };
+        let mut properties = Vec::new();
+        for i in 0..settings.cServerProperties as usize {
+            let p = unsafe { &*settings.ServerProperties.add(i) };
+            let template = unsafe { p.Property.DohSettings.as_ref() }.and_then(|d| {
+                if d.Template.is_null() { None } else { Some(unsafe { wstr(d.Template) }) }
+            });
+            let flags = unsafe { p.Property.DohSettings.as_ref() }.map_or(0, |d| d.Flags);
+            properties.push(super::DohProperty {
+                version: p.Version,
+                index: p.ServerIndex,
+                prop_type: p.Type as u32,
+                template,
+                flags,
+            });
+        }
+        unsafe { FreeInterfaceDnsSettings((&mut settings as *mut DNS_INTERFACE_SETTINGS3).cast()) };
+        Ok(super::FamilyBackup { name_server, properties })
+    }
+
+    /// Writes one family's `NameServer` and DoH properties together. The
+    /// setter is not field-atomic: a NAMESERVER-only write clears DoH, so
+    /// both flags are always carried. An empty `name_server` is a pointer to
+    /// an empty wide string (never null), which restores automatic/DHCP.
+    fn write_family(
+        guid: &GUID,
+        ipv6: bool,
+        name_server: &str,
+        properties: &[super::DohProperty],
+    ) -> Result<()> {
+        let mut ns = wide(name_server);
+        // Template buffers must outlive the property arrays that point at them.
+        let mut templates: Vec<Vec<u16>> = properties
+            .iter()
+            .map(|p| wide(p.template.as_deref().unwrap_or("")))
+            .collect();
+        let mut doh: Vec<DNS_DOH_SERVER_SETTINGS> = properties
+            .iter()
+            .enumerate()
+            .map(|(i, p)| DNS_DOH_SERVER_SETTINGS { Template: templates[i].as_mut_ptr(), Flags: p.flags })
+            .collect();
+        let mut props: Vec<DNS_SERVER_PROPERTY> = properties
+            .iter()
+            .enumerate()
+            .map(|(i, p)| DNS_SERVER_PROPERTY {
+                Version: p.version,
+                ServerIndex: p.index,
+                Type: p.prop_type as _,
+                Property: DNS_SERVER_PROPERTY_TYPES { DohSettings: &mut doh[i] },
+            })
+            .collect();
+        let mut settings: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
+        settings.Version = DNS_INTERFACE_SETTINGS_VERSION3;
+        settings.Flags = (DNS_SETTING_NAMESERVER | DNS_SETTING_DOH | if ipv6 { DNS_SETTING_IPV6 } else { 0 }) as u64;
+        settings.NameServer = ns.as_mut_ptr();
+        settings.cServerProperties = props.len() as u32;
+        settings.ServerProperties = if props.is_empty() { ptr::null_mut() } else { props.as_mut_ptr() };
+        let status = unsafe {
+            SetInterfaceDnsSettings(*guid, (&settings as *const DNS_INTERFACE_SETTINGS3).cast())
+        };
+        if status == NO_ERROR {
+            Ok(())
+        } else {
+            Err(Error::new(common::t!(
+                "SetInterfaceDnsSettings lỗi {status}. Yeager cần quyền Administrator.",
+                "SetInterfaceDnsSettings failed ({status}). Yeager needs administrator rights."
+            )))
+        }
+    }
+
+    pub fn flush_cache() {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        unsafe {
+            let lib = LoadLibraryA(b"dnsapi.dll\0".as_ptr());
+            if !lib.is_null() {
+                if let Some(proc) = GetProcAddress(lib, b"DnsFlushResolverCache\0".as_ptr()) {
+                    let func: unsafe extern "system" fn() -> i32 = std::mem::transmute(proc);
+                    func();
+                }
+            }
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
     }
 
     /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` → GUID.
@@ -548,7 +741,7 @@ mod win {
 /// reached in the app, which only ships for Windows.
 #[cfg(not(windows))]
 mod win {
-    use common::{Error, Result};
+    use common::{DohProvider, Error, Result};
     use std::net::IpAddr;
 
     pub struct Adapter {
@@ -582,5 +775,17 @@ mod win {
 
     pub fn loopback_owners() -> (Option<u32>, Option<u32>) {
         (None, None)
+    }
+
+    pub fn apply(_: DohProvider, _: &[&str]) -> Result<Vec<String>> {
+        unsupported()
+    }
+
+    pub fn capture() -> Result<Vec<super::AdapterBackup>> {
+        unsupported()
+    }
+
+    pub fn restore(_: &[super::AdapterBackup]) -> Result<()> {
+        unsupported()
     }
 }

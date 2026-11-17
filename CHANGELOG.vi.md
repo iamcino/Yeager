@@ -7,6 +7,12 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Semantic Versioning](https://semver.org/lang/vi/).
 
 ## [Unreleased]
+### Thay đổi
+- **Bảo vệ DNS nay là sao lưu và khôi phục, ngay trong ứng dụng:** khi bật DNS, Yeager lưu trước cấu hình DNS hiện tại của các adapter mạng bị ảnh hưởng vào một file sao lưu cục bộ, rồi mới áp dụng thiết lập của Yeager. Khi tắt DNS, hoặc thoát Yeager bình thường, Yeager ghi lại đúng các thiết lập đã lưu và xóa file sao lưu. Nếu Yeager đóng đột ngột, lần chạy kế tiếp sẽ khôi phục DNS đã lưu từ file sao lưu còn sót rồi xóa nó đi.
+### Đã gỡ bỏ
+- **Dịch vụ đồng hành khôi phục DNS:** dịch vụ nhỏ giới thiệu ở bản 1.1.7, cùng journal và helper của nó, không còn được cài đặt hay cần đến nữa. Yeager khởi động, bật DNS và gỡ cài đặt mà không cần dịch vụ nào, và bộ cài không đăng ký dịch vụ nào cả.
+### Sửa lỗi
+- **Sự cố DNS không bao giờ chặn việc khác:** mọi lỗi khi lưu hay khôi phục DNS chỉ làm giảm tính năng DNS; không bao giờ ngăn Yeager khởi động và không bao giờ chặn gỡ cài đặt. Nếu chính DNS không bật được thì Levi vẫn tắt, vì engine cần DoH. Gỡ cài đặt khi DNS đang bật sẽ khôi phục DNS gốc của bạn trước và vẫn hoàn tất ngay cả khi việc khôi phục đó lỗi.
 
 ## [1.1.7] - 2026-11-17
 ### Thêm mới

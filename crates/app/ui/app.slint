@@ -269,9 +269,9 @@ export component MainWindow inherits Window {
     in property <string> update-version;
     // The ISP Cloudflare sees ("" until known), shown above the status.
     in property <string> isp;
-    // --- U08 DNS recovery diagnostics ---
-    // Coordinator/service state: "" while healthy, otherwise the pending
-    // or blocked reason. Detail carries the per-adapter debt, if any.
+    // --- DNS restore diagnostics ---
+    // Restore state: "" while healthy, otherwise the pending restore reason.
+    // Detail carries the per-adapter debt, if any.
     in property <string> dns-recovery-state;
     in property <string> dns-recovery-detail;
     // --- U08 legacy leftovers (detection only in the GUI) ---

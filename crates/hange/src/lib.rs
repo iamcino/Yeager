@@ -4,37 +4,36 @@
 //! names over an encrypted channel and points the whole system at it so that
 //! plaintext DNS no longer leaks.
 //!
-//! U08: every mutation goes through the single process-wide [`authority`]
-//! (one coordinator, one service lease, one serial worker). The pre-U08
-//! direct path is gone: `system::reset` (heuristic "clear anything that
-//! looks like a public resolver back to DHCP") is deleted, and no normal
-//! path writes system DNS outside a service transaction. Rollback is the
-//! service's restore-to-original, verified by configured readback — never
-//! a heuristic clear.
+//! The DNS mechanism is backup-state-and-restore only. Every mutation goes
+//! through the single process-wide [`authority`] (one serial worker, one
+//! serving listener): on enable it FIRST saves the current adapter DNS to the
+//! one plain [`backup`] file, THEN points adapters at the stub; on disable,
+//! exit, or crash leftover it writes the backed-up state back and deletes the
+//! file. There is no recovery service, no journal, no transaction engine and
+//! no replay. Every path is fail-open: a backup/restore failure degrades the
+//! DNS feature only and never blocks the app, the engine, or uninstall.
 
 mod authority;
-mod coordinator;
+mod backup;
+mod listener;
 mod plan;
 mod pool;
-mod service;
 mod stub;
 mod system;
 mod upstream;
 
-pub use authority::{global as dns_authority, owner_id as gui_owner_id, Applied, Authority, AuthorityStatus};
-pub use coordinator::{
-    BindError, ChoiceBinder, CoordError, Coordinator, ListenerBinder, ManagedListener, ManagedStatus,
-    RealBinder, Supervision, STOP_BOUND,
-};
+pub use authority::{global as dns_authority, Applied, Authority, AuthorityStatus};
+pub use listener::{BindError, ChoiceBinder, ListenerBinder, ManagedListener, Supervision, STOP_BOUND};
 pub use plan::{
-    bound_endpoints, check_plan_rules, classify_bind, desired_plan, is_planned_loopback,
-    local_refs, service_provider, v4_loopback, v6_loopback, ListenerMode, ListenerPlan,
-    LOOPBACK_PORT,
+    check_plan_rules, classify_bind, is_planned_loopback, local_refs, v4_loopback, v6_loopback,
+    ListenerMode, ListenerPlan, LOOPBACK_PORT,
 };
 pub use pool::{Choice, PoolStatus, AUTO_PROVIDERS};
-pub use service::{DnsService, HostClient, InspectSnapshot, LeaseCreds, OwnerSnapshot, PipeClient, Registration, ServiceVersions, SvcError, SvcOutcome, SvcReport, IPC_DEADLINE, map_outcome};
 pub use stub::ShutdownOutcome;
-pub use system::{adapter_dns, AdapterInfo, DohProperty, FamilyDns, LegacyAdapterInfo, legacy_adapter_info, loopback_port_owners};
+pub use system::{
+    adapter_dns, AdapterBackup, AdapterInfo, DohProperty, FamilyBackup, FamilyDns, LegacyAdapterInfo,
+    legacy_adapter_info, loopback_port_owners,
+};
 pub use upstream::{Stat, Transport};
 
 use common::{DohProvider, Error, Result};
@@ -50,47 +49,52 @@ pub fn system_provider(choice: Choice) -> DohProvider {
     authority::system_provider(choice)
 }
 
-/// Transactional enable through the single DNS authority: prove the plan,
-/// commit it through the privileged service, and only then swap it in.
-/// Success is `Active` only — anything else (including a missing service)
-/// is an error, never a silent no-op and never a heuristic clear.
+/// Enable through the single DNS controller: save a backup of the current
+/// adapter DNS first (unless a leftover backup already exists), prove the
+/// listener plan, then point adapters at the stub. A failure restores the
+/// backup and degrades DNS only — never a silent no-op, never a heuristic
+/// clear.
 pub fn enable(choice: Choice, local: bool) -> Result<Applied> {
     authority::global().enable(choice, local)
 }
 
-/// Serialized provider/local-mode change through the same authority.
-/// Retains the pre-takeover original; a failed change restores the
-/// original, never a half-mixed provider set.
+/// Serialized provider/local-mode change through the same controller.
+/// Retains the pre-takeover original; a failed change restores the original,
+/// never a half-mixed provider set.
 pub fn change(choice: Choice, local: bool) -> Result<Applied> {
     authority::global().change(choice, local)
 }
 
-/// Transactional disable through the same authority: consults the journal
-/// even with no in-memory state, restores the exact original, and stops
-/// listeners only after the verified restore. Pending/conflict keeps the
-/// listener and is an error — never reported as success.
+/// Disable through the same controller: restores the exact backed-up
+/// original, deletes the backup, and stops listeners only after a verified
+/// restore. A restore failure keeps the backup and the listener and is
+/// reported as pending debt — never success.
 pub fn disable() -> Result<AuthorityStatus> {
     authority::global().disable()
 }
 
-/// DNS-side admission close for the shutdown path (idempotent).
-pub fn quiesce() -> SvcOutcome {
-    authority::global().quiesce()
-}
-
-/// Restore the exact pre-takeover original through the service journal.
+/// Restore the backed-up original (also the crash-leftover path). With no
+/// backup this is a debt-free no-op. Fail-open: a restore failure keeps the
+/// backup and reports pending debt.
 pub fn restore() -> Result<AuthorityStatus> {
     authority::global().restore()
 }
 
-/// Current authority state. Pending debt is reported, never hidden.
+/// Whether a leftover backup exists (a takeover is outstanding). The launch
+/// path uses this to decide between restoring a crash leftover and entering
+/// an enabled session.
+pub fn has_leftover_backup() -> bool {
+    backup::exists()
+}
+
+/// Current controller state. Pending debt is reported, never hidden.
 pub fn authority_status() -> AuthorityStatus {
     authority::global().status()
 }
 
-/// One supervision pass over the serving listener (spec §6 listener rows).
-/// Terminal task loss closes admission and restores; with no active
-/// configuration it is idle. The app drives this periodically.
+/// One supervision pass over the serving listener. Terminal task loss
+/// restores the backup and stops the listener; with no active configuration
+/// it is idle. The app drives this periodically.
 pub fn supervise_tick() -> Option<Supervision> {
     authority::global().supervise_tick()
 }
@@ -177,7 +181,7 @@ fn ask_stub(addr: SocketAddr, query: &Message) -> Result<Message> {
     let bytes = query.to_vec().map_err(|e| Error::new(e.to_string()))?;
     socket.send_to(&bytes, addr).map_err(fail)?;
     let mut buf = [0u8; 4096];
-    let len = socket.recv(&mut buf).map_err(fail)?;
+    let len = socket.recv(&mut buf).map_err(|e| Error::new(e.to_string()))?;
     Message::from_vec(&buf[..len]).map_err(|e| Error::new(e.to_string()))
 }
 
@@ -211,7 +215,7 @@ pub fn stub_running() -> bool {
     status.enabled && status.serving_local
 }
 
-/// Whether transactional enable is in effect.
+/// Whether DNS enable is in effect.
 pub fn is_enabled() -> bool {
     authority::global().status().enabled
 }

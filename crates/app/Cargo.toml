@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 common.workspace = true
-dns-recovery.workspace = true
 erwin.workspace = true
 hange.workspace = true
 serde_json.workspace = true

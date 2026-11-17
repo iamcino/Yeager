@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/erwin", "crates/hange", "crates/common", "crates/levi", "crates/dns-recovery"]
+members = ["crates/app", "crates/erwin", "crates/hange", "crates/common", "crates/levi"]
 
 [workspace.package]
 version = "1.1.7"
@@ -12,7 +12,6 @@ repository = "https://github.com/iamcino/Yeager"
 
 [workspace.dependencies]
 common = { path = "crates/common" }
-dns-recovery = { path = "crates/dns-recovery" }
 erwin = { path = "crates/erwin" }
 hange = { path = "crates/hange" }
 serde = { version = "1", features = ["derive"] }
