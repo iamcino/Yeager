@@ -12,7 +12,7 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 ### Đã gỡ bỏ
 - **Dịch vụ đồng hành khôi phục DNS:** dịch vụ nhỏ giới thiệu ở bản 1.1.7, cùng journal và helper của nó, không còn được cài đặt hay cần đến nữa. Yeager khởi động, bật DNS và gỡ cài đặt mà không cần dịch vụ nào, và bộ cài không đăng ký dịch vụ nào cả.
 ### Sửa lỗi
-- **Sự cố DNS không bao giờ chặn việc khác:** mọi lỗi khi lưu hay khôi phục DNS chỉ làm giảm tính năng DNS; không bao giờ ngăn Yeager hay Levi khởi động và không bao giờ chặn gỡ cài đặt. Gỡ cài đặt khi DNS đang bật sẽ khôi phục DNS gốc của bạn trước và vẫn hoàn tất ngay cả khi việc khôi phục đó lỗi.
+- **Sự cố DNS không bao giờ chặn việc khác:** mọi lỗi khi lưu hay khôi phục DNS chỉ làm giảm tính năng DNS; không bao giờ ngăn Yeager khởi động và không bao giờ chặn gỡ cài đặt. Nếu chính DNS không bật được thì Levi vẫn tắt, vì engine cần DoH. Gỡ cài đặt khi DNS đang bật sẽ khôi phục DNS gốc của bạn trước và vẫn hoàn tất ngay cả khi việc khôi phục đó lỗi.
 
 ## [1.1.7] - 2026-11-17
 ### Thêm mới

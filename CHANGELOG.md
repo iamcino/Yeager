@@ -12,7 +12,7 @@ All notable changes to Yeager are documented here. The format follows
 ### Removed
 - **The DNS recovery companion service:** the small service introduced in 1.1.7, together with its journal and helper, is no longer installed or required. Yeager launches, enables DNS and uninstalls without any service, and the installer registers none.
 ### Fixed
-- **DNS problems never block anything else:** any failure while saving or restoring DNS only limits the DNS feature; it never prevents Yeager or Levi from starting and never blocks uninstall. Uninstalling while DNS is on restores your original DNS first and still completes even if that restore fails.
+- **DNS problems never block anything else:** any failure while saving or restoring DNS only limits the DNS feature; it never prevents Yeager from launching and never blocks uninstall. If DNS itself cannot be enabled, Levi stays off, because the engine needs DoH. Uninstalling while DNS is on restores your original DNS first and still completes even if that restore fails.
 
 ## [1.1.7] - 2026-11-17
 ### Added
