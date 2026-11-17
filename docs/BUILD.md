@@ -23,18 +23,10 @@ cargo test --workspace --exclude levi
 The `yeager` tests need an administrator shell, because the test binary
 carries the same administrator manifest as the app.
 
-Build the installer with [Inno Setup](https://jrsoftware.org/isinfo.php) 6 or later
-(`C:\Program Files (x86)\Inno Setup 6\ISCC.exe` on garen-pc — a PATH miss is
-not a missing ISCC). The pinned thumbprint is derived at build time from
-`docs/signing/Yeager-codesign.cer` via `tools/signing/common.ps1`
-`Get-PinnedThumbprint` (the same source the signing tooling loads), never
-hand-typed. `setup.iss` fails closed without `/DPINNED_THUMBPRINT`:
+Build the installer with [Inno Setup](https://jrsoftware.org/isinfo.php) 6 or later:
 
 ```powershell
-. .\tools\signing\common.ps1
-$pinned = Get-PinnedThumbprint
-iscc installer\setup.iss /DAppVersion=1.1.7 /DNumericVersion=1.1.7.0 "/DPINNED_THUMBPRINT=$pinned"
-# dist\Yeager-Setup-<version>.exe
+iscc installer\setup.iss         # dist\Yeager-Setup-<version>.exe
 ```
 
 From Linux you can type-check the Windows build with
@@ -104,33 +96,10 @@ pass `-GitLab` / `-GitHub` for other names.
    workflow, which publishes the same release on GitHub.
 
 Every release ships the same set of files on both sites: `Yeager-Setup-<version>.exe`,
-`Yeager-<version>-portable-x64.zip` (which carries the signed `yeager.exe`
-inside), the bare `yeager.exe` the in-app updater downloads, `SHA256SUMS.txt`
-(hashes for the installer, the portable and the GUI), the `*-signature.json`
-reports (one per signed binary, including the installer), `Yeager-codesign.cer`,
-`LICENSE` and `THIRD-PARTY-NOTICES.md`. On GitHub a VirusTotal report
-(`virustotal-v<version>.json`) is added afterwards.
-
-The installer is verified under the same hash + pinned-signature trust policy
-as the app binaries: the release scripts sign every binary
-(`tools/signing/sign.ps1`) and record its hash (`*-signature.json` via
-`tools/signing/verify.ps1 -JsonPath`), and the GitHub mirror checks every file
-against `SHA256SUMS.txt`, the pinned signature, and the byte-identical
-portable contents (the portable's `yeager.exe` must hash exactly like the
-standalone `yeager.exe` artifact).
-
-## DNS backup and restore
-
-Yeager's DNS feature is backup state and restore inside the app — there is no
-recovery service, no journal and no helper binary. On enable, the current DNS
-state of the affected adapters is saved to a backup file
-(`%ProgramData%\Yeager\dns-backup.json`) BEFORE the adapters are pointed at the
-local stub; on disable or normal exit the backed-up state is written back and
-the backup deleted. If a crash leaves a backup behind, the next launch restores
-from it and deletes it. Any failure inside backup/restore degrades the DNS
-feature only and never blocks app launch, Levi or uninstall. Uninstall runs
-`yeager.exe --cleanup`, which restores DNS from any leftover backup before the
-files are removed, and completes even if that restore fails.
+`Yeager-<version>-portable-x64.zip`, the bare `yeager.exe` the in-app updater
+downloads, `SHA256SUMS.txt`, the `*-signature.json` reports,
+`Yeager-codesign.cer`, `LICENSE` and `THIRD-PARTY-NOTICES.md`. On GitHub a
+VirusTotal report (`virustotal-v<version>.json`) is added afterwards.
 
 ## Publishing on GitLab
 

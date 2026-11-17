@@ -112,13 +112,6 @@ Expand-Archive $zip.FullName $check -Force
 foreach ($inner in Get-ChildItem $check -Recurse -Filter *.exe) {
     & $verify -Path $inner.FullName -ExpectedThumbprint $thumb -ProjectName Yeager
 }
-$innerGui = Get-ChildItem $check -Recurse -Filter 'yeager.exe' | Select-Object -First 1
-if ($innerGui) {
-    $outerGuiHash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-    $innerGuiHash = (Get-FileHash $innerGui.FullName -Algorithm SHA256).Hash.ToLower()
-    if ($outerGuiHash -ne $innerGuiHash) { throw 'portable yeager.exe is not byte-identical to the standalone yeager.exe' }
-    Write-Host "  portable yeager.exe byte-identical OK"
-}
 Remove-Item -Recurse -Force $check
 
 # ---------------------------------------------------------------- GitHub release

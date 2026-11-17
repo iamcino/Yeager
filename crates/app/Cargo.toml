@@ -14,7 +14,6 @@ path = "src/main.rs"
 common.workspace = true
 erwin.workspace = true
 hange.workspace = true
-serde_json.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06", "unstable-winit-030"] }
 levi = { path = "../levi" }
 ring = "0.17"
@@ -26,19 +25,11 @@ raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi",
     "Win32_Networking_WinHttp",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_Security_Cryptography_Catalog",
-    "Win32_Security_Cryptography_Certificates",
-    "Win32_Security_Cryptography_Sip",
-    "Win32_Security_WinTrust",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

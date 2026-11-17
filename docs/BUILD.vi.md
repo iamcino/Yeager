@@ -24,16 +24,10 @@ cargo test --workspace --exclude levi
 Test của `yeager` cần cửa sổ dòng lệnh có quyền Admin, vì file test mang cùng
 manifest quyền Admin như ứng dụng.
 
-Build bộ cài bằng [Inno Setup](https://jrsoftware.org/isinfo.php) 6 trở lên.
-Thumbprint ghim được lấy lúc build từ `docs/signing/Yeager-codesign.cer` qua
-`tools/signing/common.ps1` `Get-PinnedThumbprint`, không gõ tay; `setup.iss`
-báo lỗi nếu thiếu `/DPINNED_THUMBPRINT`:
+Build bộ cài bằng [Inno Setup](https://jrsoftware.org/isinfo.php) 6 trở lên:
 
 ```powershell
-. .\tools\signing\common.ps1
-$pinned = Get-PinnedThumbprint
-iscc installer\setup.iss /DAppVersion=1.1.7 /DNumericVersion=1.1.7.0 "/DPINNED_THUMBPRINT=$pinned"
-# dist\Yeager-Setup-<phiên bản>.exe
+iscc installer\setup.iss         # dist\Yeager-Setup-<phiên bản>.exe
 ```
 
 Từ Linux có thể kiểm tra kiểu cho bản Windows bằng
@@ -102,29 +96,10 @@ tiên của `master` trên GitLab. Nó dùng remote `gl` (GitLab) và `origin`
    hành trên GitHub, đăng cùng bản phát hành đó lên GitHub.
 
 Mỗi bản phát hành có cùng bộ file ở cả hai nơi: `Yeager-Setup-<phiên bản>.exe`,
-`Yeager-<phiên bản>-portable-x64.zip` (bên trong có sẵn `yeager.exe` đã ký),
-file `yeager.exe` riêng mà trình cập nhật trong ứng dụng tải về,
-`SHA256SUMS.txt` (hash cho bộ cài, bản portable và GUI), các báo cáo
-`*-signature.json` (mỗi binary đã ký, gồm bộ cài), `Yeager-codesign.cer`,
-`LICENSE` và `THIRD-PARTY-NOTICES.md`. Trên GitHub còn có thêm báo cáo
-VirusTotal (`virustotal-v<phiên bản>.json`) được đính kèm sau.
-
-Bộ cài được kiểm tra theo đúng chính sách hash + chữ ký ghim như binary của
-ứng dụng, và bản mirror GitHub kiểm tra `yeager.exe` trong portable phải giống
-từng byte với `yeager.exe` phát hành riêng.
-
-## Sao lưu và khôi phục DNS
-
-Tính năng DNS của Yeager là sao lưu trạng thái rồi khôi phục ngay trong ứng
-dụng — không có service khôi phục, không journal và không binary helper. Khi
-bật, trạng thái DNS hiện tại của các adapter bị ảnh hưởng được lưu vào file
-sao lưu (`%ProgramData%\Yeager\dns-backup.json`) TRƯỚC khi trỏ adapter về stub
-cục bộ; khi tắt hoặc thoát bình thường, trạng thái đã sao lưu được ghi lại và
-file sao lưu bị xóa. Nếu crash để lại file sao lưu, lần chạy kế tiếp sẽ khôi
-phục từ nó rồi xóa đi. Mọi lỗi trong sao lưu/khôi phục chỉ làm giảm tính năng
-DNS, không bao giờ chặn khởi động ứng dụng, Levi hay gỡ cài đặt. Gỡ cài đặt
-chạy `yeager.exe --cleanup`, khôi phục DNS từ file sao lưu còn sót trước khi
-xóa file, và vẫn hoàn tất ngay cả khi khôi phục lỗi.
+`Yeager-<phiên bản>-portable-x64.zip`, file `yeager.exe` riêng mà trình cập nhật
+trong ứng dụng tải về, `SHA256SUMS.txt`, các báo cáo `*-signature.json`,
+`Yeager-codesign.cer`, `LICENSE` và `THIRD-PARTY-NOTICES.md`. Trên GitHub còn
+có thêm báo cáo VirusTotal (`virustotal-v<phiên bản>.json`) được đính kèm sau.
 
 ## Đăng trên GitLab
 

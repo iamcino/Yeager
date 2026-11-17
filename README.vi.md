@@ -56,7 +56,7 @@ cảnh báo, xem [Cảnh báo của Windows và phần mềm diệt virus](#cả
 
 - **Hai phạm vi.** *Toàn bộ* áp dụng cho mọi kết nối HTTPS đi ra. *Theo tên
   miền* chỉ áp dụng cho các tên miền bạn thêm (gồm cả tên miền con, ví dụ
-  `discord.com` hay `wikipedia.org`); mọi trang khác đi thẳng.
+  `discord.com` hay `medium.com`); mọi trang khác đi thẳng.
 - **Bốn cấu hình.** *Tự động* (mặc định) và *Tối ưu tốc độ* không thêm độ trễ,
   hợp với chơi game, cáp quang và đường hầm VPN như WireGuard hay NetBird.
   *Tăng cường* dành cho mạng can thiệp mạnh hơn. *Giám sát* không thay đổi gì,
@@ -67,8 +67,7 @@ cảnh báo, xem [Cảnh báo của Windows và phần mềm diệt virus](#cả
 - **Không động tới mạng nội bộ.** Địa chỉ riêng, cục bộ, và thiết bị IPv6 cùng
   mạng /64 như NAS hay TV đi thẳng với tốc độ mạng LAN.
 - **Chịu tải lớn.** Trang mở 20–30 kết nối cùng lúc, tải file, video 4K hay
-  game vẫn giữ tốc độ; chiều đi, chỉ gói mang ClientHello TLS mới được xem
-  xét — còn lại không đi qua userspace.
+  game vẫn giữ tốc độ; chỉ gói mở đầu kết nối mới được xem xét.
 - **Thân thiện với phần mềm diệt virus.** Không chèn gói giả hay cờ TCP bất
   thường, và không bao giờ động tới DNS (cổng 53 và DNS mã hóa của chính Yeager).
 - **Bộ đếm trực tiếp** ở trang Engine: số kết nối đã xử lý, đã ổn định, và số
