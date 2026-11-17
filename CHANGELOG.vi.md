@@ -8,6 +8,11 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 
 ## [Unreleased]
 
+## [1.1.9] - 2026-11-17
+
+### Đã sửa
+- Gỡ bỏ cơ chế kiểm tra quyền của thư mục driver — cơ chế này có thể từ chối khởi động engine tuỳ theo trạng thái của thư mục dữ liệu Yeager. Engine nay khởi động bình thường trở lại, và bản sao lưu DNS trong cùng thư mục không còn bị ảnh hưởng.
+
 ## [1.1.8] - 2026-11-17
 ### Thay đổi
 - **Bảo vệ DNS nay là sao lưu và khôi phục, ngay trong ứng dụng:** khi bật DNS, Yeager lưu trước cấu hình DNS hiện tại của các adapter mạng bị ảnh hưởng vào một file sao lưu cục bộ, rồi mới áp dụng thiết lập của Yeager. Khi tắt DNS, hoặc thoát Yeager bình thường, Yeager ghi lại đúng các thiết lập đã lưu và xóa file sao lưu. Nếu Yeager đóng đột ngột, lần chạy kế tiếp sẽ khôi phục DNS đã lưu từ file sao lưu còn sót rồi xóa nó đi.
