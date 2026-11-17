@@ -1,4 +1,4 @@
-//! U06: listener plans and their service-side desired plans.
+//! Listener plans: which loopback addresses the stub serves.
 //!
 //! The listener follows the provider address rules the codebase already
 //! uses: UDP+TCP is bound on both loopback families; a v6 bind failure
@@ -7,14 +7,9 @@
 //! outside these rules.
 //!
 //! This module is pure (no sockets, no NIC writes): it classifies bind
-//! outcomes and maps the bound addresses onto the U05 allowlisted
-//! [`DesiredPlan`](dns_recovery::model::DesiredPlan) the service accepts
-//! (loopback port 53 only, an advertised family requires UDP+TCP
-//! readiness). Socket binding itself stays in [`crate::stub`] / the
-//! coordinator's binder seam so every fallback is testable against fakes.
+//! outcomes. Socket binding itself stays in [`crate::stub`] / the
+//! controller's binder seam so every fallback is testable against fakes.
 
-use common::DohProvider;
-use dns_recovery::model::{BoundEndpoint, DesiredPlan, Provider as SvcProvider, Transport};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Loopback port 53, the only address the stub may serve.
@@ -80,55 +75,6 @@ impl ListenerPlan {
     }
 }
 
-/// Map the GUI provider choice onto the service-side provider enum.
-pub fn service_provider(choice: crate::pool::Choice) -> SvcProvider {
-    match choice {
-        crate::pool::Choice::Fixed(DohProvider::Cloudflare) => SvcProvider::Cloudflare,
-        crate::pool::Choice::Fixed(DohProvider::Google) => SvcProvider::Google,
-        crate::pool::Choice::Fixed(DohProvider::AdGuard) => SvcProvider::Adguard,
-        crate::pool::Choice::Auto => SvcProvider::Auto,
-    }
-}
-
-/// Expand each bound address into its UDP+TCP [`BoundEndpoint`] pair
-/// (loopback port 53 only), as the U05 allowlist requires.
-pub fn bound_endpoints(plan: &ListenerPlan) -> Vec<BoundEndpoint> {
-    let mut out = Vec::with_capacity(plan.addrs.len() * 2);
-    for addr in &plan.addrs {
-        debug_assert!(addr.port() == LOOPBACK_PORT);
-        debug_assert!(addr.ip().is_loopback());
-        out.push(BoundEndpoint {
-            ip: addr.ip(),
-            port: LOOPBACK_PORT,
-            transport: Transport::Udp,
-        });
-        out.push(BoundEndpoint {
-            ip: addr.ip(),
-            port: LOOPBACK_PORT,
-            transport: Transport::Tcp,
-        });
-    }
-    out
-}
-
-/// Build the service-side desired plan for `choice` + `plan`, carrying the
-/// proved `readiness_generation` (0 for Windows-only: no listener proved).
-/// The service refuses any plan whose readiness does not match the lease's
-/// proved generation, so callers must only pass generations the health
-/// path proved via a responding listener.
-pub fn desired_plan(
-    choice: crate::pool::Choice,
-    plan: &ListenerPlan,
-    readiness_generation: u64,
-) -> DesiredPlan {
-    DesiredPlan {
-        provider: service_provider(choice),
-        local_requested: plan.serves_local(),
-        bound_endpoints: bound_endpoints(plan),
-        readiness_generation,
-    }
-}
-
 /// The local resolver references Windows is pointed at for `plan`: the
 /// loopback IPs only (local stub first, provider resolvers after it).
 /// Windows-only carries no references.
@@ -136,8 +82,9 @@ pub fn local_refs(plan: &ListenerPlan) -> Vec<String> {
     plan.addrs.iter().map(|a| a.ip().to_string()).collect()
 }
 
-/// Assert a plan obeys the existing provider address rules: only loopback
-/// port-53 addresses, and every advertised family has both UDP and TCP.
+/// Assert a plan obeys the provider address rules: only loopback port-53
+/// addresses, and mode/addrs consistency. Each address is served UDP+TCP by
+/// construction, so every present family has both transports.
 pub fn check_plan_rules(plan: &ListenerPlan) -> Result<(), String> {
     for addr in &plan.addrs {
         if addr.port() != LOOPBACK_PORT {
@@ -145,24 +92,6 @@ pub fn check_plan_rules(plan: &ListenerPlan) -> Result<(), String> {
         }
         if !addr.ip().is_loopback() {
             return Err(format!("non-loopback listener address {addr}"));
-        }
-    }
-    let endpoints = bound_endpoints(plan);
-    for family_v4 in [true, false] {
-        let mut udp = false;
-        let mut tcp = false;
-        for e in &endpoints {
-            if e.ip.is_ipv4() == family_v4 {
-                match e.transport {
-                    Transport::Udp => udp = true,
-                    Transport::Tcp => tcp = true,
-                }
-            }
-        }
-        if (udp || tcp) && !(udp && tcp) {
-            return Err(format!(
-                "family v4={family_v4} lacks UDP+TCP readiness"
-            ));
         }
     }
     if plan.mode == ListenerMode::WindowsOnly && !plan.addrs.is_empty() {
@@ -182,7 +111,6 @@ pub fn is_planned_loopback(ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::Choice;
 
     #[test]
     fn classify_follows_existing_fallback_rules() {
@@ -194,23 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn dual_binds_udp_plus_tcp_on_both_families() {
+    fn dual_binds_both_families() {
         let plan = ListenerPlan::for_mode(ListenerMode::Dual);
         assert_eq!(plan.addrs, vec![v4_loopback(), v6_loopback()]);
-        let eps = bound_endpoints(&plan);
-        assert_eq!(eps.len(), 4);
-        for (ip, transport) in [
-            ("127.0.0.1", Transport::Udp),
-            ("127.0.0.1", Transport::Tcp),
-            ("::1", Transport::Udp),
-            ("::1", Transport::Tcp),
-        ] {
-            assert!(
-                eps.iter()
-                    .any(|e| e.ip.to_string() == ip && e.port == 53 && e.transport == transport),
-                "missing {ip}/{transport:?}"
-            );
-        }
+        assert!(plan.serves_local());
         check_plan_rules(&plan).unwrap();
     }
 
@@ -220,9 +135,6 @@ mod tests {
         let plan = ListenerPlan::for_mode(mode);
         assert_eq!(plan.mode, ListenerMode::V4Only);
         assert_eq!(plan.addrs, vec![v4_loopback()]);
-        let eps = bound_endpoints(&plan);
-        assert_eq!(eps.len(), 2);
-        assert!(eps.iter().all(|e| e.ip.is_ipv4()));
         check_plan_rules(&plan).unwrap();
     }
 
@@ -233,33 +145,8 @@ mod tests {
         assert_eq!(plan.mode, ListenerMode::WindowsOnly);
         assert!(plan.addrs.is_empty());
         assert!(!plan.serves_local());
-        assert!(bound_endpoints(&plan).is_empty());
         assert!(local_refs(&plan).is_empty());
         check_plan_rules(&plan).unwrap();
-        let desired = desired_plan(Choice::Fixed(DohProvider::Cloudflare), &plan, 0);
-        assert!(!desired.local_requested);
-        assert!(desired.bound_endpoints.is_empty());
-    }
-
-    #[test]
-    fn desired_plans_carry_readiness_and_allowlisted_providers() {
-        for (choice, provider) in [
-            (Choice::Fixed(DohProvider::Cloudflare), SvcProvider::Cloudflare),
-            (Choice::Fixed(DohProvider::Google), SvcProvider::Google),
-            (Choice::Fixed(DohProvider::AdGuard), SvcProvider::Adguard),
-            (Choice::Auto, SvcProvider::Auto),
-        ] {
-            let plan = ListenerPlan::for_mode(ListenerMode::Dual);
-            let desired = desired_plan(choice, &plan, 7);
-            assert_eq!(desired.provider, provider);
-            assert!(desired.local_requested);
-            assert_eq!(desired.readiness_generation, 7);
-            assert_eq!(desired.bound_endpoints.len(), 4);
-            dns_recovery::protocol::parse_plan(
-                &serde_json::to_value(&desired).unwrap(),
-            )
-            .expect("every desired plan must pass the service allowlist");
-        }
     }
 
     #[test]
