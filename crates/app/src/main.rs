@@ -1138,8 +1138,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_busy(true);
             ui.set_log(t!("Đang tải Yeager {version}…", "Downloading Yeager {version}…").into());
             let restart = restart.clone();
-            // The epilogue gates the restart on a verified DNS restore, so a
-            // replacement never launches while restore debt remains.
+            // Restore debt never cancels the restart; the next launch's
+            // fail-open leftover restore handles any debt.
             spawn(w.clone(), move || updater::download_and_install(&version), move |ui, res| {
                 ui.set_update_busy(false);
                 match res {
@@ -1401,25 +1401,37 @@ fn main() -> Result<(), slint::PlatformError> {
     // 1. Restore DNS from the backup and verify, with the engine stop running
     //    detached and bounded (never before DNS).
     // 2. Only then the separate TCP/logon cleanup.
-    // 3. A failed restore cancels the update restart: an unverified restore
-    //    never launches the replacement.
+    // 3. Restore debt never cancels the update restart: the debt is logged
+    //    and carried into the next launch's fail-open leftover restore.
     let report = lifecycle.shutdown(lifecycle::ShutdownKind::ProcessQuit);
     boot_guard.complete();
     if !report.successful() {
-        eprintln!("shutdown DNS debt retained ({:?}); update restart cancelled", report.dns);
+        eprintln!("shutdown DNS debt retained ({:?}); the next launch's leftover restore handles it", report.dns);
     }
     // Separate TCP cleanup, after DNS. Launch-at-login is a user setting:
     // only the uninstaller clears it.
     let _ = erwin::restore();
     drop(update_timer);
     let restart = restart.lock().unwrap().take();
-    // A failed restore cancels the restart; an unverified restore never
-    // launches the replacement.
-    if let Some((path, connect)) = restart
-        && report.successful() {
+    if let Some((path, connect)) = restart_after_shutdown(restart, &report) {
         updater::restart(&path, connect);
     }
     Ok(())
+}
+
+/// The update restart decision given the shutdown report. Restore debt never
+/// cancels the restart: a cancelled restart leaves the machine's adapters
+/// pointing at a stub that no longer runs, with nothing restoring them until
+/// the user happens to relaunch. The debt is logged and carried into the next
+/// launch, whose leftover-restore path is fail-open.
+fn restart_after_shutdown(
+    restart: Option<(PathBuf, bool)>,
+    report: &lifecycle::ShutdownReport,
+) -> Option<(PathBuf, bool)> {
+    if restart.is_some() && !report.successful() {
+        eprintln!("update restart proceeds despite shutdown DNS debt ({:?})", report.dns);
+    }
+    restart
 }
 
 /// Uninstaller path (`--cleanup`): restore DNS from any leftover backup, then
@@ -2539,6 +2551,46 @@ mod tests {
                 "Get-PinnedThumbprint (installer define source) must equal the cert file"
             );
         }
+    }
+
+    #[test]
+    fn update_restart_proceeds_when_shutdown_restore_not_verified() {
+        // Deviation 3.2: restore debt must never cancel the update restart.
+        // A cancelled restart leaves the adapters pointing at a stub that no
+        // longer runs; the debt instead carries into the next launch's
+        // fail-open leftover restore.
+        use crate::lifecycle::{DnsOutcome, EngineOutcome, ShutdownKind, ShutdownReport};
+        use std::path::PathBuf;
+        let report = |dns: DnsOutcome| ShutdownReport {
+            kind: ShutdownKind::ProcessQuit,
+            dns,
+            engine: EngineOutcome::Completed,
+            epoch: 1,
+            reopened: false,
+            cancelled_queued: 0,
+            ui_error: None,
+            persist_error: None,
+        };
+        let slot = || Some((PathBuf::from("yeager.new.exe"), true));
+        for dns in [
+            DnsOutcome::Pending("restore failed".to_string()),
+            DnsOutcome::Conflict("foreign owner".to_string()),
+        ] {
+            let r = report(dns);
+            assert!(!r.successful(), "pending/conflict is never success");
+            assert_eq!(
+                super::restart_after_shutdown(slot(), &r),
+                slot(),
+                "a non-Verified shutdown restore must not cancel the update restart"
+            );
+        }
+        let verified = report(DnsOutcome::Verified);
+        assert_eq!(super::restart_after_shutdown(slot(), &verified), slot());
+        assert_eq!(super::restart_after_shutdown(None, &verified), None);
+        assert_eq!(
+            super::restart_after_shutdown(None, &report(DnsOutcome::Pending("debt".to_string()))),
+            None
+        );
     }
 }
 

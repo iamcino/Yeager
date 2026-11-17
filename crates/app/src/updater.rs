@@ -1,10 +1,10 @@
 //! Updates `yeager.exe` in place from the project's releases, the way EasyKey
 //! does.
 //!
-//! Download/install failure leaves the current active DNS untouched, and the
-//! epilogue gates the restart on a verified DNS restore — a failed restore
-//! cancels the restart so a replacement never launches while restore debt
-//! remains. The downloaded exe is verified under the same hash +
+//! Download/install failure leaves the current active DNS untouched. The
+//! epilogue restarts the replacement even when the shutdown restore leaves
+//! debt: the debt is logged and the next launch's fail-open leftover restore
+//! handles it. The downloaded exe is verified under the same hash +
 //! pinned-signature trust policy as the app binaries.
 //!
 //! Every release is published on GitHub and on GitLab. Both are asked at once;
@@ -351,7 +351,7 @@ fn accept_bytes(
 ///
 /// This function performs no DNS mutation: a download or install failure
 /// returns before any replacement step, leaving the current active DNS
-/// untouched. The epilogue gates the restart on a verified DNS restore.
+/// untouched. Restore debt never cancels the epilogue's restart.
 pub fn download_and_install(version: &str) -> std::result::Result<PathBuf, Failure> {
     let mut failure = None;
     let mut exe = None;
