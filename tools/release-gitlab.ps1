@@ -148,12 +148,10 @@ try {
             Get-ChildItem $AssetsDir -File | Where-Object Name -notlike 'levi*' | Copy-Item -Destination $out
         }
         Step 'Checking the files'
-        foreach ($f in @('yeager.exe', 'yeager-dns-recovery.exe', $setup, $zip, 'SHA256SUMS.txt')) {
+        foreach ($f in @('yeager.exe', $setup, $zip, 'SHA256SUMS.txt')) {
             if (-not (Test-Path (Join-Path $out $f))) { throw "$f is missing from the release files" }
         }
         & .\tools\signing\verify.ps1 -Path (Join-Path $out 'yeager.exe')
-        # U09: the helper shares the app's pinned-signature trust policy.
-        & .\tools\signing\verify.ps1 -Path (Join-Path $out 'yeager-dns-recovery.exe')
         & .\tools\signing\verify.ps1 -Path (Join-Path $out $setup)
         $sums = @()
         foreach ($line in Get-Content (Join-Path $out 'SHA256SUMS.txt')) {
@@ -178,10 +176,10 @@ try {
             Step 'Testing'
             Run cargo test --locked --workspace --exclude levi
         }
-        Step 'Building yeager.exe and yeager-dns-recovery.exe (release)'
+        Step 'Building yeager.exe (release)'
         $built = $false
         foreach ($try in 1..3) {
-            & cargo build --locked --release -p yeager -p dns-recovery
+            & cargo build --locked --release -p yeager
             if ($LASTEXITCODE -eq 0) { $built = $true; break }
             Write-Host "cargo build failed (try $try of 3), retrying" -ForegroundColor Yellow
         }
@@ -189,9 +187,6 @@ try {
         $dist = Join-Path $work 'dist'
         New-Item -ItemType Directory -Force $dist | Out-Null
         Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release\yeager.exe') $dist
-        # U09: the privileged recovery helper ships in the installer and
-        # inside the portable zip; both distributions carry the service.
-        Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release\yeager-dns-recovery.exe') $dist
 
         # ------------------------------------------------------------ sign
         . .\tools\signing\common.ps1
@@ -218,11 +213,8 @@ try {
         }
 
         try {
-            Step 'Signing yeager.exe and yeager-dns-recovery.exe'
+            Step 'Signing yeager.exe'
             Sign "$dist\yeager.exe" 'yeager-signature.json'
-            # U09: the helper is signed and hash-recorded under the same
-            # pinned-certificate policy as the app binaries.
-            Sign "$dist\yeager-dns-recovery.exe" 'yeager-dns-recovery-signature.json'
 
             # -------------------------------------------------------- installer
             Step 'Building the installer'
@@ -234,11 +226,10 @@ try {
             }
             if (-not $iscc) { throw 'Inno Setup not found. Run "winget install JRSoftware.InnoSetup" and try again.' }
             $numeric = ($version -replace '-.*$', '') + '.0'
-            # U09-REV2 item 1: the installer thumbprint is derived, never
-            # hand-typed — same source the signing tooling loads.
+            # The installer thumbprint is derived, never hand-typed — same
+            # source the signing tooling loads.
             $pinnedBuild = Get-PinnedThumbprint
-            $helperShaBuild = (Get-FileHash "$dist\yeager-dns-recovery.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric" "/DPINNED_THUMBPRINT=$pinnedBuild" "/DHELPER_SHA256=$helperShaBuild"
+            Run $iscc /Q installer\setup.iss "/DAppVersion=$version" "/DNumericVersion=$numeric" "/DPINNED_THUMBPRINT=$pinnedBuild"
             Step 'Signing the installer'
             Sign "$dist\$setup" "Yeager-Setup-$version-signature.json"
         } finally {
@@ -249,19 +240,14 @@ try {
         Step 'Packaging'
         $stage = Join-Path $dist 'Yeager-portable'
         New-Item -ItemType Directory -Force $stage | Out-Null
-        # U09: the portable carries the signed helper; first run provisions
-        # the persistent service via the elevated bootstrap (Q2 ruled).
-        # Moving/deleting the portable GUI never removes the protected
-        # recovery executable or state.
-        Copy-Item "$dist\yeager.exe", "$dist\yeager-dns-recovery.exe", LICENSE, THIRD-PARTY-NOTICES.md $stage
+        Copy-Item "$dist\yeager.exe", LICENSE, THIRD-PARTY-NOTICES.md $stage
         if (Test-Path licenses) { Copy-Item licenses $stage -Recurse }
         Compress-Archive -Path "$stage\*" -DestinationPath (Join-Path $out $zip) -Force
-        Copy-Item "$dist\yeager.exe", "$dist\yeager-dns-recovery.exe", "$dist\$setup" $out
+        Copy-Item "$dist\yeager.exe", "$dist\$setup" $out
         Copy-Item docs\signing\Yeager-codesign.cer, LICENSE, THIRD-PARTY-NOTICES.md $out
         # yeager.exe on its own is what the in-app updater downloads; it checks it against this list.
-        # The helper and the installer share the same hash + pinned-signature
-        # trust policy (U09 §10 item 4).
-        $lines = foreach ($f in @($setup, $zip, 'yeager.exe', 'yeager-dns-recovery.exe')) {
+        # The installer shares the same hash + pinned-signature trust policy.
+        $lines = foreach ($f in @($setup, $zip, 'yeager.exe')) {
             "$((Get-FileHash (Join-Path $out $f) -Algorithm SHA256).Hash.ToLower())  $f"
         }
         [IO.File]::WriteAllText("$out\SHA256SUMS.txt", ($lines -join "`n") + "`n")

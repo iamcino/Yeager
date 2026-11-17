@@ -2387,8 +2387,6 @@ fn refresh_recovery_ui(ui: &MainWindow, drain: &bootstrap::SharedLogUi) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     fn sha1_hex_bytes(data: &[u8]) -> String {
         // U09-REV4 item 1 test helper: SHA-1 of the raw bytes (the .NET
         // `X509Certificate2.Thumbprint` definition). Duplicates the build
