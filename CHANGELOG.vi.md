@@ -6,6 +6,12 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và
 [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [1.1.8] - 2026-11-18
+### Thay đổi
+- **Steam nay đi dưới sự che chở của Levi:** Chế độ tương thích không còn vẫy tay cho hệ sinh thái Steam đi thẳng nữa - bản lưu đám mây, nội dung và kết nối cộng đồng được Levi giữ ổn định như mọi kết nối khác, chấm dứt những lần đồng bộ thất bại lặng lẽ.
+- **Một tên miền Steam, che chở cả hệ sinh thái:** ở phạm vi Danh sách chọn lọc, chỉ cần nêu một tên miền Steam là cả hệ sinh thái được bảo vệ - cửa hàng, cộng đồng, nội dung và kho lưu đám mây.
+- **Lối tắt Steam:** tờ Danh sách chọn lọc có thêm nút nhập nhanh Steam.
+
 ## [1.1.7] - 2026-11-17
 ### Thay đổi
 - **Engine Levi được tinh chỉnh:** nghệ thuật kết nối của Levi được mài giũa thêm một lớp bóng — mỗi cái bắt tay mở đầu giờ trôi đi với một nhịp điệu mượt mà và duyên dáng hơn, dìu cả những kết nối cứng đầu nhất về một nhịp êm đềm, ổn định.

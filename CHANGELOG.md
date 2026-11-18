@@ -6,6 +6,12 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.8] - 2026-11-18
+### Changed
+- **Steam now travels under Levi's guard:** Compatibility Mode no longer waves the Steam ecosystem straight through - cloud saves, content and community connections are steadied by Levi like every other, ending the quiet failures that left cloud saves unsynced.
+- **One Steam domain covers them all:** in Selected hosts scope, naming any single Steam domain now brings the whole ecosystem under protection - store, community, content and cloud storage alike.
+- **A Steam shortcut:** the Selected hosts sheet gains a one-tap Steam import.
+
 ## [1.1.7] - 2026-11-17
 ### Changed
 - **The Levi engine, refined:** Levi's connection craft has been polished to a finer sheen — every opening handshake now flows with a smoother, more graceful cadence, coaxing even the most stubborn of connections into a calm and steady rhythm.
