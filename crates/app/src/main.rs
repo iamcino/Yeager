@@ -1395,12 +1395,21 @@ fn domain_list(cfg: &mut Config, sheet: i32) -> &mut Vec<String> {
     if sheet == 1 { &mut cfg.custom_excluded_domains } else { &mut cfg.selected_hosts }
 }
 
-/// The suggestions the Selected hosts sheet imports: "game", "remote" or "all".
+/// The suggestions the Selected hosts sheet imports: "steam", "game", "remote" or "all".
 fn suggested_domains(kind: &str) -> Vec<&'static str> {
     match kind {
+        "steam" => levi::STEAM_ECOSYSTEM_DOMAINS.to_vec(),
         "remote" => levi::REMOTE_TOOL_DOMAINS.to_vec(),
         "game" => levi::GAME_PLATFORM_DOMAINS.to_vec(),
-        _ => levi::UNIFIED_COMPAT_DOMAINS.to_vec(),
+        _ => {
+            let mut all = levi::GAME_PLATFORM_DOMAINS.to_vec();
+            for d in levi::REMOTE_TOOL_DOMAINS {
+                if !all.contains(d) {
+                    all.push(d);
+                }
+            }
+            all
+        }
     }
 }
 

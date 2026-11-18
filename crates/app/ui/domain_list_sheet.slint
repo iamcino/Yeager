@@ -184,6 +184,10 @@ export component DomainListSheet {
                         overflow: elide;
                     }
                     PillButton {
+                        text: "Steam";
+                        clicked => { root.import-suggested("steam"); }
+                    }
+                    PillButton {
                         text: Lang.t("Game", "Games");
                         clicked => { root.import-suggested("game"); }
                     }

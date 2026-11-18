@@ -130,10 +130,21 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
     "origin.com",
     "epicgames.com",
     "unrealengine.com",
+    "steampowered.com",
+    "steamcommunity.com",
     "steamcontent.com",
     "steamstatic.com",
     "xboxlive.com",
     "playfabapi.com",
+];
+
+/// Steam ecosystem domains: targeting any of these in Scope::HostList automatically
+/// protects the complete Steam ecosystem (Store, Community, CDN, and Cloud Save storage endpoints).
+pub const STEAM_ECOSYSTEM_DOMAINS: &[&str] = &[
+    "steampowered.com",
+    "steamcommunity.com",
+    "steamcontent.com",
+    "steamstatic.com",
 ];
 
 /// Single-label Subject CN identifiers passed by remote tools in `SslStream.AuthenticateAsClient`
@@ -149,6 +160,8 @@ pub const BUILTIN_COMPAT_SINGLE_LABELS: &[&str] = &[
 
 /// Unified compatibility list: Remote Desktop tools, game platforms, and launcher services
 /// that pass through raw without mutation when Compatibility Mode is enabled.
+/// Note: Actively filtered game ecosystems (such as Steam store, community, and cloud save endpoints)
+/// are intentionally excluded so they are always stabilized and protected against ISP middlebox RSTs.
 pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     // Remote tools
     "ultraviewer.net",
@@ -182,8 +195,6 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     "origin.com",
     "epicgames.com",
     "unrealengine.com",
-    "steamcontent.com",
-    "steamstatic.com",
     "xboxlive.com",
     "playfabapi.com",
 ];
@@ -675,7 +686,7 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     // custom exclusions, and invalid/missing SNI still pass through).
                     let hostlist_target = active_policy.is_hostlist
                         && sni_opt.is_some_and(|s| {
-                            active_policy.target_hosts.iter().any(|target| matches_host(s, target))
+                            active_policy.target_hosts.iter().any(|target| matches_target_or_ecosystem(s, target))
                         });
 
                     if active_policy.is_hostlist && !hostlist_target {
@@ -821,6 +832,21 @@ pub fn matches_host(domain: &str, target: &str) -> bool {
     false
 }
 
+/// Matches host with ecosystem expansion for coupled platforms (e.g. Steam).
+/// If the target is a core ecosystem domain, associated content and cloud storage
+/// domains in the same ecosystem are automatically covered without requiring the user
+/// to manually specify CDN subdomains.
+#[inline]
+pub fn matches_target_or_ecosystem(domain: &str, target: &str) -> bool {
+    if matches_host(domain, target) {
+        return true;
+    }
+    if STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| target.eq_ignore_ascii_case(s)) {
+        return STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| matches_host(domain, s));
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,7 +899,14 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), true, &custom), Some(PassThroughReason::Compat)); // T9
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Compat));
+
+        // Steam domains (Store, Community, Cloud Saves, CDN) MUST NOT be bypassed by Compatibility Mode!
+        assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("steamcloud-ord1.steamcontent.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("steampowered.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("api.steampowered.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("steamcommunity.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("steamstatic.com"), true, &custom), None);
 
         // F2 (T2, T4, T5, T6, T7, T12, T13): Direct IP, empty SNI, single-label, or invalid FQDN
         assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
@@ -949,6 +982,21 @@ mod tests {
         assert!(!is_builtin_bypass("google.com"));
         assert!(!is_builtin_bypass("youtube.com"));
         assert!(!is_builtin_bypass("notubi.com"));
+    }
+
+    #[test]
+    fn test_steam_ecosystem_expansion_in_hostlist() {
+        // When user targets steampowered.com in Scope::HostList, all Steam platform endpoints
+        // (including cloud storage and community) are automatically covered.
+        assert!(matches_target_or_ecosystem("steamcloud-us-east1.steamcontent.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("community.steamstatic.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("steamcommunity.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("store.steampowered.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("api.steampowered.com", "steampowered.com"));
+
+        // Direct matching still works for non-Steam targets
+        assert!(matches_target_or_ecosystem("sub.example.com", "example.com"));
+        assert!(!matches_target_or_ecosystem("steamcontent.com", "example.com"));
     }
 
     #[test]
