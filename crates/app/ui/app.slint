@@ -712,7 +712,7 @@ export component MainWindow inherits Window {
                                     title: Lang.t("Chế độ tương thích", "Compatibility Mode");
                                     ToggleRow {
                                         title: Lang.t("Giữ nguyên kết nối của ứng dụng phổ biến", "Leave popular apps untouched");
-                                        subtitle: Lang.t("Game, launcher và công cụ điều khiển từ xa (UltraViewer, TeamViewer, AnyDesk, Steam, Riot…) đi thẳng, tránh lỗi đăng nhập và lỗi lấy ID", "Games, launchers and remote tools (UltraViewer, TeamViewer, AnyDesk, Steam, Riot…) go straight through, avoiding sign-in and ID errors");
+                                        subtitle: Lang.t("Game, launcher và công cụ điều khiển từ xa (UltraViewer, TeamViewer, AnyDesk, Riot, Epic, EA…) đi thẳng, tránh lỗi đăng nhập và lỗi lấy ID", "Games, launchers and remote tools (UltraViewer, TeamViewer, AnyDesk, Riot, Epic, EA…) go straight through, avoiding sign-in and ID errors");
                                         checked: root.game-protection;
                                         toggled(v) => { root.set-game-protection(v); }
                                     }
