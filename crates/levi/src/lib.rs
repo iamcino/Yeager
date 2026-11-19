@@ -145,6 +145,9 @@ pub const STEAM_ECOSYSTEM_DOMAINS: &[&str] = &[
     "steamcommunity.com",
     "steamcontent.com",
     "steamstatic.com",
+    "steamusercontent.com",
+    "steamgames.com",
+    "steamserver.net",
 ];
 
 /// Single-label Subject CN identifiers passed by remote tools in `SslStream.AuthenticateAsClient`
@@ -556,32 +559,26 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                 let prof = ACTIVE_PROFILE.load(Ordering::Relaxed);
                 let use_inorder = match prof {
                     1 => true,  // Fast: In-Order 3-Way Split (0ms delay)
-                    2 => false, // Hardened: Out-of-Order Multi-Split (with jitter)
-                    _ => {
-                        // Auto: Default to In-Order for tunnels/VPNs (MTU <= 1420), zero packet drops
-                        true
-                    }
+                    _ => false, // Auto & Hardened: Out-of-Order Multi-Split with calibrated jitter
                 };
 
                 if use_inorder {
-                    let _ = ResilienceEngine::fragment_and_send_record_split(
+                    let _ = ResilienceEngine::fragment_and_send_multisplit_inorder(
                         &api_worker,
                         handle_worker,
                         &task.pkt_bytes,
                         &parsed,
                         task.sni_split,
                         &mut addr,
-                        false,
                     );
                 } else {
-                    let _ = ResilienceEngine::fragment_and_send_record_split(
+                    let _ = ResilienceEngine::fragment_and_send_multisplit(
                         &api_worker,
                         handle_worker,
                         &task.pkt_bytes,
                         &parsed,
                         task.sni_split,
                         &mut addr,
-                        true,
                     );
                 }
             }
@@ -725,11 +722,15 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                     STATS_STABILIZED.fetch_add(1, Ordering::Relaxed);
 
                         // Proven resilient TLS transport stabilization strategy:
-                        // 3-way multi-split (TLS Record header + midpoint SNI split).
+                        // 3-way multi-split (TLS Record header + prefix SNI split).
                         let sni_split = info.as_ref().and_then(|inf| {
                             match (inf.sni_offset, inf.sni) {
                                 (Some(off), Some(sni)) if !sni.is_empty() => {
-                                    Some(off + (sni.len() / 2).max(1))
+                                    // Split at byte 2 of the SNI (e.g. "st" | "eam...") to break
+                                    // brand identifiers across TCP segment boundaries and neutralize
+                                    // keyword-matching in ISP deep packet inspection middleboxes.
+                                    let cut = if sni.len() > 3 { 2 } else { 1 };
+                                    Some(off + cut)
                                 }
                                 (Some(off), _) => Some(off + 1),
                                 _ => None,
@@ -737,24 +738,63 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                         });
 
                         let prof = ACTIVE_PROFILE.load(Ordering::Relaxed);
-                        if prof != 2 {
-                            // Fast-Path for Auto (0) and Fast (1) profiles:
-                            // Zero-delta TLS record-level split (when padding is available) with
-                            // fallback to In-Order 3-Way TCP split (0ms delay), inline on stack buffer.
-                            let _ = ResilienceEngine::fragment_and_send_record_split(
+                        if prof == 1 {
+                            // Fast (1) profile: strictly in-order 3-way split (0ms delay), optimal for tunnels
+                            let _ = ResilienceEngine::fragment_and_send_multisplit_inorder(
                                 &api_clone,
                                 handle,
                                 pkt_bytes,
                                 &parsed,
                                 sni_split,
                                 &mut addr,
-                                false,
                             );
                             continue;
                         }
 
-                        // Hardened profile (2): Out-of-Order Multi-Split (3.3ms jitter delay)
-                        // Offloaded to bounded worker pool to prevent thread churn on the main capture loop.
+                        if prof == 0 {
+                            // Auto (0) profile fast-path:
+                            // If the ClientHello contains >= 5 bytes of TLS padding (e.g. modern browsers),
+                            // execute zero-delta record splitting in-order directly on stack buffer (0ms delay).
+                            let mut rec_buf = [0u8; 2048];
+                            let payload = parsed.payload;
+                            if payload.len() <= rec_buf.len() {
+                                if let Some(rec2_off) = crate::tls::try_build_zero_delta_record_split(
+                                    payload,
+                                    &mut rec_buf[..payload.len()],
+                                ) {
+                                    addr.set_outbound(true);
+                                    addr.set_ipv6(parsed.ip_version == 6);
+                                    addr.set_impostor(true);
+
+                                    let rec1 = &rec_buf[..rec2_off];
+                                    let rec2 = &rec_buf[rec2_off..payload.len()];
+
+                                    let _ = ResilienceEngine::send_tcp_segment(
+                                        &api_clone,
+                                        handle,
+                                        pkt_bytes,
+                                        &parsed,
+                                        0,
+                                        rec1,
+                                        &mut addr,
+                                    );
+                                    let _ = ResilienceEngine::send_tcp_segment(
+                                        &api_clone,
+                                        handle,
+                                        pkt_bytes,
+                                        &parsed,
+                                        rec2_off as u32,
+                                        rec2,
+                                        &mut addr,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Hardened profile (2) OR Auto profile when TLS padding is absent (e.g. Steam / OpenSSL):
+                        // Dispatches to worker pool for Out-of-Order Multi-Split with 3.3-3.5ms jitter,
+                        // preventing middlebox TCP reassembly queues from reconstructing the ClientHello.
                         let task = ResilienceTask {
                             pkt_bytes: pkt_bytes.to_vec(),
                             meta: parsed.metadata(),
@@ -833,16 +873,26 @@ pub fn matches_host(domain: &str, target: &str) -> bool {
 }
 
 /// Matches host with ecosystem expansion for coupled platforms (e.g. Steam).
-/// If the target is a core ecosystem domain, associated content and cloud storage
-/// domains in the same ecosystem are automatically covered without requiring the user
-/// to manually specify CDN subdomains.
+/// If the target is a core ecosystem domain, associated content, community,
+/// CDN, and cloud storage domains in the same ecosystem are automatically covered
+/// without requiring the user to manually discover or specify CDN/storage subdomains.
 #[inline]
 pub fn matches_target_or_ecosystem(domain: &str, target: &str) -> bool {
     if matches_host(domain, target) {
         return true;
     }
     if STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| target.eq_ignore_ascii_case(s)) {
-        return STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| matches_host(domain, s));
+        if STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| matches_host(domain, s)) {
+            return true;
+        }
+        // Cloud Save & UGC Storage Buckets used by Steam
+        if (domain.starts_with("steamcloud-") || domain.starts_with("steamcloud"))
+            && (matches_host(domain, "storage.googleapis.com")
+                || matches_host(domain, "amazonaws.com")
+                || matches_host(domain, "blob.core.windows.net"))
+        {
+            return true;
+        }
     }
     false
 }
@@ -993,10 +1043,24 @@ mod tests {
         assert!(matches_target_or_ecosystem("steamcommunity.com", "steampowered.com"));
         assert!(matches_target_or_ecosystem("store.steampowered.com", "steampowered.com"));
         assert!(matches_target_or_ecosystem("api.steampowered.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("images.steamusercontent.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("api.steamgames.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("cm1.steamserver.net", "steampowered.com"));
+
+        // Multi-cloud Cloud Save Storage Buckets used by Steam
+        assert!(matches_target_or_ecosystem("steamcloud-singapore.storage.googleapis.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("steamcloud-taiwan.storage.googleapis.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("steamcloud-hk.storage.googleapis.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("steamcloud-sg.s3.dualstack.ap-southeast-1.amazonaws.com", "steampowered.com"));
+        assert!(matches_target_or_ecosystem("steamcloudsg.blob.core.windows.net", "steampowered.com"));
 
         // Direct matching still works for non-Steam targets
         assert!(matches_target_or_ecosystem("sub.example.com", "example.com"));
         assert!(!matches_target_or_ecosystem("steamcontent.com", "example.com"));
+
+        // Third-party storage buckets not belonging to Steam MUST NOT be matched
+        assert!(!matches_target_or_ecosystem("mybucket.storage.googleapis.com", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("other-bucket.s3.amazonaws.com", "steampowered.com"));
     }
 
     #[test]
