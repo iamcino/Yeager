@@ -139,11 +139,12 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
 ];
 
 /// Steam ecosystem domains: targeting any of these in Scope::HostList automatically
-/// protects the complete Steam ecosystem (Store, Community, CDN, and Cloud Save storage endpoints).
+/// protects the complete Steam ecosystem against ISP DPI RST injection (Store, Community, API, and Server networks).
+/// Note: Cloud save storage buckets (GCS, S3, Azure) and content CDNs are intentionally handled
+/// by [`is_cloud_storage_endpoint`] to pass through raw without packet mutation.
 pub const STEAM_ECOSYSTEM_DOMAINS: &[&str] = &[
     "steampowered.com",
     "steamcommunity.com",
-    "steamcontent.com",
     "steamstatic.com",
     "steamusercontent.com",
     "steamgames.com",
@@ -207,6 +208,8 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
 pub enum PassThroughReason {
     /// Built-in Encrypted DNS Resolver (always-on).
     Doh,
+    /// Built-in Cloud Storage & Game CDN endpoints (always-on raw pass-through).
+    Storage,
     /// Built-in Compatibility Mode (remote tools, game launchers).
     Compat,
     /// User-defined custom excluded domain.
@@ -257,6 +260,40 @@ pub fn is_valid_fqdn_sni(sni: &str) -> bool {
     last_label_has_alpha
 }
 
+/// Checks whether a domain is a cloud save storage endpoint, multi-cloud bucket,
+/// or high-throughput game content CDN that must always pass through raw without
+/// transport mutation to prevent ingress proxy resets and TLS record fragmentation aborts.
+#[inline]
+pub fn is_cloud_storage_endpoint(domain: &str) -> bool {
+    let lower = domain.to_ascii_lowercase();
+
+    // Steam Cloud storage buckets on Google Cloud Storage, AWS S3, and Azure Blob
+    if lower.starts_with("steamcloud-") || lower.starts_with("steamcloud") {
+        if matches_host(&lower, "storage.googleapis.com")
+            || matches_host(&lower, "amazonaws.com")
+            || matches_host(&lower, "blob.core.windows.net")
+        {
+            return true;
+        }
+    }
+
+    // Generic Google Cloud Storage, AWS S3, and Azure Blob endpoints
+    if matches_host(&lower, "storage.googleapis.com")
+        || matches_host(&lower, "s3.amazonaws.com")
+        || lower.contains(".s3.dualstack.")
+        || matches_host(&lower, "blob.core.windows.net")
+    {
+        return true;
+    }
+
+    // SteamPipe game download CDN & cache (high throughput, not filtered by ISP)
+    if matches_host(&lower, "steamcontent.com") {
+        return true;
+    }
+
+    false
+}
+
 /// Evaluates whether an outbound TLS connection should pass through raw without packet mutation.
 /// Centralized evaluation function used identically by the driver hot path and unit tests.
 /// Zero heap allocation: operates directly on borrowed `&str` slices via case-insensitive comparisons.
@@ -279,6 +316,10 @@ pub fn evaluate_pass_through(
 
     if BUILTIN_DOH_DOMAINS.iter().any(|target| matches_host(s, target)) {
         return Some(PassThroughReason::Doh);
+    }
+
+    if is_cloud_storage_endpoint(s) {
+        return Some(PassThroughReason::Storage);
     }
 
     if compat_mode && is_builtin_compat(s) {
@@ -321,7 +362,7 @@ pub fn is_builtin_game(domain: &str) -> bool {
 /// Backwards-compatibility alias for v1.1.0 callers.
 #[inline]
 pub fn is_builtin_bypass(domain: &str) -> bool {
-    is_builtin_doh(domain) || is_builtin_compat(domain)
+    is_builtin_doh(domain) || is_cloud_storage_endpoint(domain) || is_builtin_compat(domain)
 }
 
 /// Backwards-compatibility helper for v1.1.0 callers.
@@ -701,6 +742,9 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                             PassThroughReason::Doh => {
                                 STATS_DOH_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
                             }
+                            PassThroughReason::Storage => {
+                                STATS_COMPAT_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
+                            }
                             PassThroughReason::Compat => {
                                 STATS_COMPAT_UNTOUCHED.fetch_add(1, Ordering::Relaxed);
                                 STATS_GAME_PROTECTED.fetch_add(1, Ordering::Relaxed);
@@ -873,9 +917,11 @@ pub fn matches_host(domain: &str, target: &str) -> bool {
 }
 
 /// Matches host with ecosystem expansion for coupled platforms (e.g. Steam).
-/// If the target is a core ecosystem domain, associated content, community,
-/// CDN, and cloud storage domains in the same ecosystem are automatically covered
-/// without requiring the user to manually discover or specify CDN/storage subdomains.
+/// If the target is a core ecosystem domain, associated platform, community,
+/// API, and gaming servers in the same ecosystem are automatically covered
+/// without requiring the user to manually discover each individual subdomain.
+/// Note: Cloud save storage buckets (GCS, S3, Azure) and content CDNs are intentionally
+/// excluded from active mutation and pass through raw via [`is_cloud_storage_endpoint`].
 #[inline]
 pub fn matches_target_or_ecosystem(domain: &str, target: &str) -> bool {
     if matches_host(domain, target) {
@@ -883,14 +929,6 @@ pub fn matches_target_or_ecosystem(domain: &str, target: &str) -> bool {
     }
     if STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| target.eq_ignore_ascii_case(s)) {
         if STEAM_ECOSYSTEM_DOMAINS.iter().any(|&s| matches_host(domain, s)) {
-            return true;
-        }
-        // Cloud Save & UGC Storage Buckets used by Steam
-        if (domain.starts_with("steamcloud-") || domain.starts_with("steamcloud"))
-            && (matches_host(domain, "storage.googleapis.com")
-                || matches_host(domain, "amazonaws.com")
-                || matches_host(domain, "blob.core.windows.net"))
-        {
             return true;
         }
     }
@@ -950,13 +988,23 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
 
-        // Steam domains (Store, Community, Cloud Saves, CDN) MUST NOT be bypassed by Compatibility Mode!
-        assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), None);
-        assert_eq!(evaluate_pass_through(Some("steamcloud-ord1.steamcontent.com"), true, &custom), None);
+        // Steam platform domains (Store, Community, API, etc.) MUST NOT be bypassed by Compatibility Mode!
+        // They are actively blocked by ISP DPI in Vietnam and require transport resilience stabilization.
         assert_eq!(evaluate_pass_through(Some("steampowered.com"), true, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("store.steampowered.com"), true, &custom), None);
         assert_eq!(evaluate_pass_through(Some("api.steampowered.com"), true, &custom), None);
         assert_eq!(evaluate_pass_through(Some("steamcommunity.com"), true, &custom), None);
         assert_eq!(evaluate_pass_through(Some("steamstatic.com"), true, &custom), None);
+
+        // Steam Cloud Save Storage & Game Content CDN MUST pass through raw (Reason: Storage)
+        // to prevent ingress proxy resets and TLS record fragmentation aborts on Google GCS / AWS S3
+        assert_eq!(evaluate_pass_through(Some("steamcloud-singapore.storage.googleapis.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcloud-taiwan.storage.googleapis.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcloud-hk.storage.googleapis.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcloud-sg.s3.dualstack.ap-southeast-1.amazonaws.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcloudsg.blob.core.windows.net"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("steamcloud-ord1.steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
 
         // F2 (T2, T4, T5, T6, T7, T12, T13): Direct IP, empty SNI, single-label, or invalid FQDN
         assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
@@ -1036,9 +1084,8 @@ mod tests {
 
     #[test]
     fn test_steam_ecosystem_expansion_in_hostlist() {
-        // When user targets steampowered.com in Scope::HostList, all Steam platform endpoints
-        // (including cloud storage and community) are automatically covered.
-        assert!(matches_target_or_ecosystem("steamcloud-us-east1.steamcontent.com", "steampowered.com"));
+        // When user targets steampowered.com in Scope::HostList, core Steam platform endpoints
+        // (Community, Store, API, CM servers) are automatically covered.
         assert!(matches_target_or_ecosystem("community.steamstatic.com", "steampowered.com"));
         assert!(matches_target_or_ecosystem("steamcommunity.com", "steampowered.com"));
         assert!(matches_target_or_ecosystem("store.steampowered.com", "steampowered.com"));
@@ -1047,20 +1094,44 @@ mod tests {
         assert!(matches_target_or_ecosystem("api.steamgames.com", "steampowered.com"));
         assert!(matches_target_or_ecosystem("cm1.steamserver.net", "steampowered.com"));
 
-        // Multi-cloud Cloud Save Storage Buckets used by Steam
-        assert!(matches_target_or_ecosystem("steamcloud-singapore.storage.googleapis.com", "steampowered.com"));
-        assert!(matches_target_or_ecosystem("steamcloud-taiwan.storage.googleapis.com", "steampowered.com"));
-        assert!(matches_target_or_ecosystem("steamcloud-hk.storage.googleapis.com", "steampowered.com"));
-        assert!(matches_target_or_ecosystem("steamcloud-sg.s3.dualstack.ap-southeast-1.amazonaws.com", "steampowered.com"));
-        assert!(matches_target_or_ecosystem("steamcloudsg.blob.core.windows.net", "steampowered.com"));
-
         // Direct matching still works for non-Steam targets
         assert!(matches_target_or_ecosystem("sub.example.com", "example.com"));
-        assert!(!matches_target_or_ecosystem("steamcontent.com", "example.com"));
+        assert!(!matches_target_or_ecosystem("otherdomain.com", "example.com"));
 
-        // Third-party storage buckets not belonging to Steam MUST NOT be matched
-        assert!(!matches_target_or_ecosystem("mybucket.storage.googleapis.com", "steampowered.com"));
-        assert!(!matches_target_or_ecosystem("other-bucket.s3.amazonaws.com", "steampowered.com"));
+        // Cloud save storage buckets (GCS, S3, Azure) and content CDN are intentionally NOT matched
+        // as active resilience mutation targets; they pass through raw via is_cloud_storage_endpoint!
+        assert!(!matches_target_or_ecosystem("steamcloud-singapore.storage.googleapis.com", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("steamcloud-taiwan.storage.googleapis.com", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("steamcloud-hk.storage.googleapis.com", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("steamcloud-sg.s3.dualstack.ap-southeast-1.amazonaws.com", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("steamcloudsg.blob.core.windows.net", "steampowered.com"));
+        assert!(!matches_target_or_ecosystem("steamcontent.com", "steampowered.com"));
+    }
+
+    #[test]
+    fn test_is_cloud_storage_endpoint() {
+        // Multi-cloud Cloud Save Storage Buckets used by Steam
+        assert!(is_cloud_storage_endpoint("steamcloud-singapore.storage.googleapis.com"));
+        assert!(is_cloud_storage_endpoint("steamcloud-taiwan.storage.googleapis.com"));
+        assert!(is_cloud_storage_endpoint("steamcloud-hk.storage.googleapis.com"));
+        assert!(is_cloud_storage_endpoint("steamcloud-sg.s3.dualstack.ap-southeast-1.amazonaws.com"));
+        assert!(is_cloud_storage_endpoint("steamcloudsg.blob.core.windows.net"));
+
+        // Generic cloud storage endpoints
+        assert!(is_cloud_storage_endpoint("storage.googleapis.com"));
+        assert!(is_cloud_storage_endpoint("mybucket.storage.googleapis.com"));
+        assert!(is_cloud_storage_endpoint("mybucket.s3.amazonaws.com"));
+        assert!(is_cloud_storage_endpoint("mybucket.blob.core.windows.net"));
+
+        // Steam content distribution CDN
+        assert!(is_cloud_storage_endpoint("steamcontent.com"));
+        assert!(is_cloud_storage_endpoint("steamcloud-ord1.steamcontent.com"));
+
+        // Non-storage domains that must be stabilized (must NOT match)
+        assert!(!is_cloud_storage_endpoint("store.steampowered.com"));
+        assert!(!is_cloud_storage_endpoint("steamcommunity.com"));
+        assert!(!is_cloud_storage_endpoint("discord.com"));
+        assert!(!is_cloud_storage_endpoint("youtube.com"));
     }
 
     #[test]
