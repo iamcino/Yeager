@@ -275,7 +275,7 @@ impl ResilienceEngine {
     }
 
     /// Constructs and transmits a single TCP segment using a stack buffer (zero heap allocation for <= 2048 bytes).
-    fn send_tcp_segment(
+    pub fn send_tcp_segment(
         api: &WinDivertApi,
         handle: SafeHandle,
         packet_buf: &[u8],
