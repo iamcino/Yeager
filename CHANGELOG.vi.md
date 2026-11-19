@@ -6,6 +6,10 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và
 [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [1.1.10] - 2026-11-19
+### Đã sửa
+- **Client Riot, trực tuyến trở lại:** client Riot và League of Legends có thể tự hiện offline dù kết nối vẫn khỏe, vì một phần họ dịch vụ của Riot chưa nằm trong vùng phủ của Yeager. Nay họ dịch vụ đã được phủ đầy đủ, và đường tải bản vá cùng tài nguyên của Riot đi qua nguyên vẹn như các đường tải nội dung game khác.
+
 ## [1.1.9] - 2026-11-19
 ### Đã sửa
 - **Steam Cloud, nguyên vẹn:** các bucket lưu trữ đám mây và CDN nội dung nay đi qua nguyên trạng, chấm dứt lỗi reset làm đứt đồng bộ giữa chừng - còn nền tảng Steam vẫn nằm dưới sự che chở của Levi.
