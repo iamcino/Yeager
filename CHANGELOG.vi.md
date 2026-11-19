@@ -6,6 +6,10 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và
 [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [1.1.9] - 2026-11-19
+### Đã sửa
+- **Steam Cloud, nguyên vẹn:** các bucket lưu trữ đám mây và CDN nội dung nay đi qua nguyên trạng, chấm dứt lỗi reset làm đứt đồng bộ giữa chừng - còn nền tảng Steam vẫn nằm dưới sự che chở của Levi.
+- **Lời chào đầu vững hơn:** các client có bắt tay không đệm nay đi đường lệch thứ tự với jitter đã hiệu chuẩn, để lời chào đầu tiên vượt qua được các middlebox.
 ## [1.1.8] - 2026-11-18
 ### Thay đổi
 - **Steam nay đi dưới sự che chở của Levi:** Chế độ tương thích không còn vẫy tay cho hệ sinh thái Steam đi thẳng nữa - bản lưu đám mây, nội dung và kết nối cộng đồng được Levi giữ ổn định như mọi kết nối khác, chấm dứt những lần đồng bộ thất bại lặng lẽ.

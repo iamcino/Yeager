@@ -6,6 +6,11 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.9] - 2026-11-19
+### Fixed
+- **Steam Cloud, kept whole:** cloud save buckets and the content CDN now pass through untouched, ending the resets that broke sync mid-flight - the Steam platform itself stays under Levi's guard.
+- **A steadier first hello:** clients whose handshake carries no padding now take the out-of-order path with calibrated jitter, so their greeting survives the middleboxes.
+
 ## [1.1.8] - 2026-11-18
 ### Changed
 - **Steam now travels under Levi's guard:** Compatibility Mode no longer waves the Steam ecosystem straight through - cloud saves, content and community connections are steadied by Levi like every other, ending the quiet failures that left cloud saves unsynced.
