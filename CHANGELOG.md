@@ -6,6 +6,10 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.10] - 2026-11-19
+### Fixed
+- **Riot clients, back online:** the Riot client and League of Legends could show themselves offline on a healthy connection because part of the Riot service family was missing from Yeager's coverage. The family is covered in full now, and Riot's patch and asset downloads pass through untouched, like other game content delivery.
+
 ## [1.1.9] - 2026-11-19
 ### Fixed
 - **Steam Cloud, kept whole:** cloud save buckets and the content CDN now pass through untouched, ending the resets that broke sync mid-flight - the Steam platform itself stays under Levi's guard.
