@@ -124,6 +124,15 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
     "pvp.net",
     "leagueoflegends.com",
     "valgame.net",
+    "playvalorant.com",
+    "rgpub.io",
+    "riotcdn.net",
+    "rdatasrv.net",
+    "riotstatus.net",
+    "riotcontent.com",
+    "riotgames.net",
+    "lolesports.com",
+    "riot.com",
     "battle.net",
     "blizzard.com",
     "ea.com",
@@ -193,6 +202,15 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     "pvp.net",
     "leagueoflegends.com",
     "valgame.net",
+    "playvalorant.com",
+    "rgpub.io",
+    "riotcdn.net",
+    "rdatasrv.net",
+    "riotstatus.net",
+    "riotcontent.com",
+    "riotgames.net",
+    "lolesports.com",
+    "riot.com",
     "battle.net",
     "blizzard.com",
     "ea.com",
@@ -288,6 +306,11 @@ pub fn is_cloud_storage_endpoint(domain: &str) -> bool {
 
     // SteamPipe game download CDN & cache (high throughput, not filtered by ISP)
     if matches_host(&lower, "steamcontent.com") {
+        return true;
+    }
+
+    // Riot Games patch & dynamic asset delivery CDN (high throughput, not filtered by ISP)
+    if matches_host(&lower, "riotcdn.net") {
         return true;
     }
 
@@ -986,6 +1009,11 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("relay.splashtop.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), true, &custom), Some(PassThroughReason::Compat)); // T9
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("edge.rgpub.io"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("cmsassets.rgpub.io"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("dradis-prod.rdatasrv.net"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("status.riotstatus.net"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("playvalorant.com"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
 
         // Steam platform domains (Store, Community, API, etc.) MUST NOT be bypassed by Compatibility Mode!
@@ -1005,6 +1033,11 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("steamcloudsg.blob.core.windows.net"), true, &custom), Some(PassThroughReason::Storage));
         assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
         assert_eq!(evaluate_pass_through(Some("steamcloud-ord1.steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
+
+        // Riot Games Patch & Asset CDN MUST pass through raw (Reason: Storage)
+        assert_eq!(evaluate_pass_through(Some("riotcdn.net"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("lol.secure.dyn.riotcdn.net"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("riot-client.secure.dyn.riotcdn.net"), false, &custom), Some(PassThroughReason::Storage));
 
         // F2 (T2, T4, T5, T6, T7, T12, T13): Direct IP, empty SNI, single-label, or invalid FQDN
         assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
@@ -1044,6 +1077,8 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("connect.ultraviewer.net"), false, &custom), None);
         assert_eq!(evaluate_pass_through(Some("public-ubiservices.ubi.com"), false, &custom), None);
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), false, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("edge.rgpub.io"), false, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("dradis-prod.rdatasrv.net"), false, &custom), None);
 
         // Custom excluded domains pass through regardless of compat_mode
         assert_eq!(evaluate_pass_through(Some("internal-company.net"), false, &custom), Some(PassThroughReason::Custom));
@@ -1126,6 +1161,11 @@ mod tests {
         // Steam content distribution CDN
         assert!(is_cloud_storage_endpoint("steamcontent.com"));
         assert!(is_cloud_storage_endpoint("steamcloud-ord1.steamcontent.com"));
+
+        // Riot Games content distribution & patch CDN
+        assert!(is_cloud_storage_endpoint("riotcdn.net"));
+        assert!(is_cloud_storage_endpoint("lol.secure.dyn.riotcdn.net"));
+        assert!(is_cloud_storage_endpoint("riot-client.secure.dyn.riotcdn.net"));
 
         // Non-storage domains that must be stabilized (must NOT match)
         assert!(!is_cloud_storage_endpoint("store.steampowered.com"));
