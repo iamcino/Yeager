@@ -6,6 +6,10 @@ Mọi thay đổi đáng chú ý của Yeager được ghi lại ở đây, theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/) và
 [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [1.1.12] - 2026-11-21
+### Đã sửa
+- **Đăng nhập Riot Client ở Việt Nam, đã sửa:** một bản cập nhật Riot Client gần đây đã chuyển bước kiểm tra tài khoản tại Việt Nam sang địa chỉ dịch vụ phát hành mới của VNGGames chưa được phủ, và cách xử lý kết nối có thể làm hỏng bước kiểm tra đó. Nay địa chỉ mới đã được phủ, và các dịch vụ đăng nhập cùng tài khoản của nhà phát hành đi qua nguyên vẹn.
+
 ## [1.1.11] - 2026-11-20
 ### Đã sửa
 - **Kết nối máy chủ của Riot Client, đã sửa:** ở Việt Nam, Riot Client đăng nhập qua hệ thống nhà phát hành VNGGames/Garena, và các dịch vụ đăng nhập cùng xác thực đó chưa được phủ nên client liên tục báo lỗi kết nối máy chủ. Nay các dịch vụ của nhà phát hành đã được phủ, và đường tải bản vá của VNGGames đi qua nguyên vẹn.
