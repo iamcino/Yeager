@@ -6,6 +6,10 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.11] - 2026-11-20
+### Fixed
+- **Riot Client server connection, fixed:** in Vietnam the Riot Client signs in through the VNGGames/Garena publisher stack, and those sign-in and auth services were not covered yet, so the client kept failing with server connection errors. The publisher services are covered now, and the VNGGames patch downloads pass through untouched.
+
 ## [1.1.10] - 2026-11-19
 ### Fixed
 - **Riot clients, back online:** the Riot client and League of Legends could show themselves offline on a healthy connection because part of the Riot service family was missing from Yeager's coverage. The family is covered in full now, and Riot's patch and asset downloads pass through untouched, like other game content delivery.
