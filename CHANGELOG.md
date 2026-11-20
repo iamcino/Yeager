@@ -6,6 +6,10 @@ All notable changes to Yeager are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.12] - 2026-11-21
+### Fixed
+- **Riot Client sign-in in Vietnam, fixed:** a recent Riot Client update moved the Vietnam account check to a new VNGGames publishing service address that was not covered yet, and the connection handling could break that check. The new address is covered now, and the publisher sign-in and account services pass through untouched.
+
 ## [1.1.11] - 2026-11-20
 ### Fixed
 - **Riot Client server connection, fixed:** in Vietnam the Riot Client signs in through the VNGGames/Garena publisher stack, and those sign-in and auth services were not covered yet, so the client kept failing with server connection errors. The publisher services are covered now, and the VNGGames patch downloads pass through untouched.
