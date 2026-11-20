@@ -136,10 +136,15 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
     "riot.com",
     "leagueoflegends.net",
     "vnggames.com",
+    "vnggames.app",
     "vnggames.net",
     "vnggames.vn",
+    "vng.games",
+    "vng.app",
     "vng.com.vn",
+    "vng.com",
     "vng.vn",
+    "vcdn.vn",
     "zing.vn",
     "vgplay.vn",
     "vngcloud.vn",
@@ -148,6 +153,8 @@ pub const GAME_PLATFORM_DOMAINS: &[&str] = &[
     "garena.com",
     "garena.vn",
     "garenanow.com",
+    "akamaihd.net",
+    "leagueoflegends.co.kr",
     "battle.net",
     "blizzard.com",
     "ea.com",
@@ -229,10 +236,15 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     "riot.com",
     "leagueoflegends.net",
     "vnggames.com",
+    "vnggames.app",
     "vnggames.net",
     "vnggames.vn",
+    "vng.games",
+    "vng.app",
     "vng.com.vn",
+    "vng.com",
     "vng.vn",
+    "vcdn.vn",
     "zing.vn",
     "vgplay.vn",
     "vngcloud.vn",
@@ -241,6 +253,8 @@ pub const UNIFIED_COMPAT_DOMAINS: &[&str] = &[
     "garena.com",
     "garena.vn",
     "garenanow.com",
+    "akamaihd.net",
+    "leagueoflegends.co.kr",
     "battle.net",
     "blizzard.com",
     "ea.com",
@@ -344,8 +358,12 @@ pub fn is_cloud_storage_endpoint(domain: &str) -> bool {
         return true;
     }
 
-    // VNGGames patch & static asset CDN (high throughput, not filtered by ISP)
-    if matches_host(&lower, "cdn-apo.vnggames.com") {
+    // VNGGames publishing API & patch delivery CDN (always raw pass-through)
+    if matches_host(&lower, "vnggames.app")
+        || matches_host(&lower, "vnggames.com")
+        || matches_host(&lower, "vnggames.net")
+        || matches_host(&lower, "cdn-apo.vnggames.com")
+    {
         return true;
     }
 
@@ -744,7 +762,10 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                 continue;
             }
 
-            if let Some(parsed) = ParsedPacket::parse(pkt_bytes) {
+            let Some(parsed) = ParsedPacket::parse(pkt_bytes) else {
+                let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
+                continue;
+            };
                 // RFC 1918 Private, Loopback, Link-Local & Multicast Pass-Through:
                 // Keep internal network, captive portal, and router admin traffic unmodified!
                 if parsed.is_private_or_local_dst() {
@@ -910,7 +931,6 @@ pub fn start_with_profile(cfg: &Config, profile: ResilienceProfile) -> Result<()
                         }
                         continue;
                     }
-                }
 
             // Normal pass-through for non-ClientHello or non-target hosts
             let _ = ResilienceEngine::send_raw(&api_clone, handle, pkt_bytes, &addr);
@@ -1049,13 +1069,9 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("dradis-prod.rdatasrv.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("status.riotstatus.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("playvalorant.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("sso.vnggames.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("login.vnggames.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("id.vnggames.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("lienminh.vnggames.com"), true, &custom), Some(PassThroughReason::Compat));
-        assert_eq!(evaluate_pass_through(Some("sdk.vnggames.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("id.zing.vn"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("gas.garena.com"), true, &custom), Some(PassThroughReason::Compat));
+        assert_eq!(evaluate_pass_through(Some("am-a.akamaihd.net"), true, &custom), Some(PassThroughReason::Compat));
         assert_eq!(evaluate_pass_through(Some("client.battle.net"), true, &custom), Some(PassThroughReason::Compat));
 
         // Steam platform domains (Store, Community, API, etc.) MUST NOT be bypassed by Compatibility Mode!
@@ -1076,10 +1092,15 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
         assert_eq!(evaluate_pass_through(Some("steamcloud-ord1.steamcontent.com"), true, &custom), Some(PassThroughReason::Storage));
 
-        // Riot Games Patch & Asset CDN MUST pass through raw (Reason: Storage)
+        // Riot Games Patch & Asset CDN and VNGGames Publishing Gateway MUST pass through raw (Reason: Storage)
         assert_eq!(evaluate_pass_through(Some("riotcdn.net"), true, &custom), Some(PassThroughReason::Storage));
         assert_eq!(evaluate_pass_through(Some("lol.secure.dyn.riotcdn.net"), true, &custom), Some(PassThroughReason::Storage));
         assert_eq!(evaluate_pass_through(Some("riot-client.secure.dyn.riotcdn.net"), false, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("vn-api.vnggames.app"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("sso.vnggames.com"), true, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("login.vnggames.com"), false, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("id.vnggames.com"), false, &custom), Some(PassThroughReason::Storage));
+        assert_eq!(evaluate_pass_through(Some("sdk.vnggames.net"), false, &custom), Some(PassThroughReason::Storage));
 
         // F2 (T2, T4, T5, T6, T7, T12, T13): Direct IP, empty SNI, single-label, or invalid FQDN
         assert_eq!(evaluate_pass_through(None, true, &custom), Some(PassThroughReason::NoSni));
@@ -1121,8 +1142,8 @@ mod tests {
         assert_eq!(evaluate_pass_through(Some("auth.riotgames.com"), false, &custom), None);
         assert_eq!(evaluate_pass_through(Some("edge.rgpub.io"), false, &custom), None);
         assert_eq!(evaluate_pass_through(Some("dradis-prod.rdatasrv.net"), false, &custom), None);
-        assert_eq!(evaluate_pass_through(Some("sso.vnggames.com"), false, &custom), None);
         assert_eq!(evaluate_pass_through(Some("id.zing.vn"), false, &custom), None);
+        assert_eq!(evaluate_pass_through(Some("am-a.akamaihd.net"), false, &custom), None);
 
         // Custom excluded domains pass through regardless of compat_mode
         assert_eq!(evaluate_pass_through(Some("internal-company.net"), false, &custom), Some(PassThroughReason::Custom));
@@ -1151,10 +1172,12 @@ mod tests {
         assert!(is_builtin_compat("master.teamviewer.com"));
         assert!(is_builtin_compat("relay.anydesk.com"));
         assert!(is_builtin_compat("relay.rustdesk.com"));
+        assert!(is_builtin_compat("vn-api.vnggames.app"));
         assert!(is_builtin_compat("sso.vnggames.com"));
         assert!(is_builtin_compat("lienminh.vnggames.com"));
         assert!(is_builtin_compat("id.zing.vn"));
         assert!(is_builtin_compat("gas.garena.com"));
+        assert!(is_builtin_compat("am-a.akamaihd.net"));
         assert!(!is_builtin_doh("connect.ultraviewer.net"));
         assert!(is_builtin_bypass("connect.ultraviewer.net"));
 
@@ -1210,11 +1233,14 @@ mod tests {
         assert!(is_cloud_storage_endpoint("steamcontent.com"));
         assert!(is_cloud_storage_endpoint("steamcloud-ord1.steamcontent.com"));
 
-        // Riot Games & VNGGames content distribution & patch CDN
+        // Riot Games & VNGGames content distribution, patch CDN, and compliance API
         assert!(is_cloud_storage_endpoint("riotcdn.net"));
         assert!(is_cloud_storage_endpoint("lol.secure.dyn.riotcdn.net"));
         assert!(is_cloud_storage_endpoint("riot-client.secure.dyn.riotcdn.net"));
         assert!(is_cloud_storage_endpoint("riotcdn.com"));
+        assert!(is_cloud_storage_endpoint("vn-api.vnggames.app"));
+        assert!(is_cloud_storage_endpoint("sso.vnggames.com"));
+        assert!(is_cloud_storage_endpoint("sdk.vnggames.net"));
         assert!(is_cloud_storage_endpoint("cdn-apo.vnggames.com"));
 
         // Non-storage domains that must be stabilized (must NOT match)
